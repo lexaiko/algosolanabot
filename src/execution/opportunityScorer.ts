@@ -1,4 +1,5 @@
 import { FeatureVector, StrategySignal } from '../core/types';
+import { adaptiveLearningEngine } from '../strategies/adaptiveLearningEngine';
 
 export interface OpportunityScoreResult {
   compositeScore: number; // 0 - 100
@@ -9,46 +10,54 @@ export interface OpportunityScoreResult {
 
 export class OpportunityScorer {
   /**
-   * Generates an explainable, transparent opportunity score based on features and strategy signals
+   * Generates an explainable, transparent opportunity score based on features and strategy signals,
+   * dynamically calibrated by the Adaptive Learning Engine.
    */
   public scoreOpportunity(features: FeatureVector, signals: StrategySignal[]): OpportunityScoreResult {
     const positivePoints: Record<string, number> = {};
     const penalties: Record<string, number> = {};
+    const weights = adaptiveLearningEngine.getScoringWeights();
 
-    // 1. Momentum Component (0 - 20)
+    // 1. Momentum Component (Adaptive Weight)
     let momentumScore = 0;
-    if (features.return5m >= 4.0 && features.return5m <= 20.0) {
-      momentumScore = Math.min(20, Math.round((features.return5m / 20.0) * 20));
+    if (features.return5m >= 2.5 && features.return5m <= 55.0) {
+      momentumScore = Math.min(weights.momentumWeight, Math.round((features.return5m / 35.0) * weights.momentumWeight));
     }
     positivePoints['Momentum'] = momentumScore;
 
-    // 2. Volume Acceleration Component (0 - 20)
-    const volAccelScore = Math.min(20, Math.round(Math.min(features.volumeAcceleration, 3.0) * 6.5));
+    // 1.5. Volatility Expansion Component (Rewards active trading volatility!)
+    if (features.regime === 'HIGH_VOLATILITY' || (features.realizedVol && features.realizedVol >= 12.0)) {
+      positivePoints['Volatility'] = 8;
+    }
+
+    // 2. Volume Acceleration Component (Adaptive Weight)
+    const volAccelRatio = Math.min(features.volumeAcceleration, 3.0) / 3.0;
+    const volAccelScore = Math.min(weights.volumeWeight, Math.round(volAccelRatio * weights.volumeWeight));
     positivePoints['Volume'] = volAccelScore;
 
-    // 3. Flow Imbalance Component (0 - 20)
+    // 3. Flow Imbalance Component (Adaptive Weight)
     let flowScore = 0;
     if (features.flowImbalance > 0) {
-      flowScore = Math.min(20, Math.round(features.flowImbalance * 20));
+      flowScore = Math.min(weights.flowWeight, Math.round(features.flowImbalance * weights.flowWeight));
     }
     positivePoints['Flow'] = flowScore;
 
-    // 4. Liquidity Quality Component (0 - 20)
+    // 4. Liquidity Quality Component (Adaptive Weight)
     const liqFloor = 10000;
-    const liqRatio = Math.min(features.liquidityUsd / liqFloor, 4.0);
-    const liquidityScore = Math.min(20, Math.round(liqRatio * 5));
+    const liqRatio = Math.min(features.liquidityUsd / liqFloor, 4.0) / 4.0;
+    const liquidityScore = Math.min(weights.liquidityWeight, Math.round(liqRatio * weights.liquidityWeight));
     positivePoints['Liquidity'] = liquidityScore;
 
-    // 5. Qualified Whale Signal Component (0 - 15)
+    // 5. Qualified Whale Signal Component (Adaptive Weight)
     let whaleScore = 0;
     if (features.smartMoneyAccumulationScore >= 60 && features.whaleNetFlowSol > 0) {
-      whaleScore = Math.min(15, Math.round(((features.smartMoneyAccumulationScore - 60) / 40) * 15));
+      whaleScore = Math.min(weights.whaleWeight, Math.round(((features.smartMoneyAccumulationScore - 60) / 40) * weights.whaleWeight));
     }
     positivePoints['Whale'] = whaleScore;
 
-    // 6. Strategy Consensus Bonus (0 - 10)
+    // 6. Strategy Consensus Bonus (Adaptive Weight)
     if (signals.length >= 2) {
-      positivePoints['StrategyConsensus'] = 10;
+      positivePoints['StrategyConsensus'] = weights.consensusBonus;
     }
 
     // --- PENALTIES ---
@@ -62,14 +71,9 @@ export class OpportunityScorer {
       penalties['CabalRisk'] = Math.min(30, Math.round(features.cabalClusterRiskScore * 0.5));
     }
 
-    // Extreme Parabolic Extension penalty
-    if (features.return5m > 22.0) {
+    // Extreme Parabolic Extension penalty (only truly vertical blow-off tops)
+    if (features.return5m > 60.0) {
       penalties['ParabolicOverextended'] = 20;
-    }
-
-    // Regime penalty
-    if (features.regime === 'HIGH_VOLATILITY') {
-      penalties['HighVolRegime'] = 10;
     }
 
     const totalPositives = Object.values(positivePoints).reduce((a, b) => a + b, 0);

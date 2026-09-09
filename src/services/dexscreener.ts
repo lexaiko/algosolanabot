@@ -68,8 +68,10 @@ export async function getTokenMarketData(tokenAddress: string): Promise<TokenMar
       dexId: bestPair.dexId || 'raydium',
       url: bestPair.url || `https://dexscreener.com/solana/${tokenAddress}`,
       priceChange24h: bestPair.priceChange?.h24 || 0,
+      priceChange1h: bestPair.priceChange?.h1 || 0,
       priceChange5m: bestPair.priceChange?.m5 || 0,
       volume24h: bestPair.volume?.h24 || 0,
+      volume1h: bestPair.volume?.h1 || 0,
       volume5m: bestPair.volume?.m5 || 0,
       txns5mBuys: bestPair.txns?.m5?.buys || 0,
       txns5mSells: bestPair.txns?.m5?.sells || 0,
@@ -93,6 +95,89 @@ export async function getTokenMarketData(tokenAddress: string): Promise<TokenMar
     console.error(`[DexScreener] Error fetching data for ${tokenAddress}:`, err.message);
     return null;
   }
+}
+
+/**
+ * Ultra-Efficient Batch Multi-Token Fetcher:
+ * Queries DexScreener in chunks of up to 30 tokens in a SINGLE HTTP request!
+ * Eliminates 90%+ of redundant HTTP polling overhead!
+ */
+export async function getMultiTokenMarketData(tokenAddresses: string[]): Promise<Map<string, TokenMarketData>> {
+  const result: Map<string, TokenMarketData> = new Map();
+  if (!tokenAddresses || tokenAddresses.length === 0) return result;
+
+  // Filter unique valid addresses
+  const uniqueAddresses = Array.from(new Set(tokenAddresses.filter(a => a && a.length >= 32)));
+  const toFetch: string[] = [];
+  const now = Date.now();
+
+  // Check memory cache first
+  for (const addr of uniqueAddresses) {
+    const cached = marketDataCache.get(addr);
+    if (cached && now - cached.timestamp < CACHE_TTL_MS * 4) {
+      result.set(addr, cached.data);
+    } else {
+      toFetch.push(addr);
+    }
+  }
+
+  if (toFetch.length === 0) return result;
+
+  // Batch query DexScreener in chunks of 30
+  const CHUNK_SIZE = 30;
+  for (let i = 0; i < toFetch.length; i += CHUNK_SIZE) {
+    const chunk = toFetch.slice(i, i + CHUNK_SIZE);
+    const url = `${DEXSCREENER_BASE_URL}/tokens/${chunk.join(',')}`;
+
+    try {
+      const res = await axios.get(url, { timeout: 7000 });
+      const pairs = res.data?.pairs || [];
+
+      // Group pairs by baseToken address
+      const pairsByToken: Map<string, any[]> = new Map();
+      for (const p of pairs) {
+        if (p.chainId === 'solana' && p.baseToken?.address) {
+          const bAddr = p.baseToken.address;
+          if (!pairsByToken.has(bAddr)) pairsByToken.set(bAddr, []);
+          pairsByToken.get(bAddr)!.push(p);
+        }
+      }
+
+      for (const [addr, pList] of pairsByToken.entries()) {
+        const bestPair = pList.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
+        if (bestPair) {
+          const data: TokenMarketData = {
+            address: addr,
+            symbol: bestPair.baseToken?.symbol || 'UNKNOWN',
+            name: bestPair.baseToken?.name || 'Unknown Token',
+            priceUsd: parseFloat(bestPair.priceUsd || '0'),
+            priceNative: parseFloat(bestPair.priceNative || '0'),
+            liquidityUsd: bestPair.liquidity?.usd || 0,
+            fdv: bestPair.fdv || 0,
+            marketCap: bestPair.marketCap || bestPair.fdv || 0,
+            pairAddress: bestPair.pairAddress || '',
+            dexId: bestPair.dexId || 'raydium',
+            url: bestPair.url || `https://dexscreener.com/solana/${addr}`,
+            priceChange24h: bestPair.priceChange?.h24 || 0,
+            priceChange1h: bestPair.priceChange?.h1 || 0,
+            priceChange5m: bestPair.priceChange?.m5 || 0,
+            volume24h: bestPair.volume?.h24 || 0,
+            volume1h: bestPair.volume?.h1 || 0,
+            volume5m: bestPair.volume?.m5 || 0,
+            txns5mBuys: bestPair.txns?.m5?.buys || 0,
+            txns5mSells: bestPair.txns?.m5?.sells || 0,
+            pairCreatedAt: bestPair.pairCreatedAt ? Number(bestPair.pairCreatedAt) : undefined,
+          };
+          marketDataCache.set(addr, { data, timestamp: Date.now() });
+          result.set(addr, data);
+        }
+      }
+    } catch (err: any) {
+      console.warn('[DexScreener] Multi-token batch fetch error:', err.message);
+    }
+  }
+
+  return result;
 }
 
 /**

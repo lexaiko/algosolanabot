@@ -103,6 +103,13 @@ export function initDatabase() {
       first_name TEXT,
       created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS token_blacklist (
+      token_address TEXT PRIMARY KEY,
+      symbol TEXT,
+      reason TEXT,
+      blacklisted_at TEXT NOT NULL
+    );
   `);
 
   // Migrations for existing DB instances
@@ -122,8 +129,36 @@ export function initDatabase() {
   try { db.exec('CREATE TABLE IF NOT EXISTS whale_blacklist (address TEXT PRIMARY KEY, reason TEXT, blacklisted_at TEXT NOT NULL);'); } catch {}
   try { db.exec('CREATE TABLE IF NOT EXISTS watchers (user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, created_at TEXT NOT NULL);'); } catch {}
 
+  // Self-Learning & Online Parameter Optimization Tables
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS learned_parameters (
+        param_key TEXT PRIMARY KEY,
+        param_value REAL NOT NULL,
+        min_val REAL NOT NULL,
+        max_val REAL NOT NULL,
+        sample_count INTEGER DEFAULT 0,
+        confidence REAL DEFAULT 0.5,
+        last_updated TEXT NOT NULL,
+        notes TEXT
+      );
 
-
+      CREATE TABLE IF NOT EXISTS strategy_attribution (
+        strategy_id TEXT PRIMARY KEY,
+        total_trades INTEGER DEFAULT 0,
+        wins INTEGER DEFAULT 0,
+        losses INTEGER DEFAULT 0,
+        win_rate REAL DEFAULT 0,
+        gross_profit_sol REAL DEFAULT 0,
+        gross_loss_sol REAL DEFAULT 0,
+        profit_factor REAL DEFAULT 1.0,
+        current_weight REAL NOT NULL,
+        last_adapted_at TEXT NOT NULL
+      );
+    `);
+  } catch (e: any) {
+    console.error('[DB] Failed to init learned_parameters tables:', e.message);
+  }
   // Initialize paper wallet if not exists
   const walletRow = db.prepare('SELECT balance_sol FROM paper_wallet WHERE id = 1').get() as { balance_sol: number } | undefined;
   if (!walletRow) {
@@ -580,6 +615,7 @@ export function createPosition(pos: {
   whale_source?: string;
   target_tp_pct?: number;
   target_sl_pct?: number;
+  entry_reason?: string;
 }): Position {
   const now = new Date().toISOString();
   const tpPct = pos.target_tp_pct || CONFIG.TAKE_PROFIT_PCT;
@@ -623,7 +659,7 @@ export function createPosition(pos: {
     pos.entry_sol,
     buyFee,
     -buyFee,
-    pos.whale_source ? `COPY_BUY (${pos.whale_source})` : 'MANUAL_BUY',
+    pos.entry_reason || (pos.whale_source ? `COPY_BUY (${pos.whale_source})` : 'MANUAL_BUY'),
     now
   );
 
@@ -952,4 +988,159 @@ export function setTradingMode(mode: TradingStrategyMode): void {
   setSetting('TRADING_MODE', mode);
 }
 
+// ----------------------------------------------------
+// Self-Learning & Online Parameter Optimization Accessors
+// ----------------------------------------------------
+export interface LearnedParameterRecord {
+  param_key: string;
+  param_value: number;
+  min_val: number;
+  max_val: number;
+  sample_count: number;
+  confidence: number;
+  last_updated: string;
+  notes?: string;
+}
 
+export interface StrategyAttributionRecord {
+  strategy_id: string;
+  total_trades: number;
+  wins: number;
+  losses: number;
+  win_rate: number;
+  gross_profit_sol: number;
+  gross_loss_sol: number;
+  profit_factor: number;
+  current_weight: number;
+  last_adapted_at: string;
+}
+
+export function getLearnedParameter(key: string, defaultValue: number): number {
+  try {
+    const row = db.prepare('SELECT param_value FROM learned_parameters WHERE param_key = ?').get(key) as { param_value: number } | undefined;
+    return row !== undefined ? row.param_value : defaultValue;
+  } catch {
+    return defaultValue;
+  }
+}
+
+export function setLearnedParameter(
+  key: string,
+  value: number,
+  minVal: number,
+  maxVal: number,
+  sampleCount: number = 1,
+  confidence: number = 0.5,
+  notes: string = ''
+): void {
+  try {
+    const boundedValue = Math.max(minVal, Math.min(maxVal, value));
+    db.prepare(`
+      INSERT INTO learned_parameters (param_key, param_value, min_val, max_val, sample_count, confidence, last_updated, notes)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(param_key) DO UPDATE SET
+        param_value = excluded.param_value,
+        min_val = excluded.min_val,
+        max_val = excluded.max_val,
+        sample_count = excluded.sample_count,
+        confidence = excluded.confidence,
+        last_updated = excluded.last_updated,
+        notes = excluded.notes
+    `).run(
+      key,
+      boundedValue,
+      minVal,
+      maxVal,
+      sampleCount,
+      confidence,
+      new Date().toISOString(),
+      notes
+    );
+  } catch (err: any) {
+    console.error(`[DB] Failed to persist learned parameter ${key}:`, err.message);
+  }
+}
+
+export function getAllLearnedParameters(): Record<string, number> {
+  const result: Record<string, number> = {};
+  try {
+    const rows = db.prepare('SELECT param_key, param_value FROM learned_parameters').all() as Array<{ param_key: string; param_value: number }>;
+    for (const r of rows) {
+      result[r.param_key] = r.param_value;
+    }
+  } catch (err: any) {
+    console.error('[DB] Error loading learned parameters:', err.message);
+  }
+  return result;
+}
+
+export function getStrategyAttributionRecords(): StrategyAttributionRecord[] {
+  try {
+    return db.prepare('SELECT * FROM strategy_attribution ORDER BY current_weight DESC').all() as unknown as StrategyAttributionRecord[];
+  } catch {
+    return [];
+  }
+}
+
+export function upsertStrategyAttributionRecord(rec: StrategyAttributionRecord): void {
+  try {
+    db.prepare(`
+      INSERT INTO strategy_attribution (
+        strategy_id, total_trades, wins, losses, win_rate, gross_profit_sol, gross_loss_sol, profit_factor, current_weight, last_adapted_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(strategy_id) DO UPDATE SET
+        total_trades = excluded.total_trades,
+        wins = excluded.wins,
+        losses = excluded.losses,
+        win_rate = excluded.win_rate,
+        gross_profit_sol = excluded.gross_profit_sol,
+        gross_loss_sol = excluded.gross_loss_sol,
+        profit_factor = excluded.profit_factor,
+        current_weight = excluded.current_weight,
+        last_adapted_at = excluded.last_adapted_at
+    `).run(
+      rec.strategy_id,
+      rec.total_trades,
+      rec.wins,
+      rec.losses,
+      rec.win_rate,
+      rec.gross_profit_sol,
+      rec.gross_loss_sol,
+      rec.profit_factor,
+      rec.current_weight,
+      rec.last_adapted_at
+    );
+  } catch (err: any) {
+    console.error(`[DB] Failed to upsert strategy attribution for ${rec.strategy_id}:`, err.message);
+  }
+}
+
+export function blacklistToken(tokenAddress: string, symbol?: string, reason?: string) {
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT OR REPLACE INTO token_blacklist (token_address, symbol, reason, blacklisted_at)
+    VALUES (?, ?, ?, ?)
+  `).run(tokenAddress, symbol || 'UNKNOWN', reason || 'MANUAL_KICK', now);
+}
+
+export function unblacklistToken(tokenAddress: string): boolean {
+  const info = db.prepare('DELETE FROM token_blacklist WHERE token_address = ?').run(tokenAddress);
+  return info.changes > 0;
+}
+
+export function isTokenBlacklisted(tokenAddress: string): boolean {
+  try {
+    const row = db.prepare('SELECT token_address FROM token_blacklist WHERE token_address = ?').get(tokenAddress);
+    return !!row;
+  } catch {
+    return false;
+  }
+}
+
+export function getBlacklistedTokens(): Array<{ token_address: string; symbol: string; reason: string; blacklisted_at: string }> {
+  try {
+    return db.prepare('SELECT * FROM token_blacklist ORDER BY blacklisted_at DESC').all() as any[];
+  } catch {
+    return [];
+  }
+}

@@ -36,7 +36,7 @@ export const CONFIG = {
   MIN_MARKET_CAP_USD: Number(process.env.MIN_MARKET_CAP_USD) || 15000.0, // Min $15k market cap
   MAX_OPEN_POSITIONS: Number(process.env.MAX_OPEN_POSITIONS) || 15, // Max concurrent active trades (allows up to 15 concurrent positions for backtesting & broad diversification)
   MAX_HOLD_TIME_HOURS: Number(process.env.MAX_HOLD_TIME_HOURS) || 24, // 24h Time-Stop (Zombie Token Reaper)
-  MAX_5M_PRICE_CHANGE_PCT: Number(process.env.MAX_5M_PRICE_CHANGE_PCT) || 20.0, // Anti-FOMO parabolic candle spike
+  MAX_5M_PRICE_CHANGE_PCT: Number(process.env.MAX_5M_PRICE_CHANGE_PCT) || 50.0, // Anti-FOMO parabolic candle spike (allows up to +50% explosive momentum)
   NOTIFY_ON_REJECT: process.env.NOTIFY_ON_REJECT !== 'false', // Default to true: ALWAYS send warning/cancellation notifications!
 
   // Institutional Hedge Fund Survival Phase Filters (Anti-Detik-0 Suicide)
