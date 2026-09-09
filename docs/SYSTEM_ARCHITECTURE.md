@@ -56,9 +56,9 @@ src/
 
 ---
 
-## 2. Production PostgreSQL Database Schema
+## 2. Production SQLite Database Schema (In-Process WAL)
 
-Stored in `migrations/001_initial_schema.sql`:
+Stored in `migrations/001_sqlite_schema.sql` and managed in `tradingbot.db`:
 - `tokens`: Discovered token metadata.
 - `pools`: AMM liquidity pools (Raydium, Pump.fun, Orca, Meteora).
 - `market_events`: Normalized immutable stream of swaps, liquidity changes, and block prices with latency and data quality tags (`VALID`, `STALE`, `SUSPICIOUS`).
