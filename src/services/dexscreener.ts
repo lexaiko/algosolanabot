@@ -70,6 +70,10 @@ export async function getTokenMarketData(tokenAddress: string): Promise<TokenMar
       priceChange24h: bestPair.priceChange?.h24 || 0,
       priceChange5m: bestPair.priceChange?.m5 || 0,
       volume24h: bestPair.volume?.h24 || 0,
+      volume5m: bestPair.volume?.m5 || 0,
+      txns5mBuys: bestPair.txns?.m5?.buys || 0,
+      txns5mSells: bestPair.txns?.m5?.sells || 0,
+      pairCreatedAt: bestPair.pairCreatedAt ? Number(bestPair.pairCreatedAt) : undefined,
     };
 
     marketDataCache.set(tokenAddress, { data, timestamp: Date.now() });
