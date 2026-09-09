@@ -770,25 +770,25 @@ export async function evaluatePosition(
       let tierLabel = '';
 
       if (peakGainPct >= 50.0) {
-        // Tier 4: Moonbag Parabolic Runner (Trail 7% from peak, guaranteed floor >= +38%)
-        targetFloorPct = Math.max(38.0, peakGainPct - 7.0);
+        // Tier 4: Moonbag Parabolic Runner (Trail 6.5% from peak, guaranteed floor >= +40%)
+        targetFloorPct = Math.max(40.0, peakGainPct - 6.5);
         tierLabel = 'TIER_4_MOONBAG';
       } else if (peakGainPct >= 30.0) {
-        // Tier 3: Big Runner (Trail 6% from peak, guaranteed floor >= +20%)
-        targetFloorPct = Math.max(20.0, peakGainPct - 6.0);
+        // Tier 3: Big Runner (Trail 5.5% from peak, guaranteed floor >= +22%)
+        targetFloorPct = Math.max(22.0, peakGainPct - 5.5);
         tierLabel = 'TIER_3_RUNNER';
       } else if (peakGainPct >= 18.0) {
-        // Tier 2: Strong Breakout (Trail 5% from peak, guaranteed floor >= +10%)
-        targetFloorPct = Math.max(10.0, peakGainPct - 5.0);
+        // Tier 2: Strong Breakout (Trail 4.5% from peak, guaranteed floor >= +12%)
+        targetFloorPct = Math.max(12.0, peakGainPct - 4.5);
         tierLabel = 'TIER_2_BREAKOUT';
       } else if (peakGainPct >= 10.0) {
-        // Tier 1: Solid Profit Lock (Trail 4% from peak, guaranteed floor >= +5.0%)
-        // Example: Peak +12.3% -> Floor = Math.max(5.0, 12.3 - 4.0) = +8.3%!
-        targetFloorPct = Math.max(5.0, peakGainPct - 4.0);
+        // Tier 1: Solid Profit Lock (Trail 3.0% from peak, guaranteed floor >= +6.0%)
+        // Example: Peak +12.0% -> Floor = Math.max(6.0, 12.0 - 3.0) = +9.0%!
+        targetFloorPct = Math.max(6.0, peakGainPct - 3.0);
         tierLabel = 'TIER_1_PROFIT_LOCK';
-      } else if (peakGainPct >= 6.5) {
-        // Tier 0: Early Zero-Risk Transition / BEP+ (Trail 3.5% from peak, guaranteed floor >= +2.5% to cover all fees)
-        targetFloorPct = Math.max(2.5, peakGainPct - 3.5);
+      } else if (peakGainPct >= 6.0) {
+        // Tier 0: Early Zero-Risk Transition / BEP+ (Trail 2.5% from peak, guaranteed floor >= +3.0% to cover all fees)
+        targetFloorPct = Math.max(3.0, peakGainPct - 2.5);
         tierLabel = 'TIER_0_BEP_PLUS';
       }
 
