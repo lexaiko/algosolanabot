@@ -80,6 +80,10 @@ export interface TokenMarketData {
   priceChange24h: number;
   priceChange5m?: number;
   volume24h?: number;
+  volume5m?: number;
+  txns5mBuys?: number;
+  txns5mSells?: number;
+  pairCreatedAt?: number;
 }
 
 export interface QueuedWhale {
