@@ -482,10 +482,20 @@ export async function executeSellToken(
   }
 
   let alertHeader = isProfit ? '🎉 *TAKE PROFIT DIEKSEKUSI!*' : '🛑 *STOP LOSS DIEKSEKUSI!*';
-  if (reason.includes('SL_PLUS') || reason.includes('BREAK_EVEN')) {
-    alertHeader = isProfit 
-      ? '💰 *SL PLUS (PROFIT LOCK) DIEKSEKUSI!*' 
-      : '🛡️ *SL PLUS (PROTECTED EXIT) DIEKSEKUSI!*';
+  let noteSection = '';
+
+  if (reason.includes('FLASH_DUMP_RESCUE')) {
+    alertHeader = '⚡ *EMERGENCY FLASH DUMP RESCUE (SLIPPAGE GAP)!*';
+    noteSection = `\n⚠️ *Analisis On-Chain (Slippage Gap Down):*\n` +
+      `_Token sempat mencatat profit puncak, namun terjadi dump masif on-chain dalam 1 blok yang melompati batas pengaman. Bot langsung melikuidasi darurat di ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}% untuk mengamankan sisa modal Anda sebelum rugi fatal terkena Full SL (-${pos.target_sl_pct || CONFIG.STOP_LOSS_PCT}%)._\n`;
+  } else if (reason.includes('SL_PLUS') || reason.includes('BREAK_EVEN')) {
+    if (isProfit) {
+      alertHeader = '💰 *SL PLUS (PROFIT LOCK) DIEKSEKUSI!*';
+      noteSection = `\n🛡️ *Prinsip Pro Trader:* _Trade yang sudah profit berhasil diamankan ke dalam saldo (Risk-Free Profit Realization)._\n`;
+    } else {
+      alertHeader = '⚡ *EMERGENCY SLIPPAGE CUT!*';
+      noteSection = `\n⚠️ *Catatan Slippage:* _Harga pasar jatuh menembus floor sebelum sempat dieksekusi. Bot memotong posisi untuk menghindari risiko drawdown lebih dalam._\n`;
+    }
   } else if (reason.includes('TRAILING_STOP') || reason.includes('RUNNER_TRAILING')) {
     alertHeader = isProfit 
       ? '🚀 *TRAILING STOP DIEKSEKUSI!*' 
@@ -502,7 +512,8 @@ export async function executeSellToken(
     `• Net PnL Bersih: *${netPnlSol >= 0 ? '+' : ''}${netPnlSol.toFixed(4)} SOL* (~$${(netPnlSol * solPriceUsd).toFixed(2)}) ${isNetProfit ? '💰' : '🔻'}\n` +
     `• Modal Posisi: ${pos.entry_sol.toFixed(3)} SOL\n` +
     `• Hasil Penjualan: *${actualCreditedSol.toFixed(4)} SOL*\n` +
-    `• Saldo Virtual Sekarang: *${newBalance.toFixed(3)} SOL*\n\n` +
+    `• Saldo Virtual Sekarang: *${newBalance.toFixed(3)} SOL*\n` +
+    noteSection + '\n' +
     `_Riwayat tersimpan ke database._`;
 
   await notify(sellAlert);
@@ -669,7 +680,8 @@ export async function evaluatePosition(
 
     // Fallback to DexScreener if not a bonding curve token or graduated to Raydium
     if (currentPrice === pos.current_price_usd || currentLiquidityUsd === 0) {
-      const marketData = await getTokenMarketData(pos.token_address);
+      const isProfitable = (pos.peak_price_usd > pos.entry_price_usd);
+      const marketData = await getTokenMarketData(pos.token_address, isProfitable);
       if (marketData) {
         currentPrice = marketData.priceUsd;
         currentLiquidityUsd = marketData.liquidityUsd;
@@ -749,38 +761,48 @@ export async function evaluatePosition(
       return;
     }
 
-    // 3.5. PRO TRADER SL PLUS & DYNAMIC PROFIT LOCK LADDER (Trailing in Profit):
+    // 3.5. PRO TRADER DYNAMIC SL PLUS & PROFIT LOCK LADDER (Adaptive High-Water Trailing):
     // Prinsip Hedge Fund Pro: Trade yang sudah profit TIDAK BOLEH berbalik menjadi rugi!
-    // SL otomatis dikerek naik (Trailing Stop in Profit) seiring kenaikan harga ke puncak.
+    // Floor pengaman dikerek naik secara dinamis mengikuti puncak profit (High-Water Mark).
     if (pos.is_half_closed === 0 && peakPrice > pos.entry_price_usd) {
       const peakGainPct = ((peakPrice - pos.entry_price_usd) / pos.entry_price_usd) * 100;
+      let targetFloorPct: number | null = null;
+      let tierLabel = '';
 
-      // Tier 4: Moonbag Parabolic Runner (Peak >= +50.0% -> Guaranteed Floor >= +35.0%)
-      if (peakGainPct >= 50.0 && pnlPct <= 35.0) {
-        console.log(`[TradeManager] 💎 SL PLUS TIER 4 (+35% Locked) Triggered for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Current: ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`);
-        await executeSellToken(pos.id, 100, `SL_PLUS_TIER_4 (Peak +${peakGainPct.toFixed(1)}% -> Locked @ ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`);
-        return;
+      if (peakGainPct >= 50.0) {
+        // Tier 4: Moonbag Parabolic Runner (Trail 7% from peak, guaranteed floor >= +38%)
+        targetFloorPct = Math.max(38.0, peakGainPct - 7.0);
+        tierLabel = 'TIER_4_MOONBAG';
+      } else if (peakGainPct >= 30.0) {
+        // Tier 3: Big Runner (Trail 6% from peak, guaranteed floor >= +20%)
+        targetFloorPct = Math.max(20.0, peakGainPct - 6.0);
+        tierLabel = 'TIER_3_RUNNER';
+      } else if (peakGainPct >= 18.0) {
+        // Tier 2: Strong Breakout (Trail 5% from peak, guaranteed floor >= +10%)
+        targetFloorPct = Math.max(10.0, peakGainPct - 5.0);
+        tierLabel = 'TIER_2_BREAKOUT';
+      } else if (peakGainPct >= 10.0) {
+        // Tier 1: Solid Profit Lock (Trail 4% from peak, guaranteed floor >= +5.0%)
+        // Example: Peak +12.3% -> Floor = Math.max(5.0, 12.3 - 4.0) = +8.3%!
+        targetFloorPct = Math.max(5.0, peakGainPct - 4.0);
+        tierLabel = 'TIER_1_PROFIT_LOCK';
+      } else if (peakGainPct >= 6.5) {
+        // Tier 0: Early Zero-Risk Transition / BEP+ (Trail 3.5% from peak, guaranteed floor >= +2.5% to cover all fees)
+        targetFloorPct = Math.max(2.5, peakGainPct - 3.5);
+        tierLabel = 'TIER_0_BEP_PLUS';
       }
 
-      // Tier 3: Big Runner (Peak >= +30.0% -> Guaranteed Floor >= +18.0%)
-      if (peakGainPct >= 30.0 && pnlPct <= 18.0) {
-        console.log(`[TradeManager] 💰 SL PLUS TIER 3 (+18% Locked) Triggered for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Current: ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`);
-        await executeSellToken(pos.id, 100, `SL_PLUS_TIER_3 (Peak +${peakGainPct.toFixed(1)}% -> Locked @ ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`);
-        return;
-      }
-
-      // Tier 2: Strong Breakout (Peak >= +18.0% -> Guaranteed Floor >= +8.0%)
-      if (peakGainPct >= 18.0 && pnlPct <= 8.0) {
-        console.log(`[TradeManager] 🛡️ SL PLUS TIER 2 (+8% Locked) Triggered for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Current: ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`);
-        await executeSellToken(pos.id, 100, `SL_PLUS_TIER_2 (Peak +${peakGainPct.toFixed(1)}% -> Locked @ ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`);
-        return;
-      }
-
-      // Tier 1: Zero-Risk Transition / BEP+ (Peak >= +10.0% -> Guaranteed Floor >= +3.5% Cover DEX Fees & Slippage Buffer)
-      if (peakGainPct >= 10.0 && pnlPct <= 3.5) {
-        console.log(`[TradeManager] 🛡️ SL PLUS TIER 1 (BEP+ Cover Fees) Triggered for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Current: ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`);
-        await executeSellToken(pos.id, 100, `SL_PLUS_BEP (Peak +${peakGainPct.toFixed(1)}% -> Protected @ ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`);
-        return;
+      if (targetFloorPct !== null && pnlPct <= targetFloorPct) {
+        if (pnlPct >= 0.5) {
+          console.log(`[TradeManager] 💰 SL PLUS ${tierLabel} (+${targetFloorPct.toFixed(1)}% Floor) Triggered for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Current: +${pnlPct.toFixed(1)}%)`);
+          await executeSellToken(pos.id, 100, `SL_PLUS_${tierLabel} (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${pnlPct.toFixed(1)}%)`);
+          return;
+        } else {
+          // Flash dump slipped past the trailing floor in a single block before it could be caught
+          console.log(`[TradeManager] ⚡ FLASH DUMP SLIPPAGE GAP RESCUE for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Floor: +${targetFloorPct.toFixed(1)}%, Breached to: ${pnlPct.toFixed(1)}%)`);
+          await executeSellToken(pos.id, 100, `FLASH_DUMP_RESCUE (Peak +${peakGainPct.toFixed(1)}% Jebol Floor +${targetFloorPct.toFixed(1)}% -> Cut @ ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`);
+          return;
+        }
       }
     }
 
@@ -818,8 +840,8 @@ export function startPositionManager() {
 
   refreshPositionWebSocketSubscriptions();
   checkPositions();
-  // 15-second quiet heartbeat (WebSocket handles live sub-second price ticks)
-  monitorInterval = setInterval(checkPositions, 15000);
+  // 3-second rapid heartbeat for active position evaluations
+  monitorInterval = setInterval(checkPositions, 3000);
 }
 
 export function stopPositionManager() {
@@ -841,8 +863,8 @@ export function stopPositionManager() {
 
 /**
  * Event-Driven Position Fallback Check:
- * DOES NOT hammer DexScreener HTTP. Only triggers quiet RPC queries if a position
- * has received ZERO WebSocket ticks for >35 seconds!
+ * Only triggers quiet RPC queries if a position has received ZERO WebSocket ticks for >35 seconds,
+ * UNLESS the position is already in profit (peak > entry), in which case it is evaluated actively!
  */
 async function checkPositions() {
   const openPositions = getOpenPositions();
@@ -864,10 +886,11 @@ async function checkPositions() {
         continue;
       }
 
-      // 2. Event-Driven Gate: If WebSocket stream is active, do NOT poll HTTP!
+      // 2. Event-Driven Gate: If WebSocket stream is active, do NOT poll HTTP unless position is profitable!
+      const isProfitable = (pos.peak_price_usd > pos.entry_price_usd);
       const lastWs = lastWsUpdateTimestamp.get(pos.id) || 0;
-      if (now - lastWs < WS_SILENCE_FALLBACK_MS) {
-        continue; // Active WebSocket streaming handles position evaluation
+      if (!isProfitable && (now - lastWs < WS_SILENCE_FALLBACK_MS)) {
+        continue; // Active WebSocket streaming handles position evaluation for calm positions
       }
 
       // 3. Quiet Fallback: Direct RPC getAccountInfo for Pump.fun tokens (0 DexScreener HTTP)

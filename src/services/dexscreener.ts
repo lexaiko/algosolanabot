@@ -31,10 +31,12 @@ export async function getSolPriceUsd(): Promise<number> {
 const marketDataCache: Map<string, { data: TokenMarketData; timestamp: number }> = new Map();
 const CACHE_TTL_MS = 3000;
 
-export async function getTokenMarketData(tokenAddress: string): Promise<TokenMarketData | null> {
-  const cached = marketDataCache.get(tokenAddress);
-  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
-    return cached.data;
+export async function getTokenMarketData(tokenAddress: string, forceFresh: boolean = false): Promise<TokenMarketData | null> {
+  if (!forceFresh) {
+    const cached = marketDataCache.get(tokenAddress);
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+      return cached.data;
+    }
   }
 
   try {
