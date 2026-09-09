@@ -13,20 +13,55 @@ import {
   addWatcher,
   removeWatcher,
   isWatcher,
-  getWatchers
+  getWatchers,
+  getOpenPositionByToken,
+  blacklistToken,
+  unblacklistToken,
+  isTokenBlacklisted,
+  getBlacklistedTokens
 } from '../db/index';
 import { getSolPriceUsd, getTokenMarketData } from '../services/dexscreener';
 import { checkTokenSafety } from '../services/antirug';
 import { executeBuyToken, executeSellToken, setTelegramNotifier } from '../services/tradeManager';
 import { scanMarketOnce, setAlgoScannerNotifier } from '../services/algoScanner';
+import { setMarketStreamerNotifier, getWatchlistStatus, removeTokenFromWatchlist } from '../services/marketStreamer';
 import {
   fetchHistoricalCandles,
   generateSyntheticRegime,
   runBacktest,
   formatBacktestTelegramReport
 } from '../services/backtester';
+import { adaptiveLearningEngine } from '../strategies/adaptiveLearningEngine';
 
 export const bot = new Telegraf(CONFIG.TELEGRAM_BOT_TOKEN);
+
+// Global Error Handler: Prevents Telegram unhandled rejections from freezing bot polling
+bot.catch((err: any, ctx: any) => {
+  console.error('[Telegram] Global bot error handler caught update error:', err?.message || err);
+  try {
+    if (ctx?.answerCbQuery) {
+      ctx.answerCbQuery('⚠️ Terjadi kendala memproses tombol.').catch(() => {});
+    }
+  } catch {}
+});
+
+/**
+ * Sends a Markdown message with automatic fallback to plain text if Markdown parsing fails.
+ * Guarantees the user always receives a response and never gets stuck!
+ */
+export async function safeReplyWithMarkdown(ctx: any, text: string, extra?: any) {
+  try {
+    return await ctx.replyWithMarkdown(text, extra);
+  } catch (err: any) {
+    console.warn('[Telegram] Markdown formatting failed, falling back to clean text:', err.message);
+    const cleanText = text.replace(/[*_`]/g, '');
+    try {
+      return await ctx.reply(cleanText, extra);
+    } catch (fallbackErr: any) {
+      console.error('[Telegram] Failed to send fallback message:', fallbackErr.message);
+    }
+  }
+}
 
 // Register Telegram notifiers (Admin + Active Watchers Broadcast)
 const sendAdminAlert = async (msg: string, extra?: any) => {
@@ -61,10 +96,11 @@ const sendAdminAlert = async (msg: string, extra?: any) => {
 
 setTelegramNotifier(sendAdminAlert);
 setAlgoScannerNotifier(sendAdminAlert);
+setMarketStreamerNotifier(sendAdminAlert);
 
 // Executive/Admin commands that modify state or settings
 const ADMIN_COMMANDS = new Set([
-  'buy', 'sell', 'settings', 'resetcb', 'scan'
+  'buy', 'sell', 'settings', 'resetcb', 'scan', 'kick', 'drop', 'blacklist', 'unkick', 'unblacklist'
 ]);
 
 // Middleware: Role-Based Access Control (Admin vs Watcher)
@@ -167,10 +203,13 @@ bot.command(['start', 'status'], async (ctx) => {
   await ctx.replyWithMarkdown(text, Markup.inlineKeyboard([
     [
       Markup.button.callback('⚡ Pindai Pasar Live (/scan)', 'trigger_scan'),
-      Markup.button.callback('💼 Posisi Aktif (/positions)', 'menu_positions')
+      Markup.button.callback('📡 Radar Watchlist (/ws)', 'menu_watchlist')
     ],
     [
-      Markup.button.callback('📊 Laporan 24j', 'menu_report'),
+      Markup.button.callback('💼 Posisi Aktif (/positions)', 'menu_positions'),
+      Markup.button.callback('📊 Laporan 24j', 'menu_report')
+    ],
+    [
       Markup.button.callback('📐 Metrik Quant', 'menu_quant'),
       Markup.button.callback('🔬 Backtester', 'menu_backtest')
     ],
@@ -187,7 +226,9 @@ bot.command('help', async (ctx) => {
     `🤖 *Status & Portofolio:*\n` +
     `• \`/start\` atau \`/status\` - Dashboard utama sistem & status engine quant\n` +
     `• \`/scan\` - Pindai pasar Solana secara live dengan filter Survival Phase\n` +
+    `• \`/watchlist\` atau \`/radar\` - Lihat token yang sedang di-track live WebSocket\n` +
     `• \`/positions\` - Lihat posisi trade yang sedang aktif dibuka\n` +
+    `• \`/kick <CA>\` atau \`/drop <CA>\` - Tendang token dari Watchlist, jual posisi jika ada, & blacklist permanen\n` +
     `• \`/report\` atau \`/pnl\` - Jurnal performa trading 24 jam (True Net Accounting)\n` +
     `• \`/quant\` - Audit metrik kuantitatif (Sharpe, Sortino, Profit Factor, MDD)\n` +
     `• \`/backtest\` - Backtester algoritma replay candle historis & skenario stres\n` +
@@ -197,6 +238,57 @@ bot.command('help', async (ctx) => {
     `• Kirim atau paste Contract Address (CA) Solana apapun untuk audit instan Anti-Rug, Likuiditas, & Quick Buy!`;
 
   await ctx.replyWithMarkdown(text);
+});
+
+// COMMAND: /kick <CA> atau /drop <CA> atau /blacklist <CA>
+bot.command(['kick', 'drop', 'blacklist'], async (ctx) => {
+  const parts = ctx.message.text.trim().split(/\s+/);
+  if (parts.length < 2) {
+    return ctx.replyWithMarkdown('ℹ️ *Format Perintah Kick / Blacklist:*\n`/kick <Contract_Address_Token> [alasan]`\n\n_Contoh:_ `/kick 8RNUw4N655VSrZKuhGdywhbSMDTrheguFPfxbpE2NZHQ scam dev`\n\n_Efek:_ Token langsung dikeluarkan dari Watchlist, dijual jika sedang dipegang di portofolio, dan di-blacklist permanen dari scanner.');
+  }
+
+  const tokenMint = parts[1].trim();
+  const reason = parts.slice(2).join(' ') || 'USER_MANUAL_KICK';
+
+  // 1. Kick dari WebSocket Watchlist
+  removeTokenFromWatchlist(tokenMint);
+
+  // 2. Jika token sedang aktif dibuka di portofolio, force sell 100%!
+  const openPos = getOpenPositionByToken(tokenMint);
+  let soldMsg = '';
+  if (openPos) {
+    await executeSellToken(openPos.id, 100, `MANUAL_KICK_EXIT (${reason})`);
+    soldMsg = `\n💰 *Posisi Aktif Ditemukan:* Posisi #${openPos.id} (${openPos.token_symbol}) langsung dilikuidasi 100% demi mengamankan modal!`;
+  }
+
+  // 3. Masukkan ke Token Blacklist di Database
+  blacklistToken(tokenMint, openPos?.token_symbol || 'TOKEN', reason);
+
+  const text = `🚫 *TOKEN BERHASIL DI-KICK & DIBLACKLIST!* 🚫\n\n` +
+    `📝 *CA:* \`${tokenMint}\`\n` +
+    `⚠️ *Alasan:* _${reason}_\n` +
+    `🗑️ *Watchlist:* Dikeluarkan dari radar WebSocket.\n` +
+    `🛡️ *Scanner:* Diblokir permanen dari algoritma scanner.${soldMsg}\n\n` +
+    `_Bot tidak akan pernah lagi melirik, memantau, atau membeli token ini._`;
+
+  await ctx.replyWithMarkdown(text);
+});
+
+// COMMAND: /unblacklist <CA> atau /unkick <CA>
+bot.command(['unblacklist', 'unkick'], async (ctx) => {
+  const parts = ctx.message.text.trim().split(/\s+/);
+  if (parts.length < 2) {
+    return ctx.replyWithMarkdown('ℹ️ *Format Perintah Unkick / Pulihkan:*\n`/unblacklist <Contract_Address_Token>`');
+  }
+
+  const tokenMint = parts[1].trim();
+  const success = unblacklistToken(tokenMint);
+
+  if (success) {
+    await ctx.replyWithMarkdown(`✅ *Token Berhasil Dipulihkan!*\nToken \`${tokenMint}\` telah dihapus dari blacklist.`);
+  } else {
+    await ctx.replyWithMarkdown(`ℹ️ Token \`${tokenMint}\` tidak ditemukan di daftar blacklist.`);
+  }
 });
 
 // 2. SCAN COMMAND & MARKET SCANNER
@@ -213,43 +305,90 @@ export async function handleScanCommand(ctx: any) {
   );
 
   try {
-    const candidates = await scanMarketOnce(8);
+    const candidates = await scanMarketOnce(14);
     if (candidates.length === 0) {
-      return ctx.replyWithMarkdown('ℹ️ Belum ditemukan token aktif yang memenuhi kriteria likuiditas dasar. Coba beberapa saat lagi.');
+      return safeReplyWithMarkdown(ctx, 'ℹ️ Belum ditemukan token aktif yang memenuhi kriteria likuiditas dasar. Coba beberapa saat lagi.');
     }
 
-    let text = `⚡ *HASIL SCAN PASAR KUANTITATIF (${candidates.length} Token Dipindai)*\n\n`;
+    const buyReady = candidates.filter(c => c.category === 'BUY_READY');
+    const pullbackWatch = candidates.filter(c => c.category === 'PULLBACK_WATCH');
+    const discarded = candidates.filter(c => c.category === 'DISCARDED');
+
+    let text = `⚡ *RADAR PASAR SOLANA (ORGANIK & KUANTITATIF)*\n\n` +
+      `_Sumber: GeckoTerminal Trending Pools + Solana DEX Leaders (100% Organik, Bebas Iklan Boost!)_\n\n`;
 
     const buttons: any[] = [];
 
-    for (let i = 0; i < candidates.length; i++) {
-      const c = candidates[i];
-      const statusEmoji = c.passed ? '🟢 *LOLOS*' : '🔴 *DITOLAK*';
-      const scoreBadge = c.score >= 70 ? '💎 TOP GRADE' : (c.score >= 50 ? '⚖️ NEUTRAL' : '⚠️ LOW CONVICTION');
-
-      text += `*#${i + 1}* ${statusEmoji} *${c.symbol}* (${c.name})\n` +
-        `• CA: \`${c.mint}\`\n` +
-        `• Skor Quant: *${c.score}/100* [${scoreBadge}]\n` +
-        `• Likuiditas: *$${formatNumber(c.liquidityUsd)}* | MC: *$${formatNumber(c.marketCapUsd)}*\n` +
-        `• Harga: *${formatPrice(c.priceUsd)}*\n` +
-        `• Status Filter: ${c.passed ? '✅ _Memenuhi seluruh standar survival phase_' : `❌ _${c.rejectReason || 'Skor belum mencukupi'}_`}\n\n`;
-
-      if (c.passed || c.score >= 60) {
+    // 1. SECTION: BUY READY
+    if (buyReady.length > 0) {
+      text += `🎯 *SETUP SIAP ENTRY (${buyReady.length} Token):*\n` +
+        `_Koreksi sehat terabsorpsi + Pantulan hijau terkonfirmasi + Order flow dominan beli:_\n\n`;
+      for (const c of buyReady) {
+        const cleanSymbol = (c.symbol || 'TOKEN').replace(/[*_`\[\]()~]/g, '');
+        const cleanName = (c.name || 'Solana Token').replace(/[*_`\[\]()~]/g, '');
+        text += `🟢 *${cleanSymbol}* (${cleanName})\n` +
+          `• CA: \`${c.mint}\`\n` +
+          `• Skor: *${c.score}/100* 💎 | Harga: *${formatPrice(c.priceUsd)}*\n` +
+          `• Liq: *$${formatNumber(c.liquidityUsd)}* | MC: *$${formatNumber(c.marketCapUsd)}*\n` +
+          `• Flow 5m: *${c.buys5m} Buys / ${c.sells5m} Sells* (5m: *${c.ret5m >= 0 ? '+' : ''}${c.ret5m.toFixed(1)}%*)\n` +
+          `• Eksekusi: ✅ _Memenuhi parameter Buy Rebound & Order Flow_\n\n`;
+        
         buttons.push([
-          Markup.button.callback(`⚡ Beli ${c.symbol} (0.05 SOL)`, `buy_quick_${c.mint}_0.05`),
-          Markup.button.callback(`⚡ Beli ${c.symbol} (0.1 SOL)`, `buy_quick_${c.mint}_0.1`)
+          Markup.button.callback(`⚡ Snipe ${cleanSymbol} (0.05 SOL)`, `buy_quick_${c.mint}_0.05`),
+          Markup.button.callback(`⚡ Snipe ${cleanSymbol} (0.1 SOL)`, `buy_quick_${c.mint}_0.1`)
         ]);
       }
+      text += `───────────────────\n\n`;
     }
 
+    // 2. SECTION: RADAR WATCHLIST (PULLBACK WATCH)
+    if (pullbackWatch.length > 0) {
+      text += `⏳ *RADAR PULLBACK WATCHLIST (${pullbackWatch.length} Token):*\n` +
+        `_Tren kuat & volume jutaan dollar. Otomatis dilock di Helius WebSocket untuk menunggu koreksi sehat:_\n\n`;
+      for (const c of pullbackWatch.slice(0, 6)) {
+        const cleanSymbol = (c.symbol || 'TOKEN').replace(/[*_`\[\]()~]/g, '');
+        const cleanName = (c.name || 'Solana Token').replace(/[*_`\[\]()~]/g, '');
+        const statusDesc = c.ret5m > 6.0 
+          ? 'Nempel di pucuk pump (Menunggu koreksi -3% s/d -6%)' 
+          : (c.ret5m < -6.0 ? 'Koreksi tajam (Menunggu buyer absorption)' : 'Sedang konsolidasi akumulasi');
+
+        text += `📡 *${cleanSymbol}* (${cleanName}) [Skor: ${c.score}/100]\n` +
+          `• CA: \`${c.mint}\`\n` +
+          `• Liq: *$${formatNumber(c.liquidityUsd)}* | MC: *$${formatNumber(c.marketCapUsd)}*\n` +
+          `• Momentum: *5m: ${c.ret5m >= 0 ? '+' : ''}${c.ret5m.toFixed(1)}%* | *1h: ${c.ret1h >= 0 ? '+' : ''}${c.ret1h.toFixed(1)}%*\n` +
+          `• Flow 5m: *${c.buys5m} Buys / ${c.sells5m} Sells*\n` +
+          `• Status Radar: ⏳ _${statusDesc}_\n\n`;
+
+        buttons.push([
+          Markup.button.callback(`⚡ Beli Cepat ${cleanSymbol} (0.05 SOL)`, `buy_quick_${c.mint}_0.05`),
+          Markup.button.callback(`⚡ Beli Cepat ${cleanSymbol} (0.1 SOL)`, `buy_quick_${c.mint}_0.1`)
+        ]);
+      }
+      text += `───────────────────\n\n`;
+    }
+
+    // 3. SECTION: DISCARDED SUMMARY
+    if (discarded.length > 0) {
+      text += `🛡️ *DI-FILTER KELUAR (${discarded.length} Token):*\n`;
+      const sampleDiscarded = discarded.slice(0, 4).map(d => {
+        const sym = (d.symbol || 'TOKEN').replace(/[*_`\[\]()~]/g, '');
+        const reason = (d.rejectReason || 'Skor belum memadai').replace(/[*_`\[\]()~]/g, ' ');
+        return `• ${sym}: _${reason}_`;
+      }).join('\n');
+      text += `${sampleDiscarded}\n\n`;
+    }
+
+    text += `_💡 Catatan: Koin di Radar Watchlist otomatis dipantau WebSocket real-time. Bot akan mengeksekusi buy saat candle merah mikro berbalik arah (green rebound)._`;
+
     buttons.push([
-      Markup.button.callback('🔄 Scan Ulang Pasar', 'trigger_scan'),
+      Markup.button.callback('🔄 Refresh Radar Pasar', 'trigger_scan'),
+      Markup.button.callback('📡 Radar Watchlist', 'menu_watchlist'),
       Markup.button.callback('💼 Posisi Aktif', 'menu_positions')
     ]);
 
-    await ctx.replyWithMarkdown(text, Markup.inlineKeyboard(buttons));
+    await safeReplyWithMarkdown(ctx, text, Markup.inlineKeyboard(buttons));
   } catch (err: any) {
-    await ctx.replyWithMarkdown(`❌ Terjadi kesalahan saat scanning: ${err.message}`);
+    await safeReplyWithMarkdown(ctx, `❌ Terjadi kesalahan saat scanning: ${err.message}`);
   }
 }
 
@@ -263,6 +402,134 @@ bot.hears(/^(scan|pindai)$/i, async (ctx) => {
 
 bot.action('trigger_scan', async (ctx) => {
   await handleScanCommand(ctx);
+});
+
+// WATCHLIST COMMAND & LIVE WEBSOCKET RADAR
+async function renderWatchlist(ctx: any, page: number = 1) {
+  const items = getWatchlistStatus();
+  if (items.length === 0) {
+    return safeReplyWithMarkdown(
+      ctx,
+      `📡 *RADAR WEBSOCKET WATCHLIST (0/50)*\n\n` +
+      `Belum ada token yang sedang di-track secara real-time.\n\n` +
+      `_Token akan otomatis masuk ke radar ini saat kamu menjalankan /scan atau saat sistem mendeteksi runner bervolume tinggi._`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback('⚡ Scan Pasar Sekarang', 'trigger_scan')]
+      ])
+    );
+  }
+
+  const PAGE_SIZE = 5;
+  const totalPages = Math.ceil(items.length / PAGE_SIZE) || 1;
+  const currentPage = Math.max(1, Math.min(page, totalPages));
+  const startIndex = (currentPage - 1) * PAGE_SIZE;
+  const displayItems = items.slice(startIndex, startIndex + PAGE_SIZE);
+
+  let text = `📡 *RADAR WEBSOCKET WATCHLIST (${items.length}/50 - Hal ${currentPage}/${totalPages})*\n\n` +
+    `_Token-token ini sedang dipantau secara real-time via Helius RPC WebSocket (0 HTTP Polling, Bebas Rate Limit 429)._\n\n`;
+
+  const buttons: any[] = [];
+
+  for (let i = 0; i < displayItems.length; i++) {
+    const w = displayItems[i];
+    const indexNum = startIndex + i + 1;
+    const cleanSymbol = (w.symbol || 'TOKEN').replace(/[*_`\[\]()~]/g, '');
+    const cleanPool = (w.poolName || cleanSymbol).replace(/[*_`\[\]()~]/g, '');
+    const priceStr = formatPrice(w.lastPriceUsd);
+    const liqStr = formatNumber(w.lastLiquidityUsd);
+    
+    // Status setup
+    let statusText = '⏳ Memantau pergerakan swap';
+    if (w.drawdownFromPeakPct > 8.0) {
+      statusText = `🔴 Drop tajam (-${w.drawdownFromPeakPct.toFixed(1)}% dari peak). Menunggu buyer absorption.`;
+    } else if (w.drawdownFromPeakPct >= 2.0 && w.drawdownFromPeakPct <= 6.0) {
+      if (w.ret1m > 0) {
+        statusText = `🟢 *PULLBACK TERABSORPSI!* Pantulan hijau (+${w.ret1m.toFixed(1)}%). Siap entry!`;
+      } else {
+        statusText = `🟡 Di zona pullback (-${w.drawdownFromPeakPct.toFixed(1)}%). Menunggu 1 tick pantulan hijau.`;
+      }
+    } else if (w.ret1m > 3.0) {
+      statusText = `🚀 Pumping (+${w.ret1m.toFixed(1)}% 1m). Menunggu micro-dip.`;
+    }
+
+    text += `*#${indexNum}* 🪙 *${cleanSymbol}* (${cleanPool})\n` +
+      `• CA: \`${w.mint}\`\n` +
+      `• Harga: *${priceStr}* | Liq: *$${liqStr}*\n` +
+      `• Swaps Terpantau: *${w.ticks} swap ticks* (${w.isPump ? 'Pump.fun Curve' : 'Raydium AMM'})\n` +
+      `• Status: ${statusText}\n\n`;
+  }
+
+  // Clean Token Selector Buttons (2 buttons per row, showing the exact token number and symbol!)
+  const tokenRows: any[] = [];
+  let currentRow: any[] = [];
+
+  for (let i = 0; i < displayItems.length; i++) {
+    const w = displayItems[i];
+    const indexNum = startIndex + i + 1;
+    const cleanSymbol = (w.symbol || 'TOKEN').replace(/[*_`\[\]()~]/g, '');
+
+    currentRow.push(Markup.button.callback(`#${indexNum} 🪙 ${cleanSymbol}`, `token_detail_${w.mint}`));
+    if (currentRow.length === 2 || i === displayItems.length - 1) {
+      tokenRows.push(currentRow);
+      currentRow = [];
+    }
+  }
+
+  buttons.push(...tokenRows);
+
+  // Pagination navigation row
+  if (totalPages > 1) {
+    const navRow: any[] = [];
+    if (currentPage > 1) {
+      navRow.push(Markup.button.callback('⬅️ Prev', `watchlist_page_${currentPage - 1}`));
+    }
+    navRow.push(Markup.button.callback(`📄 ${currentPage} / ${totalPages}`, 'watchlist_noop'));
+    if (currentPage < totalPages) {
+      navRow.push(Markup.button.callback('Next ➡️', `watchlist_page_${currentPage + 1}`));
+    }
+    buttons.push(navRow);
+  }
+
+  buttons.push([
+    Markup.button.callback('🔄 Refresh Watchlist', `watchlist_page_${currentPage}`),
+    Markup.button.callback('⚡ Scan Pasar (/scan)', 'trigger_scan')
+  ]);
+
+  await safeReplyWithMarkdown(ctx, text, Markup.inlineKeyboard(buttons));
+}
+
+bot.command(['watchlist', 'radar', 'ws'], async (ctx) => {
+  const parts = ctx.message.text.trim().split(/\s+/);
+  const page = parts.length > 1 ? parseInt(parts[1], 10) || 1 : 1;
+  await renderWatchlist(ctx, page);
+});
+
+bot.action('menu_watchlist', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  await renderWatchlist(ctx, 1);
+});
+
+bot.action(/watchlist_page_(\d+)/, async (ctx) => {
+  const page = parseInt(ctx.match[1], 10);
+  await ctx.answerCbQuery().catch(() => {});
+  await renderWatchlist(ctx, page);
+});
+
+bot.action('watchlist_noop', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+});
+
+bot.action(/token_detail_([1-9A-HJ-NP-Za-km-z]{32,44})/, async (ctx) => {
+  const tokenMint = ctx.match[1];
+  await ctx.answerCbQuery().catch(() => {});
+  await handleTokenAuditAndSnipe(ctx, tokenMint);
+});
+
+bot.action(/ws_remove_([1-9A-HJ-NP-Za-km-z]{32,44})/, async (ctx) => {
+  const tokenMint = ctx.match[1];
+  removeTokenFromWatchlist(tokenMint);
+  await ctx.answerCbQuery('🗑️ Token dikeluarkan dari Watchlist!').catch(() => {});
+  await renderWatchlist(ctx, 1);
 });
 
 // 3. DYNAMIC CONTRACT ADDRESS (CA) LISTENER
@@ -310,7 +577,11 @@ async function handleTokenAuditAndSnipe(ctx: any, tokenMint: string) {
       Markup.button.callback('⚡ Beli 0.25 SOL', `buy_quick_${tokenMint}_0.25`)
     ],
     [
-      Markup.button.url('📈 DexScreener', market.url)
+      Markup.button.url('📈 DexScreener Live Chart', market.url),
+      Markup.button.callback('🗑️ Hapus dari Watchlist', `ws_remove_${tokenMint}`)
+    ],
+    [
+      Markup.button.callback('📡 Kembali ke Watchlist', 'menu_watchlist')
     ]
   ];
 
@@ -318,6 +589,11 @@ async function handleTokenAuditAndSnipe(ctx: any, tokenMint: string) {
 }
 
 // 4. POSITIONS & PORTFOLIO MANAGEMENT
+bot.command(['learning', 'selflearning', 'audit'], async (ctx) => {
+  const report = adaptiveLearningEngine.getDiagnosticsReport();
+  await ctx.replyWithMarkdown(report);
+});
+
 bot.command('positions', async (ctx) => {
   const parts = ctx.message.text.trim().split(/\s+/);
   const page = parts.length > 1 ? parseInt(parts[1], 10) || 1 : 1;
@@ -477,13 +753,13 @@ async function renderPositions(ctx: any, page: number = 1) {
   try {
     if (ctx.callbackQuery) {
       await ctx.editMessageText(text, { parse_mode: 'Markdown', ...keyboard }).catch(async () => {
-        await ctx.replyWithMarkdown(text, keyboard);
+        await safeReplyWithMarkdown(ctx, text, keyboard);
       });
     } else {
-      await ctx.replyWithMarkdown(text, keyboard);
+      await safeReplyWithMarkdown(ctx, text, keyboard);
     }
   } catch (err: any) {
-    await ctx.replyWithMarkdown(text, keyboard);
+    await safeReplyWithMarkdown(ctx, text, keyboard);
   }
 }
 
@@ -493,58 +769,75 @@ bot.command(['report', 'pnl'], async (ctx) => {
 });
 
 bot.action('menu_report', async (ctx) => {
-  await ctx.answerCbQuery();
-  await renderReport(ctx);
+  try {
+    await ctx.answerCbQuery();
+  } catch {}
+  try {
+    await renderReport(ctx);
+  } catch (err: any) {
+    console.error('[Telegram] Error handling menu_report:', err.message);
+  }
 });
 
 async function renderReport(ctx: any) {
-  const daily = getDailyRealizedPnl();
-  const solPrice = await getSolPriceUsd();
-  const netPnlUsd = daily.netPnlSol * solPrice;
-  const isNetProfit = daily.netPnlSol >= 0;
+  try {
+    const daily = getDailyRealizedPnl();
+    const solPrice = await getSolPriceUsd();
+    const netPnlUsd = daily.netPnlSol * solPrice;
+    const isNetProfit = daily.netPnlSol >= 0;
 
-  let text = `📊 *JURNAL PERFORMA & LABA BERSIH 24 JAM (TRUE NET ACCOUNTING)*\n\n` +
-    `Standar audit Wall Street yang memperhitungkan biaya riil transaksi (*Gas Drag*, Priority Tips, & Slippage):\n\n` +
-    `📈 *Ringkasan Transaksi:*\n` +
-    `• Total Trade Selesai: *${daily.totalTrades}* trade\n` +
-    `• Win / Loss: *${daily.winTrades}* Menang / *${daily.lossTrades}* Kalah\n` +
-    `• Win Rate: *${daily.winRate}%* ${parseFloat(daily.winRate) >= 50 ? '🟢' : '🔴'}\n\n` +
-    `💵 *Kalkulasi Laba Bersih:*\n` +
-    `• Laba Kotor (Gross PnL): *${daily.grossPnlSol >= 0 ? '+' : ''}${daily.grossPnlSol.toFixed(4)} SOL*\n` +
-    `• Biaya Gas & Jito Tip (Est): *-${daily.totalFeesSol.toFixed(4)} SOL*\n` +
-    `• 💰 *Laba Bersih Riil (Net PnL):* *${isNetProfit ? '+' : ''}${daily.netPnlSol.toFixed(4)} SOL* (~*${isNetProfit ? '+' : ''}$${netPnlUsd.toFixed(2)}*) ${isNetProfit ? '🟢' : '🔴'}\n\n`;
+    let text = `📊 *JURNAL PERFORMA & LABA BERSIH 24 JAM (TRUE NET ACCOUNTING)*\n\n` +
+      `Standar audit Wall Street yang memperhitungkan biaya riil transaksi (*Gas Drag*, Priority Tips, & Slippage):\n\n` +
+      `📈 *Ringkasan Transaksi:*\n` +
+      `• Total Trade Selesai: *${daily.totalTrades}* trade\n` +
+      `• Win / Loss: *${daily.winTrades}* Menang / *${daily.lossTrades}* Kalah\n` +
+      `• Win Rate: *${daily.winRate}%* ${parseFloat(daily.winRate) >= 50 ? '🟢' : '🔴'}\n\n` +
+      `💵 *Kalkulasi Laba Bersih:*\n` +
+      `• Laba Kotor (Gross PnL): *${daily.grossPnlSol >= 0 ? '+' : ''}${daily.grossPnlSol.toFixed(4)} SOL*\n` +
+      `• Biaya Gas & Jito Tip (Est): *-${daily.totalFeesSol.toFixed(4)} SOL*\n` +
+      `• 💰 *Laba Bersih Riil (Net PnL):* *${isNetProfit ? '+' : ''}${daily.netPnlSol.toFixed(4)} SOL* (~*${isNetProfit ? '+' : ''}$${netPnlUsd.toFixed(2)}*) ${isNetProfit ? '🟢' : '🔴'}\n\n`;
 
-  if (daily.bestTrade) {
-    text += `🏆 *Trade Terbaik:* *+${daily.bestTrade.pnlPct.toFixed(1)}%* (${daily.bestTrade.symbol}) [Net: +${daily.bestTrade.netPnlSol.toFixed(4)} SOL]\n`;
-  }
-  if (daily.worstTrade) {
-    text += `🔻 *Trade Terburuk:* *${daily.worstTrade.pnlPct.toFixed(1)}%* (${daily.worstTrade.symbol}) [Net: ${daily.worstTrade.netPnlSol.toFixed(4)} SOL]\n`;
-  }
-
-  const history = getTradeHistory(5);
-  if (history.length > 0) {
-    text += `\n📜 *5 Transaksi Terakhir:*\n`;
-    for (const h of history) {
-      const pnlText = h.action === 'SELL'
-        ? ` (${h.pnl_pct >= 0 ? '+' : ''}${h.pnl_pct.toFixed(1)}% / ${h.pnl_sol >= 0 ? '+' : ''}${h.pnl_sol.toFixed(4)} SOL)`
-        : '';
-      const actionBadge = h.action === 'BUY' ? '🟢 BELI' : (h.pnl_pct >= 0 ? '🟢 TP' : '🔴 SL');
-      text += `• ${actionBadge} *${h.token_symbol}*: ${h.total_sol.toFixed(3)} SOL${pnlText} _[${h.reason}]_\n`;
+    if (daily.bestTrade) {
+      const sym = (daily.bestTrade.symbol || '').replace(/[*_`]/g, '');
+      text += `🏆 *Trade Terbaik:* *+${daily.bestTrade.pnlPct.toFixed(1)}%* (${sym}) [Net: +${daily.bestTrade.netPnlSol.toFixed(4)} SOL]\n`;
     }
+    if (daily.worstTrade) {
+      const sym = (daily.worstTrade.symbol || '').replace(/[*_`]/g, '');
+      text += `🔻 *Trade Terburuk:* *${daily.worstTrade.pnlPct.toFixed(1)}%* (${sym}) [Net: ${daily.worstTrade.netPnlSol.toFixed(4)} SOL]\n`;
+    }
+
+    const history = getTradeHistory(5);
+    if (history.length > 0) {
+      text += `\n📜 *5 Transaksi Terakhir:*\n`;
+      for (const h of history) {
+        const pnlText = h.action === 'SELL'
+          ? ` (${h.pnl_pct >= 0 ? '+' : ''}${h.pnl_pct.toFixed(1)}% / ${h.pnl_sol >= 0 ? '+' : ''}${h.pnl_sol.toFixed(4)} SOL)`
+          : '';
+        const actionBadge = h.action === 'BUY' ? '🟢 BELI' : (h.pnl_pct >= 0 ? '🟢 TP' : '🔴 SL');
+        const cleanSymbol = (h.token_symbol || '').replace(/[*_`]/g, '');
+        const cleanReason = (h.reason || '').replace(/[*_`]/g, ' ').trim();
+        text += `• ${actionBadge} *${cleanSymbol}*: ${h.total_sol.toFixed(3)} SOL${pnlText} \`[${cleanReason}]\`\n`;
+      }
+    }
+
+    text += `\n_Data diperbarui secara otomatis setiap ada order jual tereksekusi._`;
+
+    await safeReplyWithMarkdown(ctx, text, Markup.inlineKeyboard([
+      [
+        Markup.button.callback('📐 Metrik Quant', 'menu_quant'),
+        Markup.button.callback('🔬 Uji Backtest', 'menu_backtest')
+      ],
+      [
+        Markup.button.callback('💼 Posisi Aktif', 'menu_positions'),
+        Markup.button.callback('⚡ Pindai Pasar Live', 'trigger_scan')
+      ]
+    ]));
+  } catch (err: any) {
+    console.error('[Telegram] renderReport error:', err.message);
+    try {
+      await ctx.reply(`❌ Terjadi kendala saat menampilkan laporan: ${err.message}`);
+    } catch {}
   }
-
-  text += `\n_Data diperbarui secara otomatis setiap ada order jual tereksekusi._`;
-
-  await ctx.replyWithMarkdown(text, Markup.inlineKeyboard([
-    [
-      Markup.button.callback('📐 Metrik Quant', 'menu_quant'),
-      Markup.button.callback('🔬 Uji Backtest', 'menu_backtest')
-    ],
-    [
-      Markup.button.callback('💼 Posisi Aktif', 'menu_positions'),
-      Markup.button.callback('⚡ Pindai Pasar Live', 'trigger_scan')
-    ]
-  ]));
 }
 
 // 6. QUANT METRICS AUDIT
@@ -553,44 +846,57 @@ bot.command('quant', async (ctx) => {
 });
 
 bot.action('menu_quant', async (ctx) => {
-  await ctx.answerCbQuery();
-  await renderQuantMetrics(ctx);
+  try {
+    await ctx.answerCbQuery();
+  } catch {}
+  try {
+    await renderQuantMetrics(ctx);
+  } catch (err: any) {
+    console.error('[Telegram] Error handling menu_quant:', err.message);
+  }
 });
 
 async function renderQuantMetrics(ctx: any) {
-  const metrics = getPortfolioQuantMetrics();
-  const solPrice = await getSolPriceUsd();
-  const netPnlUsd = metrics.netPnlSol * solPrice;
+  try {
+    const metrics = getPortfolioQuantMetrics();
+    const solPrice = await getSolPriceUsd();
+    const netPnlUsd = metrics.netPnlSol * solPrice;
 
-  let text = `📐 *AUDIT STATISTIK & METRIK KUANTITATIF (INSTITUSIONAL)*\n\n` +
-    `Standar metrik hedge fund yang mengukur rasio imbal hasil terhadap volatilitas dan risiko kerugian modal:\n\n` +
-    `📊 *Rasio Kinerja & Risiko:*\n` +
-    `• *Sharpe Ratio:* *${metrics.sharpeRatio}* ${metrics.sharpeRatio >= 1.5 ? '🏆 (Elite Tier)' : (metrics.sharpeRatio >= 1.0 ? '✅ (Baik)' : '⚠️ (Fluktuatif)')}\n` +
-    `  _Mengukur excess return terhadap total volatilitas portofolio._\n` +
-    `• *Sortino Ratio:* *${metrics.sortinoRatio}* 💎\n` +
-    `  _Hanya menghukum volatilitas penurunan (downside risk), ideal untuk koin meme asimetris._\n` +
-    `• *Profit Factor:* *${metrics.profitFactor}* ${metrics.profitFactor >= 1.75 ? '🟢 (Prima)' : '🔻'}\n` +
-    `  _Rasio total laba kotor dibagi total rugi kotor (standar Wall Street: >1.75)._\n` +
-    `• *Max Drawdown (MDD):* *${metrics.maxDrawdownPct}%* (-${metrics.maxDrawdownSol.toFixed(4)} SOL)\n` +
-    `  _Penurunan modal terdalam dari titik puncak equity curve._\n` +
-    `• *Calmar Ratio:* *${metrics.calmarRatio}*\n` +
-    `  _Rasio imbal hasil tahunan terhadap Max Drawdown._\n` +
-    `• *Payoff Ratio (Win/Loss):* *${metrics.payoffRatio}x*\n` +
-    `  _Rata-rata untung per trade vs rata-rata rugi per trade._\n` +
-    `• *Trade Expectancy:* *${metrics.tradeExpectancySol >= 0 ? '+' : ''}${metrics.tradeExpectancySol.toFixed(4)} SOL / trade*\n` +
-    `  _Nilai ekspektasi matematis keuntungan setiap kali bot mengeksekusi order._\n\n` +
-    `💼 *Ringkasan Akuntansi Real:*\n` +
-    `• Total Trade Selesai: *${metrics.totalTrades}* (${metrics.winTrades}W / ${metrics.lossTrades}L - *${metrics.winRatePct}%* Winrate)\n` +
-    `• Gross PnL: *${metrics.grossPnlSol >= 0 ? '+' : ''}${metrics.grossPnlSol.toFixed(4)} SOL*\n` +
-    `• Gas Drag & Jito Tips: *-${metrics.totalFeesSol.toFixed(4)} SOL*\n` +
-    `• 💰 *Net Laba Bersih:* *${metrics.netPnlSol >= 0 ? '+' : ''}${metrics.netPnlSol.toFixed(4)} SOL* (~$${netPnlUsd.toFixed(2)})\n`;
+    let text = `📐 *AUDIT STATISTIK & METRIK KUANTITATIF (INSTITUSIONAL)*\n\n` +
+      `Standar metrik hedge fund yang mengukur rasio imbal hasil terhadap volatilitas dan risiko kerugian modal:\n\n` +
+      `📊 *Rasio Kinerja & Risiko:*\n` +
+      `• *Sharpe Ratio:* *${metrics.sharpeRatio}* ${metrics.sharpeRatio >= 1.5 ? '🏆 (Elite Tier)' : (metrics.sharpeRatio >= 1.0 ? '✅ (Baik)' : '⚠️ (Fluktuatif)')}\n` +
+      `  _Mengukur excess return terhadap total volatilitas portofolio._\n` +
+      `• *Sortino Ratio:* *${metrics.sortinoRatio}* 💎\n` +
+      `  _Hanya menghukum volatilitas penurunan (downside risk), ideal untuk koin meme asimetris._\n` +
+      `• *Profit Factor:* *${metrics.profitFactor}* ${metrics.profitFactor >= 1.75 ? '🟢 (Prima)' : '🔻'}\n` +
+      `  _Rasio total laba kotor dibagi total rugi kotor (standar Wall Street: >1.75)._\n` +
+      `• *Max Drawdown (MDD):* *${metrics.maxDrawdownPct}%* (-${metrics.maxDrawdownSol.toFixed(4)} SOL)\n` +
+      `  _Penurunan modal terdalam dari titik puncak equity curve._\n` +
+      `• *Calmar Ratio:* *${metrics.calmarRatio}*\n` +
+      `  _Rasio imbal hasil tahunan terhadap Max Drawdown._\n` +
+      `• *Payoff Ratio (Win/Loss):* *${metrics.payoffRatio}x*\n` +
+      `  _Rata-rata untung per trade vs rata-rata rugi per trade._\n` +
+      `• *Trade Expectancy:* *${metrics.tradeExpectancySol >= 0 ? '+' : ''}${metrics.tradeExpectancySol.toFixed(4)} SOL / trade*\n` +
+      `  _Nilai ekspektasi matematis keuntungan setiap kali bot mengeksekusi order._\n\n` +
+      `💼 *Ringkasan Akuntansi Real:*\n` +
+      `• Total Trade Selesai: *${metrics.totalTrades}* (${metrics.winTrades}W / ${metrics.lossTrades}L - *${metrics.winRatePct}%* Winrate)\n` +
+      `• Gross PnL: *${metrics.grossPnlSol >= 0 ? '+' : ''}${metrics.grossPnlSol.toFixed(4)} SOL*\n` +
+      `• Gas Drag & Jito Tips: *-${metrics.totalFeesSol.toFixed(4)} SOL*\n` +
+      `• 💰 *Net Laba Bersih:* *${metrics.netPnlSol >= 0 ? '+' : ''}${metrics.netPnlSol.toFixed(4)} SOL* (~$${netPnlUsd.toFixed(2)})\n`;
 
-  await ctx.replyWithMarkdown(text, Markup.inlineKeyboard([
-    [
-      Markup.button.callback('🔬 Uji Backtest Historis', 'menu_backtest'),
-      Markup.button.callback('📊 Laporan 24 Jam', 'menu_report')
-    ]
-  ]));
+    await safeReplyWithMarkdown(ctx, text, Markup.inlineKeyboard([
+      [
+        Markup.button.callback('🔬 Uji Backtest Historis', 'menu_backtest'),
+        Markup.button.callback('📊 Laporan 24 Jam', 'menu_report')
+      ]
+    ]));
+  } catch (err: any) {
+    console.error('[Telegram] renderQuantMetrics error:', err.message);
+    try {
+      await ctx.reply(`❌ Terjadi kendala saat menampilkan metrik quant: ${err.message}`);
+    } catch {}
+  }
 }
 
 // 7. BACKTEST ENGINE
@@ -786,7 +1092,18 @@ bot.action(/buy_quick_([1-9A-HJ-NP-Za-km-z]{32,44})_([\d.]+)/, async (ctx) => {
   await ctx.answerCbQuery(`Mengeksekusi order ${amountSol} SOL...`);
   await ctx.replyWithMarkdown(`⚡ Memproses pembelian *${amountSol} SOL* untuk \`${tokenMint}\`...`);
 
-  const result = await executeBuyToken(tokenMint, amountSol, 'MANUAL_SNIPER');
+  const result = await executeBuyToken(
+    tokenMint,
+    amountSol,
+    'MANUAL_SNIPER',
+    undefined,
+    undefined,
+    undefined,
+    {
+      setupType: 'MANUAL_SNIPER',
+      explanation: 'Instruksi manual sniper via tombol interaktif Telegram'
+    }
+  );
   if (!result.success) {
     await ctx.replyWithMarkdown(`❌ Pembelian gagal: ${result.message}`);
   }

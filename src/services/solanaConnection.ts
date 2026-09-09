@@ -26,7 +26,8 @@ function initEndpoints() {
         wsUrl,
         connection: new Connection(rpcUrl, {
           commitment: 'confirmed',
-          wsEndpoint: wsUrl
+          wsEndpoint: wsUrl,
+          disableRetryOnRateLimit: true
         })
       });
       console.log(`[ConnectionPool] 🔑 Endpoint #${i + 1} terdaftar: ...${key.slice(-8)}`);
@@ -41,7 +42,8 @@ function initEndpoints() {
       wsUrl,
       connection: new Connection(rpcUrl, {
         commitment: 'confirmed',
-        wsEndpoint: wsUrl
+        wsEndpoint: wsUrl,
+        disableRetryOnRateLimit: true
       })
     });
   }

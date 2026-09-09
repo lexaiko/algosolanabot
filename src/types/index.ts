@@ -78,8 +78,10 @@ export interface TokenMarketData {
   dexId: string;
   url: string;
   priceChange24h: number;
+  priceChange1h?: number;
   priceChange5m?: number;
   volume24h?: number;
+  volume1h?: number;
   volume5m?: number;
   txns5mBuys?: number;
   txns5mSells?: number;
@@ -96,5 +98,23 @@ export interface QueuedWhale {
   reference_pool: string;
   score: number;
   created_at: string;
+}
+
+export interface ExecutionDataReason {
+  setupType?: 'PARABOLIC_BREAKOUT' | 'PULLBACK_ABSORPTION' | 'MOMENTUM_RUNNER' | 'WHALE_COPY' | 'MANUAL_SNIPER' | string;
+  score?: number;
+  minScore?: number;
+  explanation?: string;
+  rvol?: number;
+  priceChange5m?: number;
+  priceChange1h?: number;
+  buySellRatio?: number;
+  flowImbalance?: number;
+  volume5mUsd?: number;
+  whaleNetFlowSol?: number;
+  drawdownFromPeakPct?: number;
+  reboundTickPct?: number;
+  buys5m?: number;
+  sells5m?: number;
 }
 

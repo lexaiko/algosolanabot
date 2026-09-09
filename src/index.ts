@@ -3,6 +3,7 @@ import { initDatabase, getPaperBalance } from './db/index';
 import { bot } from './bot/telegram';
 import { startPositionManager, stopPositionManager } from './services/tradeManager';
 import { startAlgoScanner, stopAlgoScanner } from './services/algoScanner';
+import { startMarketStreamer, stopMarketStreamer } from './services/marketStreamer';
 
 async function main() {
   console.log('====================================================');
@@ -14,8 +15,9 @@ async function main() {
   initDatabase();
   console.log(`[DB] Database initialized successfully. Paper Balance: ${getPaperBalance().toFixed(3)} SOL`);
 
-  // 2. Start Quantitative Execution Engines
+  // 2. Start Quantitative Execution Engines (Zero-Polling Event-Driven WebSocket First)
   startPositionManager();
+  await startMarketStreamer();
   startAlgoScanner();
 
   // 3. Start Telegram Bot
@@ -42,6 +44,7 @@ async function main() {
   const shutdown = () => {
     console.log('\n[System] Shutting down cleanly...');
     stopPositionManager();
+    stopMarketStreamer();
     stopAlgoScanner();
     bot.stop();
     process.exit(0);

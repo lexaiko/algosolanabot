@@ -19,8 +19,9 @@ import { getTokenMarketData, getSolPriceUsd, calculatePriceImpactPct } from './d
 import { getOnChainBondingCurve, getBondingCurveAddress, decodeBondingCurveBuffer } from './bondingCurve';
 import { checkTokenSafety } from './antirug';
 import { getBuyQuote, getSellQuote } from './jupiter';
-import { Whale, Position } from '../types/index';
+import { Whale, Position, ExecutionDataReason } from '../types/index';
 import { getDedicatedConnection, getDedicatedEndpoint } from './solanaConnection';
+import { adaptiveLearningEngine } from '../strategies/adaptiveLearningEngine';
 
 const positionEndpoint = getDedicatedEndpoint('POSITION_MANAGER');
 const wsUrl = positionEndpoint.wsUrl;
@@ -62,7 +63,8 @@ export async function executeBuyToken(
   source: string = 'MANUAL',
   whale?: Whale,
   whaleEntryPriceUsd?: number,
-  prefetchedMarketData?: any
+  prefetchedMarketData?: any,
+  dataReason?: ExecutionDataReason
 ): Promise<{ success: boolean; message: string; position?: Position }> {
   // Circuit Breaker Kill-Switch: Block buys if market crash / severe loss streak detected
   const cb = isCircuitBreakerActive();
@@ -282,28 +284,48 @@ export async function executeBuyToken(
   const totalBuyDeductionSol = amountSol + CONFIG.ESTIMATED_BUY_FEE_SOL;
   updatePaperBalance(-totalBuyDeductionSol);
 
-  // Institutional Continuous Conditional Risk/Reward Engine
-  let targetTpPct = CONFIG.TAKE_PROFIT_PCT;
-  let targetSlPct = CONFIG.STOP_LOSS_PCT;
-  if (CONFIG.VOLATILITY_ADAPTIVE_EXITS) {
-    const absVol = marketData.priceChange5m ? Math.abs(marketData.priceChange5m) : 0;
-    
-    // Dynamic Stop-Loss: strictly bounded between 10.0% and 14.0%
-    // In low-liquidity memecoins, wide SL (like 25%) leads to fatal drawdowns.
-    // Instead, SL is kept tight (-10% to -14%) while position size is downscaled by Kelly.
-    const volSlAdjustment = Math.min(2.0, absVol * 0.10);
-    const liqSlAdjustment = effectiveLiquidity < 15000 ? 1.0 : (effectiveLiquidity > 50000 ? -1.0 : 0.0);
-    targetSlPct = Math.min(14.0, Math.max(10.0, CONFIG.STOP_LOSS_PCT + volSlAdjustment + liqSlAdjustment));
-    targetSlPct = Math.round(targetSlPct * 10) / 10;
+  // Institutional Continuous Conditional Risk/Reward Engine (Self-Learning)
+  const absVol = marketData.priceChange5m ? Math.abs(marketData.priceChange5m) : 0;
+  const dynamicTargets = adaptiveLearningEngine.getDynamicTpSl(absVol, absVol * 1.2);
+  const targetTpPct = dynamicTargets.targetTpPct;
+  const targetSlPct = dynamicTargets.targetSlPct;
 
-    // Dynamic Take-Profit: dynamically expanded on high momentum/volatility
-    // Guarantees an institutional 3.0:1 to 4.5:1 asymmetric payoff ratio!
-    const dynamicTpMultiplier = 3.0 + Math.min(1.0, (absVol / 20.0));
-    targetTpPct = Math.min(65.0, Math.max(CONFIG.TAKE_PROFIT_PCT, targetSlPct * dynamicTpMultiplier));
-    targetTpPct = Math.round(targetTpPct * 10) / 10;
+  // Determine Source Label
+  let sourceLabel = '⚡ Manual Sniper';
+  if (whale) {
+    sourceLabel = `🐋 ${whale.label} (Smart Money)`;
+  } else if (source === 'LIVE_WS_STREAM') {
+    sourceLabel = '⚡ Live WebSocket Stream (Helius Sub-Detik)';
+  } else if (source === 'ALGO_AUTONOMOUS') {
+    sourceLabel = '🔍 Algo Scanner Otonom (Watchdog Cycle)';
+  } else if (source === 'MANUAL_SNIPER') {
+    sourceLabel = '🎯 Manual Sniper (Telegram UI)';
+  } else if (source) {
+    sourceLabel = `⚙️ ${source}`;
   }
 
+  // Setup Model Classification
+  const setup = dataReason?.setupType || (source === 'LIVE_WS_STREAM' ? 'PARABOLIC_BREAKOUT' : (source === 'ALGO_AUTONOMOUS' ? 'MOMENTUM_RUNNER' : (whale ? 'WHALE_COPY' : 'MANUAL_SNIPER')));
+
+  let setupHeader = '🎯 Algorithmic Entry';
+  if (setup === 'PARABOLIC_BREAKOUT') {
+    setupHeader = '🚀 PARABOLIC BREAKOUT (God Candle Momentum)';
+  } else if (setup === 'PULLBACK_ABSORPTION') {
+    setupHeader = '📉 PULLBACK ABSORPTION (Diskon Sehat + Rebound)';
+  } else if (setup === 'WHALE_COPY') {
+    setupHeader = '🐋 SMART MONEY INFLOW (Paus Akumulasi)';
+  } else if (setup === 'MOMENTUM_RUNNER' || setup === 'QUANT_MOMENTUM') {
+    setupHeader = '🔥 ORGANIC RUNNER (Volume Shock & Velocity)';
+  } else if (setup === 'MANUAL_SNIPER') {
+    setupHeader = '🎯 MANUAL SNIPER (User Executed)';
+  }
+
+  const ret5mVal = dataReason?.priceChange5m ?? marketData.priceChange5m;
+  const vol5mVal = dataReason?.volume5mUsd ?? marketData.volume5m;
+  const ratioVal = dataReason?.buySellRatio ?? (marketData.txns5mSells && marketData.txns5mSells > 0 ? ((marketData.txns5mBuys || 0) / marketData.txns5mSells) : undefined);
+
   // 5. Create Position in Database
+  const entryReasonStr = `${setupHeader}${dataReason?.score ? ` (Score: ${dataReason.score}/100)` : ''}`;
   const position = createPosition({
     token_address: tokenMint,
     token_symbol: marketData.symbol,
@@ -313,13 +335,51 @@ export async function executeBuyToken(
     entry_sol: amountSol,
     whale_source: whale ? whale.label : source,
     target_tp_pct: targetTpPct,
-    target_sl_pct: targetSlPct
+    target_sl_pct: targetSlPct,
+    entry_reason: entryReasonStr
   });
   refreshPositionWebSocketSubscriptions();
 
   const remainingBalance = getPaperBalance();
+
+  // Construct Quantitative Data Reason Section for Telegram
+  let dataReasonSection = `\n🧠 *DATA REASON & ALGORITHMIC TRIGGER:*\n` +
+    `• Setup Model: *${setupHeader}*\n`;
+
+  if (dataReason?.score !== undefined) {
+    dataReasonSection += `• Skor Quant: *${dataReason.score}/100* ${dataReason.minScore ? `(Hurdle: *${dataReason.minScore}*)` : ''} 🟢\n`;
+  }
+  if (ret5mVal !== undefined) {
+    const rvolSnippet = dataReason?.rvol ? ` (RVOL: *${dataReason.rvol.toFixed(1)}x* Shock)` : '';
+    dataReasonSection += `• Momentum 5m: *${ret5mVal >= 0 ? '+' : ''}${ret5mVal.toFixed(1)}%*${rvolSnippet}\n`;
+  }
+  if (dataReason?.priceChange1h !== undefined) {
+    dataReasonSection += `• Momentum 1 Jam: *${dataReason.priceChange1h >= 0 ? '+' : ''}${dataReason.priceChange1h.toFixed(1)}%*\n`;
+  }
+  if (vol5mVal) {
+    dataReasonSection += `• Volume 5m: *$${Math.round(vol5mVal).toLocaleString()}*\n`;
+  }
+  if (ratioVal !== undefined) {
+    const buySellCount = (dataReason?.buys5m !== undefined && dataReason?.sells5m !== undefined)
+      ? ` (${dataReason.buys5m} Buys / ${dataReason.sells5m} Sells)`
+      : (marketData.txns5mBuys && marketData.txns5mSells ? ` (${marketData.txns5mBuys}B / ${marketData.txns5mSells}S)` : '');
+    dataReasonSection += `• Order Flow: *${ratioVal.toFixed(1)}x* Dominasi Buyer${buySellCount}\n`;
+  }
+  if (dataReason?.whaleNetFlowSol !== undefined && dataReason.whaleNetFlowSol > 0) {
+    dataReasonSection += `• Smart Money Flow: *+${dataReason.whaleNetFlowSol.toFixed(1)} SOL* Net Akumulasi\n`;
+  }
+  if (dataReason?.drawdownFromPeakPct !== undefined && dataReason.drawdownFromPeakPct > 0) {
+    dataReasonSection += `• Retracement Dip: *-${dataReason.drawdownFromPeakPct.toFixed(1)}%* dari peak lokal\n`;
+  }
+  if (dataReason?.reboundTickPct !== undefined) {
+    dataReasonSection += `• Rebound Tick: *${dataReason.reboundTickPct >= 0 ? '+' : ''}${dataReason.reboundTickPct.toFixed(1)}%* Terkonfirmasi\n`;
+  }
+  if (dataReason?.explanation) {
+    dataReasonSection += `• Konfirmasi Algoritma: _"${dataReason.explanation}"_\n`;
+  }
+
   const buyAlert = `🚀 *ORDER BELI BERHASIL DIEKSEKUSI!* (Simulasi $0)\n\n` +
-    `🏷️ *Sumber:* ${whale ? `🐋 ${whale.label}` : '⚡ Manual Sniper'}\n` +
+    `🏷️ *Sumber:* ${sourceLabel}\n` +
     `🪙 *Token:* *${marketData.symbol}* (${marketData.name})\n` +
     `📝 *CA:* \`${tokenMint}\`\n\n` +
     `📊 *Rincian Order:*\n` +
@@ -328,7 +388,8 @@ export async function executeBuyToken(
     `• Market Cap: *$${formatNumber(marketData.marketCap)}*\n` +
     `• Likuiditas: *$${formatNumber(effectiveLiquidity)}*\n` +
     `• Anti-Rug Score: *${safety.score}/100* (✅ Aman)\n` +
-    `• Sisa Saldo Dummy: *${remainingBalance.toFixed(3)} SOL*\n\n` +
+    `• Sisa Saldo Dummy: *${remainingBalance.toFixed(3)} SOL*\n` +
+    dataReasonSection + '\n' +
     `🎯 *Target TP:* +${targetTpPct}% | 🛑 *Cut Loss:* -${targetSlPct}% (Adaptive Volatility)\n` +
     `_Bot memantau pergerakan harga secara realtime._`;
 
@@ -435,6 +496,18 @@ export async function executeSellToken(
 
   await notify(sellAlert);
 
+  // Self-Learning Engine Feedback: Adapt strategy weights, TP/SL targets, and entry hurdle
+  adaptiveLearningEngine.onTradeClosed({
+    positionId: pos.id,
+    tokenAddress: pos.token_address,
+    tokenSymbol: pos.token_symbol,
+    netPnlSol,
+    pnlPct,
+    reason,
+    strategySource: pos.whale_source,
+    holdingDurationSeconds: Math.floor((Date.now() - new Date(pos.opened_at).getTime()) / 1000)
+  });
+
   // Institutional Risk Control: Circuit Breaker Max Daily Drawdown / Consecutive Stop-Loss Guard
   if (CONFIG.CIRCUIT_BREAKER_ENABLED && (!isProfit || reason.includes('SL') || reason.includes('STOP_LOSS'))) {
     const dailyLosses = getDailyStopLossCount();
@@ -485,6 +558,7 @@ export async function executeWhaleSellFollow(
 let monitorInterval: NodeJS.Timeout | null = null;
 const lastKnownLiquidity: Map<number, number> = new Map();
 const activePositionSubs: Map<number, { accountSubs: number[]; logSubs: number[] }> = new Map();
+const lastWsUpdateTimestamp: Map<number, number> = new Map();
 const evaluatingPositions: Set<number> = new Set();
 
 export function refreshPositionWebSocketSubscriptions() {
@@ -501,6 +575,7 @@ export function refreshPositionWebSocketSubscriptions() {
         try { connection.removeOnLogsListener(subId); } catch {}
       }
       activePositionSubs.delete(posId);
+      lastWsUpdateTimestamp.delete(posId);
       console.log(`[TradeManager] 🛑 WebSocket position tracker stopped for #${posId}`);
     }
   }
@@ -523,6 +598,7 @@ export function refreshPositionWebSocketSubscriptions() {
                 const solPrice = await getSolPriceUsd();
                 const currentPrice = state.spotPriceSol * solPrice;
                 const currentLiq = state.liquiditySol * solPrice;
+                lastWsUpdateTimestamp.set(pos.id, Date.now());
                 await evaluatePosition(pos.id, currentPrice, currentLiq);
               }
             } catch {}
@@ -538,6 +614,7 @@ export function refreshPositionWebSocketSubscriptions() {
           async (logsCtx) => {
             if (logsCtx.err) return;
             try {
+              lastWsUpdateTimestamp.set(pos.id, Date.now());
               await evaluatePosition(pos.id);
             } catch {}
           },
@@ -590,13 +667,14 @@ export async function evaluatePosition(
 
     if (!currentPrice || currentPrice <= 0) return;
 
-    // Flash-Exit Rug Buster: Detect sudden liquidity drainage (>30% in single tick)
+    // Flash-Exit Rug Buster: Detect sudden catastrophic liquidity drainage (Dev pulling liquidity)
     if (CONFIG.FLASH_EXIT_ENABLED && currentLiquidityUsd > 0) {
       const prevLiq = lastKnownLiquidity.get(pos.id);
-      if (prevLiq && prevLiq > 1000) {
+      if (prevLiq && prevLiq > 5000) {
         const dropPct = ((prevLiq - currentLiquidityUsd) / prevLiq) * 100;
-        if (dropPct >= CONFIG.FLASH_EXIT_DROP_PCT) {
-          console.log(`[TradeManager] 🚨 FLASH-EXIT RUG BUSTER TRIGGERED for ${pos.token_symbol}! Liquidity dropped ${dropPct.toFixed(1)}% in single tick.`);
+        // Genuine rug drain: liquidity dumped > 50% AND collapsed below $12k liquidity floor
+        if (dropPct >= 50.0 && currentLiquidityUsd < 12000) {
+          console.log(`[TradeManager] 🚨 FLASH-EXIT RUG BUSTER TRIGGERED for ${pos.token_symbol}! Liquidity dropped ${dropPct.toFixed(1)}% to $${currentLiquidityUsd.toFixed(0)}.`);
           lastKnownLiquidity.delete(pos.id);
           await executeSellToken(pos.id, 100, `FLASH_EXIT_RUG_BUSTER (-${dropPct.toFixed(0)}% Liq Drain)`);
           return;
@@ -703,11 +781,12 @@ export async function evaluatePosition(
 
 export function startPositionManager() {
   if (monitorInterval) return;
-  console.log(`[TradeManager] ⚡ Live Position WebSocket & Fallback Monitor started (Polling fallback: ${CONFIG.POSITION_CHECK_INTERVAL_SEC}s)...`);
+  console.log('[TradeManager] ⚡ Live Position Event-Driven WebSocket Engine aktif (Fallback timeout: 35s).');
 
   refreshPositionWebSocketSubscriptions();
   checkPositions();
-  monitorInterval = setInterval(checkPositions, CONFIG.POSITION_CHECK_INTERVAL_SEC * 1000);
+  // 15-second quiet heartbeat (WebSocket handles live sub-second price ticks)
+  monitorInterval = setInterval(checkPositions, 15000);
 }
 
 export function stopPositionManager() {
@@ -724,18 +803,55 @@ export function stopPositionManager() {
     }
   }
   activePositionSubs.clear();
+  lastWsUpdateTimestamp.clear();
 }
 
+/**
+ * Event-Driven Position Fallback Check:
+ * DOES NOT hammer DexScreener HTTP. Only triggers quiet RPC queries if a position
+ * has received ZERO WebSocket ticks for >35 seconds!
+ */
 async function checkPositions() {
   const openPositions = getOpenPositions();
   if (openPositions.length === 0) return;
 
   refreshPositionWebSocketSubscriptions();
 
+  const now = Date.now();
+  const WS_SILENCE_FALLBACK_MS = 35_000; // 35 seconds
+
   for (const pos of openPositions) {
     try {
+      // 1. Time-Stop / Zombie Position Reaper (24-Hour Turnover)
+      const openedTime = new Date(pos.opened_at).getTime();
+      const hoursHeld = (now - openedTime) / (1000 * 60 * 60);
+      if (hoursHeld >= CONFIG.MAX_HOLD_TIME_HOURS) {
+        console.log(`[TradeManager] ⌛ Time-Stop Triggered for ${pos.token_symbol} (${hoursHeld.toFixed(1)}h held). Liquidating to free capital...`);
+        await executeSellToken(pos.id, 100, `TIME_STOP (${hoursHeld.toFixed(1)}h Zombie Exit)`);
+        continue;
+      }
+
+      // 2. Event-Driven Gate: If WebSocket stream is active, do NOT poll HTTP!
+      const lastWs = lastWsUpdateTimestamp.get(pos.id) || 0;
+      if (now - lastWs < WS_SILENCE_FALLBACK_MS) {
+        continue; // Active WebSocket streaming handles position evaluation
+      }
+
+      // 3. Quiet Fallback: Direct RPC getAccountInfo for Pump.fun tokens (0 DexScreener HTTP)
+      if (pos.token_address.endsWith('pump')) {
+        const curve = await getOnChainBondingCurve(pos.token_address);
+        if (curve && !curve.complete && curve.spotPriceSol > 0) {
+          const solPrice = await getSolPriceUsd();
+          lastWsUpdateTimestamp.set(pos.id, now);
+          await evaluatePosition(pos.id, curve.spotPriceSol * solPrice, curve.liquiditySol * solPrice);
+          continue;
+        }
+      }
+
+      // Raydium / DEX quiet fallback
+      lastWsUpdateTimestamp.set(pos.id, now);
       await evaluatePosition(pos.id);
-    } catch (err: any) {
+    } catch {
       // Ignore transient errors
     }
   }

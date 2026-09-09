@@ -79,7 +79,8 @@ export class DiscoveryFunnel {
       };
     }
 
-    // STAGE 2: Institutional Survival Phase - Age Filter (Anti-Detik-0 Suicide)
+    // STAGE 2: Institutional Survival Phase - Age & Vitality Filter
+    // 2a. Anti-Detik-0 Suicide Gate: Token must have survived at least 180 seconds
     const minAgeSec = CONFIG.MIN_TOKEN_AGE_SEC || 180;
     if (tokenAgeSeconds !== undefined && tokenAgeSeconds < minAgeSec) {
       return {
@@ -90,43 +91,55 @@ export class DiscoveryFunnel {
       };
     }
 
-    const maxAgeHours = CONFIG.MAX_TOKEN_AGE_HOURS || 24;
-    if (tokenAgeSeconds !== undefined && tokenAgeSeconds > (maxAgeHours * 3600)) {
-      return {
-        passed: false,
-        stageFailed: 'SURVIVAL_PHASE_AGE',
-        reason: `Token melebihi batas umur momentum (${(tokenAgeSeconds / 3600).toFixed(1)}j > ${maxAgeHours}j). Menghindari koin zombie mati.`,
-        riskScore: 70
-      };
-    }
-
-    // STAGE 3: Pump.fun Bonding Curve Sweet Spot Gate
-    const isPumpFun = token.isPumpFun || token.address.endsWith('pump');
-    if (isPumpFun && bondingCurveProgressPct !== undefined) {
-      const minCurve = CONFIG.BONDING_CURVE_MIN_PCT || 25.0;
-      const maxCurve = CONFIG.BONDING_CURVE_MAX_PCT || 85.0;
-
-      if (bondingCurveProgressPct < minCurve) {
+    // 2b. Established Token Vitality Gate (> 24 hours):
+    // Pro Trader Rule: Established tokens are NOT zombies if they have active volume and liquidity!
+    // They are prime consolidation breakout runners because dev dumping risk is already 0%.
+    if (tokenAgeSeconds !== undefined && tokenAgeSeconds > (24 * 3600)) {
+      const minEstablishedLiquidity = 15000;
+      const minEstablishedVolume = 30000;
+      if (liquidityUsd < minEstablishedLiquidity || volume24hUsd < minEstablishedVolume) {
         return {
           passed: false,
-          stageFailed: 'BONDING_CURVE_GATE',
-          reason: `Progres bonding curve (${bondingCurveProgressPct.toFixed(1)}%) di bawah batas aman (Min: ${minCurve}%). Dev masih menguasai mayoritas likuiditas virtual.`,
-          riskScore: 85
+          stageFailed: 'SURVIVAL_PHASE_AGE',
+          reason: `Token established (${(tokenAgeSeconds / 3600).toFixed(1)}j) mengalami volume decay (Vol 24j: $${Math.round(volume24hUsd).toLocaleString()} < $30k, Liq: $${Math.round(liquidityUsd).toLocaleString()}). Di-filter sebagai koin zombie mati.`,
+          riskScore: 75
         };
       }
+      // If established token has active volume, it smoothly passes as a Mature Runner!
+    }
 
-      if (bondingCurveProgressPct > maxCurve) {
-        return {
-          passed: false,
-          stageFailed: 'BONDING_CURVE_GATE',
-          reason: `Progres bonding curve (${bondingCurveProgressPct.toFixed(1)}%) di zona bahaya migrasi Raydium (> ${maxCurve}%). Rawan jeda freeze transaksi.`,
-          riskScore: 80
-        };
+    // STAGE 3: Pump.fun Bonding Curve Sweet Spot & Raydium Graduate Gate
+    const isPumpFun = token.isPumpFun || token.address.endsWith('pump');
+    if (isPumpFun && bondingCurveProgressPct !== undefined) {
+      const isGraduated = bondingCurveProgressPct >= 98.0;
+
+      // If still active on Pump.fun bonding curve (not yet graduated to Raydium):
+      if (!isGraduated) {
+        const minCurve = CONFIG.BONDING_CURVE_MIN_PCT || 15.0;
+        const maxCurve = CONFIG.BONDING_CURVE_MAX_PCT || 85.0;
+
+        if (bondingCurveProgressPct < minCurve) {
+          return {
+            passed: false,
+            stageFailed: 'BONDING_CURVE_GATE',
+            reason: `Progres bonding curve (${bondingCurveProgressPct.toFixed(1)}%) di bawah batas aman (Min: ${minCurve}%). Dev masih menguasai mayoritas likuiditas virtual.`,
+            riskScore: 85
+          };
+        }
+
+        if (bondingCurveProgressPct > maxCurve) {
+          return {
+            passed: false,
+            stageFailed: 'BONDING_CURVE_GATE',
+            reason: `Progres bonding curve (${bondingCurveProgressPct.toFixed(1)}%) di zona transisi migrasi Raydium (> ${maxCurve}%). Rawan jeda freeze transaksi.`,
+            riskScore: 80
+          };
+        }
       }
     }
 
     // STAGE 4: Dev Holding & Sybil Concentration Filter
-    const maxDevHolding = CONFIG.MAX_DEV_HOLDING_PCT || 5.0;
+    const maxDevHolding = CONFIG.MAX_DEV_HOLDING_PCT || 8.0;
     if (devHoldingPct !== undefined && devHoldingPct > maxDevHolding) {
       return {
         passed: false,
