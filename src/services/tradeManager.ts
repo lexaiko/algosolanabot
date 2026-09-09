@@ -481,7 +481,18 @@ export async function executeSellToken(
     console.log(`[TradeManager] ⚡ Emergency Exit detected (${reason}). Escalating priority fee & widening slippage tolerance.`);
   }
 
-  const sellAlert = `${isProfit ? '🎉 *TAKE PROFIT DIEKSEKUSI!*' : '🛑 *STOP LOSS DIEKSEKUSI!*'} (Simulasi)\n\n` +
+  let alertHeader = isProfit ? '🎉 *TAKE PROFIT DIEKSEKUSI!*' : '🛑 *STOP LOSS DIEKSEKUSI!*';
+  if (reason.includes('SL_PLUS') || reason.includes('BREAK_EVEN')) {
+    alertHeader = isProfit 
+      ? '💰 *SL PLUS (PROFIT LOCK) DIEKSEKUSI!*' 
+      : '🛡️ *SL PLUS (PROTECTED EXIT) DIEKSEKUSI!*';
+  } else if (reason.includes('TRAILING_STOP') || reason.includes('RUNNER_TRAILING')) {
+    alertHeader = isProfit 
+      ? '🚀 *TRAILING STOP DIEKSEKUSI!*' 
+      : '🛑 *STOP LOSS DIEKSEKUSI!*';
+  }
+
+  const sellAlert = `${alertHeader} (Simulasi)\n\n` +
     `🪙 *Token:* *${pos.token_symbol}*\n` +
     `📝 *Alasan:* \`${reason}\`\n\n` +
     `📊 *Hasil Perdagangan (True Net Accounting):*\n` +
@@ -738,27 +749,49 @@ export async function evaluatePosition(
       return;
     }
 
-    // 3.5. PRO TRADER BREAK-EVEN GUARD (BEP Guard):
-    // Jika token sudah sempat profit >= +10.0%, lindungi modal!
-    // Jika harga kembali turun mendekati titik impas (+1.0%), langsung jual untuk mengunci modal + fee.
-    // Aturan Emas Hedge Fund: Trade yang sudah profit TIDAK BOLEH berbalik menjadi rugi!
+    // 3.5. PRO TRADER SL PLUS & DYNAMIC PROFIT LOCK LADDER (Trailing in Profit):
+    // Prinsip Hedge Fund Pro: Trade yang sudah profit TIDAK BOLEH berbalik menjadi rugi!
+    // SL otomatis dikerek naik (Trailing Stop in Profit) seiring kenaikan harga ke puncak.
     if (pos.is_half_closed === 0 && peakPrice > pos.entry_price_usd) {
       const peakGainPct = ((peakPrice - pos.entry_price_usd) / pos.entry_price_usd) * 100;
-      if (peakGainPct >= 10.0 && pnlPct <= 1.0) {
-        console.log(`[TradeManager] 🛡️ Break-Even Stop Triggered for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Pulled back to ${pnlPct.toFixed(1)}%). Protecting capital!`);
-        await executeSellToken(pos.id, 100, `BREAK_EVEN_GUARD (Peak +${peakGainPct.toFixed(1)}% -> Protected @ +${pnlPct.toFixed(1)}%)`);
+
+      // Tier 4: Moonbag Parabolic Runner (Peak >= +50.0% -> Guaranteed Floor >= +35.0%)
+      if (peakGainPct >= 50.0 && pnlPct <= 35.0) {
+        console.log(`[TradeManager] 💎 SL PLUS TIER 4 (+35% Locked) Triggered for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Current: ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`);
+        await executeSellToken(pos.id, 100, `SL_PLUS_TIER_4 (Peak +${peakGainPct.toFixed(1)}% -> Locked @ ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`);
+        return;
+      }
+
+      // Tier 3: Big Runner (Peak >= +30.0% -> Guaranteed Floor >= +18.0%)
+      if (peakGainPct >= 30.0 && pnlPct <= 18.0) {
+        console.log(`[TradeManager] 💰 SL PLUS TIER 3 (+18% Locked) Triggered for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Current: ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`);
+        await executeSellToken(pos.id, 100, `SL_PLUS_TIER_3 (Peak +${peakGainPct.toFixed(1)}% -> Locked @ ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`);
+        return;
+      }
+
+      // Tier 2: Strong Breakout (Peak >= +18.0% -> Guaranteed Floor >= +8.0%)
+      if (peakGainPct >= 18.0 && pnlPct <= 8.0) {
+        console.log(`[TradeManager] 🛡️ SL PLUS TIER 2 (+8% Locked) Triggered for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Current: ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`);
+        await executeSellToken(pos.id, 100, `SL_PLUS_TIER_2 (Peak +${peakGainPct.toFixed(1)}% -> Locked @ ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`);
+        return;
+      }
+
+      // Tier 1: Zero-Risk Transition / BEP+ (Peak >= +10.0% -> Guaranteed Floor >= +3.5% Cover DEX Fees & Slippage Buffer)
+      if (peakGainPct >= 10.0 && pnlPct <= 3.5) {
+        console.log(`[TradeManager] 🛡️ SL PLUS TIER 1 (BEP+ Cover Fees) Triggered for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Current: ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`);
+        await executeSellToken(pos.id, 100, `SL_PLUS_BEP (Peak +${peakGainPct.toFixed(1)}% -> Protected @ ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`);
         return;
       }
     }
 
-    // 4. TRAILING STOP STANDAR (Jika naik >= 20% tapi belum kena target TP lalu koreksi)
+    // 4. RUNNER TRAILING STOP (Untuk mega runner di atas +60% yang belum kena TP penuh)
     if (pos.is_half_closed === 0) {
       const peakGainPct = ((peakPrice - pos.entry_price_usd) / pos.entry_price_usd) * 100;
-      if (peakGainPct >= 20.0) {
+      if (peakGainPct >= 60.0) {
         const dropFromPeakPct = ((peakPrice - currentPrice) / peakPrice) * 100;
-        if (dropFromPeakPct >= CONFIG.TRAILING_STOP_PCT) {
-          console.log(`[TradeManager] 🛡️ Trailing Stop Triggered for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Dropped: -${dropFromPeakPct.toFixed(1)}%)`);
-          await executeSellToken(pos.id, 100, `TRAILING_STOP (Peak +${peakGainPct.toFixed(1)}%)`);
+        if (dropFromPeakPct >= 15.0) {
+          console.log(`[TradeManager] 🚀 Mega Runner Trailing Stop Triggered for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Dropped: -${dropFromPeakPct.toFixed(1)}%)`);
+          await executeSellToken(pos.id, 100, `RUNNER_TRAILING_STOP (Peak +${peakGainPct.toFixed(1)}%)`);
           return;
         }
       }
