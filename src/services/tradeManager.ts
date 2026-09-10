@@ -610,6 +610,17 @@ export async function executeSellToken(
       alertHeader = '⚡ *EMERGENCY SLIPPAGE CUT!*';
       noteSection = `\n⚠️ *Catatan Slippage:* _Harga pasar jatuh menembus floor sebelum sempat dieksekusi. Bot memotong posisi untuk menghindari risiko drawdown lebih dalam._\n`;
     }
+  } else if (reason.includes('MOONBAG')) {
+    if (isProfit && isNetProfit) {
+      alertHeader = '🚀 *MOONBAG PROFIT HARVEST DIEKSEKUSI!*';
+      noteSection = `\n🌕 *Strategi Moonbag:* _Sisa posisi 50% berhasil memanen cuan puncak dan diamankan otomatis saat terjadi koreksi harga!_\n`;
+    } else if (isProfit) {
+      alertHeader = '🛡️ *MOONBAG BEP GUARD (PROTEKSI IMPAS)!*';
+      noteSection = `\n🛡️ *Prinsip Proteksi:* _Sisa posisi 50% diamankan di titik impas (BEP) demi melindungi modal awal dari ancaman Full Stop-Loss._\n`;
+    } else {
+      alertHeader = '⚡ *EMERGENCY SLIPPAGE CUT (MOONBAG BEP)!*';
+      noteSection = `\n⚠️ *Catatan Likuiditas:* _Terjadi slippage on-chain saat mengeksekusi proteksi impas (BEP Guard). Bot langsung memotong sisa posisi untuk mencegah drawdown lebih dalam._\n`;
+    }
   } else if (reason.includes('TRAILING_STOP') || reason.includes('RUNNER_TRAILING')) {
     alertHeader = isProfit 
       ? '🚀 *TRAILING STOP DIEKSEKUSI!*' 
@@ -856,22 +867,49 @@ export async function evaluatePosition(
       return;
     }
 
-    // 2. STAGE 2 MOONBAG TRAILING STOP (Untuk sisa 50% koin)
+    // 2. STAGE 2 PRO MOONBAG TRAILING STOP & DYNAMIC PROFIT HARVEST (Untuk sisa 50% koin)
     if (pos.is_half_closed === 1) {
       const peakGainPct = ((peakPrice - pos.entry_price_usd) / pos.entry_price_usd) * 100;
-      const dropFromPeakPct = ((peakPrice - currentPrice) / peakPrice) * 100;
+      
+      // Dynamic Gas Drag Calculation for Net Breakeven Floor:
+      // Pastikan floor minimal menutupi round-trip gas fee + buffer slippage agar Net PnL tidak minus
+      const roundTripFeeSol = (CONFIG.ESTIMATED_BUY_FEE_SOL * 0.5) + CONFIG.ESTIMATED_SELL_FEE_SOL;
+      const gasFeePct = pos.entry_sol > 0 ? (roundTripFeeSol / pos.entry_sol) * 100 : 3.0;
+      const netBepFloorPct = Math.max(3.5, Math.min(8.0, gasFeePct + 1.0));
 
-      // Breakeven Floor for Moonbag: Sisa 50% koin tidak boleh berbalik menjadi rugi!
-      // Jika harga turun mendekati entry (+1.0%), langsung tutup sisa posisi 100%!
-      if (pnlPct <= 1.0) {
-        console.log(`[TradeManager] 🛡️ Moonbag BEP Guard Triggered for ${pos.token_symbol} (Locked at BEP)`);
-        await executeSellToken(pos.id, 100, `MOONBAG_BEP_GUARD (Peak +${peakGainPct.toFixed(1)}% -> Protected @ +${pnlPct.toFixed(1)}%)`);
-        return;
+      let moonbagFloorPct: number | null = null;
+      let moonbagReason = '';
+
+      if (peakGainPct >= 50.0) {
+        // Moonbag Mega Runner: Trail 6.0% from peak, guaranteed floor >= +38%
+        moonbagFloorPct = Math.max(38.0, peakGainPct - 6.0);
+        moonbagReason = `MOONBAG_MEGA_RUNNER (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${moonbagFloorPct.toFixed(1)}%)`;
+      } else if (peakGainPct >= 30.0) {
+        // Moonbag Super Runner: Trail 5.0% from peak, guaranteed floor >= +20%
+        moonbagFloorPct = Math.max(20.0, peakGainPct - 5.0);
+        moonbagReason = `MOONBAG_SUPER_RUNNER (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${moonbagFloorPct.toFixed(1)}%)`;
+      } else if (peakGainPct >= 18.0) {
+        // Moonbag Strong Breakout (seperti CATE +19.4%): Trail 4.0% from peak, guaranteed floor >= +12%
+        // -> Koin yang melesat ke +19.4% akan otomatis dieksekusi di +15.4% mengunci cuan besar, TIDAK dibiarkan longsor ke rugi!
+        moonbagFloorPct = Math.max(12.0, peakGainPct - 4.0);
+        moonbagReason = `MOONBAG_PROFIT_HARVEST (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${moonbagFloorPct.toFixed(1)}%)`;
+      } else if (peakGainPct >= 10.0) {
+        // Moonbag Solid Lock: Trail 3.0% from peak, guaranteed floor >= +6.0%
+        moonbagFloorPct = Math.max(6.0, peakGainPct - 3.0);
+        moonbagReason = `MOONBAG_PROFIT_LOCK (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${moonbagFloorPct.toFixed(1)}%)`;
+      } else if (peakGainPct >= 5.0) {
+        // Moonbag Early Runner (seperti PERPSPAD +8.3%): Trail 2.5% from peak, floor >= netBepFloorPct
+        moonbagFloorPct = Math.max(netBepFloorPct, peakGainPct - 2.5);
+        moonbagReason = `MOONBAG_EARLY_RUNNER (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${moonbagFloorPct.toFixed(1)}%)`;
+      } else {
+        // Below +5%: Absolute True Net BEP Guard
+        moonbagFloorPct = netBepFloorPct;
+        moonbagReason = `MOONBAG_TRUE_NET_BEP (Protected @ +${moonbagFloorPct.toFixed(1)}%)`;
       }
 
-      if (dropFromPeakPct >= CONFIG.TRAILING_STOP_PCT) {
-        console.log(`[TradeManager] 🌕 Moonbag Trailing Stop Triggered for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Dropped: -${dropFromPeakPct.toFixed(1)}%)`);
-        await executeSellToken(pos.id, 100, `MOONBAG_TRAILING_STOP (Peak +${peakGainPct.toFixed(1)}%)`);
+      if (pnlPct <= moonbagFloorPct) {
+        console.log(`[TradeManager] 🛡️ Moonbag Dynamic Trailing Floor Triggered for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Floor: +${moonbagFloorPct.toFixed(1)}%, Current: +${pnlPct.toFixed(1)}%)`);
+        await executeSellToken(pos.id, 100, moonbagReason);
         return;
       }
     }
