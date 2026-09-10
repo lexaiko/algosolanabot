@@ -609,6 +609,23 @@ export function getLastClosedPosition(tokenAddress: string): Position | undefine
   return db.prepare("SELECT * FROM positions WHERE token_address = ? AND status = 'CLOSED' ORDER BY id DESC LIMIT 1").get(tokenAddress) as unknown as Position | undefined;
 }
 
+export function getConsecutiveAlgoLosses(): number {
+  try {
+    const rows = db.prepare("SELECT pnl_pct FROM positions WHERE status = 'CLOSED' ORDER BY id DESC LIMIT 10").all() as { pnl_pct: number }[];
+    let streak = 0;
+    for (const r of rows) {
+      if (r.pnl_pct <= 0) {
+        streak++;
+      } else {
+        break; // Streak broken by a winning trade!
+      }
+    }
+    return streak;
+  } catch {
+    return 0;
+  }
+}
+
 export function createPosition(pos: {
   token_address: string;
   token_symbol: string;
