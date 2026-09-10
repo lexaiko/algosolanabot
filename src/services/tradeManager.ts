@@ -747,6 +747,14 @@ export async function evaluatePosition(
       const peakGainPct = ((peakPrice - pos.entry_price_usd) / pos.entry_price_usd) * 100;
       const dropFromPeakPct = ((peakPrice - currentPrice) / peakPrice) * 100;
 
+      // Breakeven Floor for Moonbag: Sisa 50% koin tidak boleh berbalik menjadi rugi!
+      // Jika harga turun mendekati entry (+1.0%), langsung tutup sisa posisi 100%!
+      if (pnlPct <= 1.0) {
+        console.log(`[TradeManager] 🛡️ Moonbag BEP Guard Triggered for ${pos.token_symbol} (Locked at BEP)`);
+        await executeSellToken(pos.id, 100, `MOONBAG_BEP_GUARD (Peak +${peakGainPct.toFixed(1)}% -> Protected @ +${pnlPct.toFixed(1)}%)`);
+        return;
+      }
+
       if (dropFromPeakPct >= CONFIG.TRAILING_STOP_PCT) {
         console.log(`[TradeManager] 🌕 Moonbag Trailing Stop Triggered for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Dropped: -${dropFromPeakPct.toFixed(1)}%)`);
         await executeSellToken(pos.id, 100, `MOONBAG_TRAILING_STOP (Peak +${peakGainPct.toFixed(1)}%)`);
@@ -794,11 +802,35 @@ export async function evaluatePosition(
 
       if (targetFloorPct !== null && pnlPct <= targetFloorPct) {
         if (pnlPct >= 0.5) {
-          console.log(`[TradeManager] 💰 SL PLUS ${tierLabel} (+${targetFloorPct.toFixed(1)}% Floor) Triggered for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Current: +${pnlPct.toFixed(1)}%)`);
-          await executeSellToken(pos.id, 100, `SL_PLUS_${tierLabel} (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${pnlPct.toFixed(1)}%)`);
+          // PRO TRADER SCALE-OUT (50:50 RULE):
+          // Jual 50% posisi untuk mengunci modal + profit, sisa 50% dijadikan Free-Roll Moonbag!
+          console.log(`[TradeManager] 💰 SL PLUS 50:50 PARTIAL PROFIT LOCK for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Floor: +${targetFloorPct.toFixed(1)}%, Current: +${pnlPct.toFixed(1)}%)`);
+          
+          const isPump = pos.token_address.endsWith('pump');
+          const dexFeePct = isPump ? 1.0 : 0.25;
+          const halfTokens = pos.amount_tokens * 0.5;
+          const grossSoldUsd = halfTokens * currentPrice;
+          const grossSoldSol = grossSoldUsd / solPriceUsd;
+          const netSoldSol = grossSoldSol * (1 - dexFeePct / 100);
+          const creditedSol = Math.max(0, netSoldSol - CONFIG.ESTIMATED_SELL_FEE_SOL);
+
+          updatePaperBalance(creditedSol);
+          halfClosePosition(pos.id, currentPrice, creditedSol, `SL_PLUS_50_50_${tierLabel} (+${pnlPct.toFixed(1)}%)`);
+
+          const remainingBalance = getPaperBalance();
+          const halfAlert = `💰 *SL PLUS: 50% PROFIT LOCK & FREE-ROLL MOONBAG!* (Simulasi)\n\n` +
+            `🪙 *Token:* *${pos.token_symbol}* (${pos.token_name})\n` +
+            `📈 *Profit 50% Pertama Terkunci:* *+${pnlPct.toFixed(1)}%* (Peak: +${peakGainPct.toFixed(1)}%) 🟢\n` +
+            `💵 *Dana Diamankan:* *${creditedSol.toFixed(4)} SOL* (~$${(creditedSol * solPriceUsd).toFixed(2)})\n` +
+            `🛡️ *Status:* *Modal Awal & Sebagian Cuan Masuk Dompet!* Trade ini 100% BEBAS RISIKO.\n` +
+            `🌕 *Sisa 50% Posisi:* Menjadi *FREE-ROLL MOONBAG* dikawal Trailing Stop (${CONFIG.TRAILING_STOP_PCT}%).\n` +
+            `💼 *Saldo Virtual Sekarang:* *${remainingBalance.toFixed(3)} SOL*\n\n` +
+            `_Jika token meledak ratusan persen, sisa 50% ini akan memanen cuan puncak tanpa takut rugi!_`;
+
+          await notify(halfAlert);
           return;
         } else {
-          // Flash dump slipped past the trailing floor in a single block before it could be caught
+          // Flash dump slipped past the trailing floor in a single block before it could be caught: Liquidate 100% emergency
           console.log(`[TradeManager] ⚡ FLASH DUMP SLIPPAGE GAP RESCUE for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Floor: +${targetFloorPct.toFixed(1)}%, Breached to: ${pnlPct.toFixed(1)}%)`);
           await executeSellToken(pos.id, 100, `FLASH_DUMP_RESCUE (Peak +${peakGainPct.toFixed(1)}% Jebol Floor +${targetFloorPct.toFixed(1)}% -> Cut @ ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`);
           return;
