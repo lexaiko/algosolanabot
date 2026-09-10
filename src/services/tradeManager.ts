@@ -13,7 +13,8 @@ import {
   recordWhaleTrade,
   isCircuitBreakerActive,
   tripCircuitBreaker,
-  getDailyStopLossCount
+  getDailyStopLossCount,
+  getConsecutiveAlgoLosses
 } from '../db/index';
 import { getTokenMarketData, getSolPriceUsd, calculatePriceImpactPct } from './dexscreener';
 import { getOnChainBondingCurve, getBondingCurveAddress, decodeBondingCurveBuffer } from './bondingCurve';
@@ -56,16 +57,78 @@ export function extractNarrative(symbol: string, name: string): string {
   return 'OTHER';
 }
 
+export interface DynamicSizingResult {
+  allocatedSol: number;
+  basePercentSol: number;
+  streakDecay: number;
+  consecutiveLosses: number;
+  rationale: string;
+}
+
+/**
+ * Dynamic Equity Sizing with Consecutive Loss Scaling for Algo Bot
+ * - Base sizing: 5% of current equity
+ * - Losing streak penalty: drops by 0.75^losses (Anti-Martingale defense)
+ * - Floor: 0.030 SOL (preserves capital while maintaining viable on-chain trade)
+ */
+export function getDynamicAlgoBuyAmount(): DynamicSizingResult {
+  const balance = getPaperBalance();
+  const consecutiveLosses = getConsecutiveAlgoLosses();
+
+  // 1. Base Target: 5.0% of current equity
+  const baseFraction = 0.05;
+  const rawBaseSol = balance * baseFraction;
+
+  // 2. Minimum Viable Solana Floor: 0.030 SOL (prevents excessive gas fee ratio)
+  const MIN_FLOOR_SOL = 0.030;
+  // Maximum Cap: Max 0.050 SOL on 1 SOL scale, or up to 0.12 SOL on larger balances
+  const MAX_CAP_SOL = balance <= 1.5 ? 0.050 : Math.min(0.12, Math.max(0.050, balance * 0.08));
+
+  // 3. Loss Streak Decay (Anti-Martingale Defensive Sizing):
+  // 0 losses: 1.0x (full conviction)
+  // 1 loss: 0.75x (-25% size reduction)
+  // 2 losses: 0.56x (-44% size reduction)
+  // 3+ losses: minimum floor 0.030 SOL
+  const streakDecay = consecutiveLosses > 0 ? Math.pow(0.75, consecutiveLosses) : 1.0;
+
+  let allocatedSol = rawBaseSol * streakDecay;
+
+  // Bound within [MIN_FLOOR_SOL, MAX_CAP_SOL]
+  allocatedSol = Math.max(MIN_FLOOR_SOL, Math.min(MAX_CAP_SOL, allocatedSol));
+  
+  // Guard if balance is low
+  if (balance < allocatedSol + 0.005) {
+    allocatedSol = Math.max(0.02, balance * 0.5);
+  }
+
+  allocatedSol = Math.round(allocatedSol * 1000) / 1000;
+
+  return {
+    allocatedSol,
+    basePercentSol: Math.round(rawBaseSol * 1000) / 1000,
+    streakDecay: Math.round(streakDecay * 100) / 100,
+    consecutiveLosses,
+    rationale: `Balance: ${balance.toFixed(3)} SOL | 5% Base: ${rawBaseSol.toFixed(3)} SOL | Loss Streak: ${consecutiveLosses} (Decay: ${streakDecay.toFixed(2)}x) -> Final: ${allocatedSol} SOL`
+  };
+}
+
 // 1. EXECUTE BUY (Copy-Trade or Manual)
 export async function executeBuyToken(
   tokenMint: string,
-  amountSol: number = CONFIG.DEFAULT_BUY_AMOUNT_SOL,
+  amountSol?: number,
   source: string = 'MANUAL',
   whale?: Whale,
   whaleEntryPriceUsd?: number,
   prefetchedMarketData?: any,
   dataReason?: ExecutionDataReason
 ): Promise<{ success: boolean; message: string; position?: Position }> {
+  // Apply Dynamic Equity Sizing if amountSol is not explicitly specified or default
+  if (!amountSol || amountSol === CONFIG.DEFAULT_BUY_AMOUNT_SOL) {
+    const dynamicSizing = getDynamicAlgoBuyAmount();
+    amountSol = dynamicSizing.allocatedSol;
+    console.log(`[TradeManager] 💰 Dynamic Sizing Applied: ${amountSol} SOL (${dynamicSizing.rationale})`);
+  }
+
   // Circuit Breaker Kill-Switch: Block buys if market crash / severe loss streak detected
   const cb = isCircuitBreakerActive();
   if (cb.active) {

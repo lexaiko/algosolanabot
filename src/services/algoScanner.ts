@@ -1,7 +1,7 @@
 import axios from 'axios';
 import { getTokenMarketData, getMultiTokenMarketData, getSolPriceUsd } from './dexscreener';
 import { checkTokenSafety } from './antirug';
-import { executeBuyToken } from './tradeManager';
+import { executeBuyToken, getDynamicAlgoBuyAmount } from './tradeManager';
 import { getOpenPositions, getOpenPositionByToken, getLastClosedPosition, getPaperBalance, getWhaleQueue, isTokenBlacklisted } from '../db/index';
 import { discoveryFunnel } from '../market/discoveryFunnel';
 import { opportunityScorer } from '../execution/opportunityScorer';
@@ -565,17 +565,21 @@ export async function runAlgoScanCycle() {
       return; // Portfolio capacity full
     }
 
+    const dynamicSizing = getDynamicAlgoBuyAmount();
+    const allocatedSol = dynamicSizing.allocatedSol;
+
     const balance = getPaperBalance();
-    if (balance < CONFIG.DEFAULT_BUY_AMOUNT_SOL) {
+    if (balance < allocatedSol + CONFIG.ESTIMATED_BUY_FEE_SOL) {
       return; // Insufficient funds
     }
 
     console.log(`[AlgoScanner] 🚀 GOLDEN OPPORTUNITY DETECTED: ${best.symbol} (${best.name}) Skor: ${best.score}/100 (Ambang Adaptif: >=${dynamicMinScore})!`);
+    console.log(`[AlgoScanner] 💰 Dynamic Equity Sizing: ${allocatedSol} SOL (${dynamicSizing.rationale})`);
     
     // Execute Autonomous Buy
     await executeBuyToken(
       best.mint,
-      CONFIG.DEFAULT_BUY_AMOUNT_SOL,
+      allocatedSol,
       'ALGO_AUTONOMOUS',
       undefined,
       undefined,

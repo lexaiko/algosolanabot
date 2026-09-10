@@ -4,7 +4,7 @@ import { getDedicatedConnection } from './solanaConnection';
 import { getBondingCurveAddress, decodeBondingCurveBuffer } from './bondingCurve';
 import { getSolPriceUsd, getTokenMarketData, getMultiTokenMarketData } from './dexscreener';
 import { getOpenPositionByToken, getOpenPositions, getLastClosedPosition } from '../db/index';
-import { executeBuyToken } from './tradeManager';
+import { executeBuyToken, getDynamicAlgoBuyAmount } from './tradeManager';
 import { entryEngine } from '../execution';
 import { adaptiveLearningEngine } from '../strategies/adaptiveLearningEngine';
 import { getOrganicTrendingTokens } from './algoScanner';
@@ -420,13 +420,16 @@ async function evaluateWatchlistCandidateOnTick(item: WatchedCandidate, curveSta
       }
     }
 
-    console.log(`[MarketStreamer] 🎯 INSTANT WEBSOCKET SIGNAL: ${item.symbol} Score=${decision.compositeScore}/${minScore} (+${priceChangePct.toFixed(1)}% 5m velocity)!`);
-
     const isBreakout = decision.reason.includes('PARABOLIC_BREAKOUT') || (vector.volumeAcceleration >= 1.8 && vector.buySellRatio >= 1.75);
+
+    const dynamicSizing = getDynamicAlgoBuyAmount();
+    const allocatedSol = dynamicSizing.allocatedSol;
+
+    console.log(`[MarketStreamer] 💰 Dynamic Equity Sizing: ${allocatedSol} SOL (${dynamicSizing.rationale})`);
 
     await executeBuyToken(
       item.tokenMint,
-      CONFIG.DEFAULT_BUY_AMOUNT_SOL,
+      allocatedSol,
       `LIVE_WS_STREAM`,
       undefined,
       undefined,
