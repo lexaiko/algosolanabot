@@ -605,6 +605,10 @@ export function getOpenPositionByToken(tokenAddress: string): Position | undefin
   return db.prepare("SELECT * FROM positions WHERE token_address = ? AND status = 'OPEN'").get(tokenAddress) as unknown as Position | undefined;
 }
 
+export function getLastClosedPosition(tokenAddress: string): Position | undefined {
+  return db.prepare("SELECT * FROM positions WHERE token_address = ? AND status = 'CLOSED' ORDER BY id DESC LIMIT 1").get(tokenAddress) as unknown as Position | undefined;
+}
+
 export function createPosition(pos: {
   token_address: string;
   token_symbol: string;
