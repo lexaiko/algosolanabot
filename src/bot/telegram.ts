@@ -1146,13 +1146,39 @@ bot.action(/cancel_sell_(\d+)/, async (ctx) => {
   } catch {}
 });
 
-// Inline Quick Buy Action
+// Inline Quick Buy Action with Two-Step Confirmation (Anti-Accidental Tap)
 bot.action(/buy_quick_([1-9A-HJ-NP-Za-km-z]{32,44})_([\d.]+)/, async (ctx) => {
   const tokenMint = ctx.match[1];
   const amountSol = parseFloat(ctx.match[2]);
 
-  await ctx.answerCbQuery(`Mengeksekusi order ${amountSol} SOL...`);
-  await ctx.replyWithMarkdown(`⚡ Memproses pembelian *${amountSol} SOL* untuk \`${tokenMint}\`...`);
+  await ctx.answerCbQuery('⚠️ Konfirmasi pembelian dibutuhkan');
+
+  const confirmKeyboard = Markup.inlineKeyboard([
+    [
+      Markup.button.callback(`✅ Ya, Beli ${amountSol} SOL`, `cbuy_${tokenMint}_${amountSol}`),
+      Markup.button.callback(`❌ Batalkan`, `cancel_buy`)
+    ]
+  ]);
+
+  await safeReplyWithMarkdown(
+    ctx,
+    `⚠️ *KONFIRMASI PEMBELIAN MANUAL (SNIPER)*\n\n` +
+    `Anda akan melakukan order beli token:\n` +
+    `• Mint: \`${tokenMint}\`\n` +
+    `• Nilai: *${amountSol} SOL*\n\n` +
+    `_Klik tombol konfirmasi di bawah ini untuk mengeksekusi, atau batalkan jika tidak sengaja tertekan._`,
+    confirmKeyboard
+  );
+});
+
+bot.action(/cbuy_([1-9A-HJ-NP-Za-km-z]{32,44})_([\d.]+)/, async (ctx) => {
+  const tokenMint = ctx.match[1];
+  const amountSol = parseFloat(ctx.match[2]);
+
+  await ctx.answerCbQuery(`🚀 Mengeksekusi order ${amountSol} SOL...`);
+  try {
+    await ctx.editMessageText(`⏳ *Memproses pembelian ${amountSol} SOL untuk \`${tokenMint}\`...*`, { parse_mode: 'Markdown' }).catch(() => {});
+  } catch {}
 
   const result = await executeBuyToken(
     tokenMint,
@@ -1167,8 +1193,15 @@ bot.action(/buy_quick_([1-9A-HJ-NP-Za-km-z]{32,44})_([\d.]+)/, async (ctx) => {
     }
   );
   if (!result.success) {
-    await ctx.replyWithMarkdown(`❌ Pembelian gagal: ${result.message}`);
+    await safeReplyWithMarkdown(ctx, `❌ *Pembelian gagal:* ${result.message}`);
   }
+});
+
+bot.action('cancel_buy', async (ctx) => {
+  await ctx.answerCbQuery('✅ Pembelian dibatalkan');
+  try {
+    await ctx.editMessageText(`🛡️ *Pembelian token dibatalkan.* Saldo SOL Anda aman.`, { parse_mode: 'Markdown' }).catch(() => {});
+  } catch {}
 });
 
 // Watcher Actions
