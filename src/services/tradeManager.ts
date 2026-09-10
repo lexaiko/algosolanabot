@@ -554,14 +554,18 @@ export async function executeSellToken(
   }
 
   // Execution Escalation Log for Emergency Exits
-  if (reason.includes('SL') || reason.includes('FLASH_EXIT') || reason.includes('WHALE_DUMP')) {
+  if (reason.includes('SL') || reason.includes('FLASH_EXIT') || reason.includes('WHALE_DUMP') || reason.includes('VELOCITY_DUMP')) {
     console.log(`[TradeManager] ⚡ Emergency Exit detected (${reason}). Escalating priority fee & widening slippage tolerance.`);
   }
 
   let alertHeader = isProfit ? '🎉 *TAKE PROFIT DIEKSEKUSI!*' : '🛑 *STOP LOSS DIEKSEKUSI!*';
   let noteSection = '';
 
-  if (reason.includes('FLASH_DUMP_RESCUE')) {
+  if (reason.includes('VELOCITY_DUMP_RESCUE')) {
+    alertHeader = '⚡ *EMERGENCY VELOCITY DUMP RESCUE (CUT CEPAT)!*';
+    noteSection = `\n⚠️ *Analisis On-Chain (Deteksi Terjun Bebas):*\n` +
+      `_Terdeteksi aksi dump dev/cabal mendadak dalam hitungan detik setelah entry. Bot memotong posisi lebih awal di ${pnlPct.toFixed(1)}% tanpa menunggu batas Stop-Loss penuh demi menyelamatkan modal Anda sebelum liquidity pool terkuras!_\n`;
+  } else if (reason.includes('FLASH_DUMP_RESCUE')) {
     alertHeader = '⚡ *EMERGENCY FLASH DUMP RESCUE (SLIPPAGE GAP)!*';
     noteSection = `\n⚠️ *Analisis On-Chain (Slippage Gap Down):*\n` +
       `_Token sempat mencatat profit puncak, namun terjadi dump masif on-chain dalam 1 blok yang melompati batas pengaman. Bot langsung melikuidasi darurat di ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}% untuk mengamankan sisa modal Anda sebelum rugi fatal terkena Full SL (-${pos.target_sl_pct || CONFIG.STOP_LOSS_PCT}%)._\n`;
@@ -837,6 +841,22 @@ export async function evaluatePosition(
         await executeSellToken(pos.id, 100, `MOONBAG_TRAILING_STOP (Peak +${peakGainPct.toFixed(1)}%)`);
         return;
       }
+    }
+
+    // 2.8. VELOCITY DUMP RESCUE (Anti-Rug / Early Collapse Cut)
+    // Prinsip Pro: Jika koin baru dibeli (<90s) dan langsung anjlok <= -7%, atau terjadi sudden plunge tick drop,
+    // JANGAN tunggu sampai -14%! Potong langsung di -7% untuk menyelamatkan modal sebelum pool terkuras!
+    const ageSec = (Date.now() - new Date(pos.opened_at).getTime()) / 1000;
+    const isFreshCollapse = (ageSec <= 90 && pnlPct <= -7.0);
+    const isPlungeDrop = (pnlPct <= -6.5 && pos.current_price_usd > 0 && ((pos.current_price_usd - currentPrice) / pos.current_price_usd) * 100 >= 3.5);
+
+    if (pos.is_half_closed === 0 && (isFreshCollapse || isPlungeDrop)) {
+      const reasonDetail = isFreshCollapse 
+        ? `Fresh collapse (${pnlPct.toFixed(1)}% in ${ageSec.toFixed(0)}s < 90s)` 
+        : `Plunge drop (${pnlPct.toFixed(1)}% with severe tick velocity)`;
+      console.log(`[TradeManager] ⚡ VELOCITY DUMP RESCUE triggered for ${pos.token_symbol}: ${reasonDetail}`);
+      await executeSellToken(pos.id, 100, `VELOCITY_DUMP_RESCUE (${reasonDetail})`);
+      return;
     }
 
     // 3. STOP-LOSS (Adaptive Target)
