@@ -15,9 +15,9 @@ export const CONFIG = {
     : 'https://solana-rpc.publicnode.com'),
 
   PAPER_TRADING: process.env.PAPER_TRADING !== 'false', // Default to true for safety
-  INITIAL_PAPER_BALANCE_SOL: Number(process.env.INITIAL_PAPER_BALANCE_SOL) || 10.0,
-  DEFAULT_BUY_AMOUNT_SOL: Number(process.env.DEFAULT_BUY_AMOUNT_SOL) || 0.12,
-  VIP_BUY_AMOUNT_SOL: Number(process.env.VIP_BUY_AMOUNT_SOL) || 0.20, // Tier-weighted sizing for VIP whales
+  INITIAL_PAPER_BALANCE_SOL: Number(process.env.INITIAL_PAPER_BALANCE_SOL) || 1.0,
+  DEFAULT_BUY_AMOUNT_SOL: Number(process.env.DEFAULT_BUY_AMOUNT_SOL) || 0.05,
+  VIP_BUY_AMOUNT_SOL: Number(process.env.VIP_BUY_AMOUNT_SOL) || 0.075, // Tier-weighted sizing for VIP whales
   SLIPPAGE_PCT: Number(process.env.SLIPPAGE_PCT) || 2.5,
 
   // Risk Management & Multi-Tier TP
