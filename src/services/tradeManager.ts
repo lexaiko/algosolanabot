@@ -523,18 +523,18 @@ export async function executeSellToken(
   refreshPositionWebSocketSubscriptions();
 
   const pnlPct = ((effectiveExitPriceUsd - pos.entry_price_usd) / pos.entry_price_usd) * 100;
-  const pnlSol = actualCreditedSol - (pos.entry_sol * (sellPct / 100));
+  const grossPnlSol = grossExitSol - (pos.entry_sol * (sellPct / 100));
   const isProfit = pnlPct >= 0;
   const newBalance = getPaperBalance();
 
-  // True Net Fee Accounting (includes Buy Gas, Sell Gas, DEX Fee)
-  const roundTripFeeSol = CONFIG.ESTIMATED_BUY_FEE_SOL + CONFIG.ESTIMATED_SELL_FEE_SOL + (grossExitSol * (dexFeePct / 100));
-  const netPnlSol = pnlSol;
+  // True Net Fee Accounting (includes Buy Gas, Sell Gas, DEX Protocol Fee)
+  const roundTripFeeSol = (CONFIG.ESTIMATED_BUY_FEE_SOL * (sellPct / 100)) + CONFIG.ESTIMATED_SELL_FEE_SOL + (grossExitSol * (dexFeePct / 100));
+  const netPnlSol = grossPnlSol - roundTripFeeSol;
   const isNetProfit = netPnlSol >= 0;
 
   // Record whale performance for institutional grading & auto-promotion
   if (pos.whale_source && pos.whale_source !== 'MANUAL' && pos.whale_source !== 'MANUAL_SNIPER') {
-    const perf = recordWhaleTrade(pos.whale_source, pnlSol, isProfit);
+    const perf = recordWhaleTrade(pos.whale_source, netPnlSol, isNetProfit);
     if (perf?.promoted) {
       const promoMsg = `🎖️ *PROMOSI ELITE SMART MONEY!*\n\n` +
         `Dompet *${perf.whale.label}* (\`${perf.whale.address.slice(0, 6)}...${perf.whale.address.slice(-4)}\`) berhasil membuktikan profitabilitas!\n` +
@@ -588,7 +588,7 @@ export async function executeSellToken(
     `📝 *Alasan:* \`${reason}\`\n\n` +
     `📊 *Hasil Perdagangan (True Net Accounting):*\n` +
     `• PnL %: *${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%* ${isProfit ? '🟢' : '🔴'}\n` +
-    `• Gross PnL: *${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL* (~$${(pnlSol * solPriceUsd).toFixed(2)})\n` +
+    `• Gross PnL: *${grossPnlSol >= 0 ? '+' : ''}${grossPnlSol.toFixed(4)} SOL* (~$${(grossPnlSol * solPriceUsd).toFixed(2)})\n` +
     `• Biaya On-Chain: *-${roundTripFeeSol.toFixed(4)} SOL* (Gas + Priority + Jito Tip)\n` +
     `• Net PnL Bersih: *${netPnlSol >= 0 ? '+' : ''}${netPnlSol.toFixed(4)} SOL* (~$${(netPnlSol * solPriceUsd).toFixed(2)}) ${isNetProfit ? '💰' : '🔻'}\n` +
     `• Modal Posisi: ${pos.entry_sol.toFixed(3)} SOL\n` +
