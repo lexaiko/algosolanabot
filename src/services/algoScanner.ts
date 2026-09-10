@@ -397,6 +397,11 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
         return1m = ret5m * 0.15;
       }
 
+      // Precision Upper Wick Ratio for Pucuk Guard (Jarum Atas > 40% of body)
+      const upperWickRatio = (ret5m > 0 && drawdownFromPeakPct > 0)
+        ? ((drawdownFromPeakPct / 100) / Math.max(0.01, 1 - drawdownFromPeakPct / 100)) / Math.max(0.01, ret5m / (100 + ret5m))
+        : (drawdownFromPeakPct > 3.0 ? 999.0 : 0);
+
       const vector: FeatureVector = {
         tokenId: item.tokenMint,
         timestampMs: Date.now(),
@@ -408,6 +413,7 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
         atrPct,
         breakoutDistancePct: Math.max(0, ret5m - 2.0),
         drawdownFromPeakPct,
+        upperWickRatio,
         volume5mUsd,
         volumeAcceleration,
         buySellRatio,
@@ -430,7 +436,10 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
       // 1. Pucuk & Exhaustion Filter (Anti-Late Distribution & Anti-FOMO Spike)
       let isExhausted = false;
       let exhaustionReason = '';
-      if (ret1h > 70.0 && ret5m < 0) {
+      if (upperWickRatio > 0.40) {
+        isExhausted = true;
+        exhaustionReason = `UPPER_WICK_REJECTION (Jarum atas ${(upperWickRatio * 100).toFixed(0)}% > 40% dari body - dev/insider distribusi)`;
+      } else if (ret1h > 70.0 && ret5m < 0) {
         isExhausted = true;
         exhaustionReason = `POST_PUMP_EXHAUSTION (1h +${ret1h.toFixed(0)}% with 5m rolling down ${ret5m.toFixed(1)}%)`;
       } else if (ret5m > 30.0) {

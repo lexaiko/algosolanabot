@@ -89,6 +89,7 @@ export interface FeatureVector {
   atrPct: number; // Average True Range %
   breakoutDistancePct: number;
   drawdownFromPeakPct: number;
+  upperWickRatio?: number; // (Peak - Close) / (Close - Open), > 0.40 = rejection / long upper shadow
 
   // Volume & Flow
   volume5mUsd: number;

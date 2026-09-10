@@ -28,6 +28,11 @@ export class MomentumContinuationStrategy implements IStrategy {
       return null;
     }
 
+    // Condition 4: Reject upper wick distribution (> 40% upper shadow)
+    if (features.upperWickRatio !== undefined && features.upperWickRatio > 0.40) {
+      return null;
+    }
+
     const confidence = Math.min(0.95, 0.60 + (features.flowImbalance * 0.25) + (features.return1m > 0 ? 0.10 : 0));
 
     return {
