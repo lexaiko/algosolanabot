@@ -290,8 +290,8 @@ export async function executeBuyToken(
       if (shouldNotifyFilterSkip) {
         const alertMsg = `⚠️ *ORDER DIBATALKAN: ANTI-CHASE GUARD (Pucuk Guard)*\n\n` +
           `🪙 *Token:* ${marketData.symbol}\n` +
-          `🐋 *Entry Paus:* *$${whaleEntryPriceUsd < 0.01 ? whaleEntryPriceUsd.toExponential(4) : whaleEntryPriceUsd.toFixed(6)}*\n` +
-          `📈 *Harga Pasar Sekarang:* *$${marketData.priceUsd < 0.01 ? marketData.priceUsd.toExponential(4) : marketData.priceUsd.toFixed(6)}* (+${driftPct.toFixed(1)}% dari paus)\n` +
+          `🐋 *Entry Paus:* *${formatPrice(whaleEntryPriceUsd)}*\n` +
+          `📈 *Harga Pasar Sekarang:* *${formatPrice(marketData.priceUsd)}* (+${driftPct.toFixed(1)}% dari paus)\n` +
           `🛡️ *Batas Toleransi Drift:* *+${CONFIG.MAX_PRICE_DRIFT_PCT}%*\n\n` +
           `_Bot menolak mengejar koin yang sudah terlanjur melambung tinggi agar modal Anda tidak menjadi exit liquidity!_`;
         await notify(alertMsg);
@@ -447,7 +447,7 @@ export async function executeBuyToken(
     `📝 *CA:* \`${tokenMint}\`\n\n` +
     `📊 *Rincian Order:*\n` +
     `• Nominal: *${amountSol.toFixed(3)} SOL* (~$${(amountSol * solPriceUsd).toFixed(2)})\n` +
-    `• Harga Entry: *$${entryPriceUsd < 0.01 ? entryPriceUsd.toExponential(4) : entryPriceUsd.toFixed(6)}*\n` +
+    `• Harga Entry: *${formatPrice(entryPriceUsd)}*\n` +
     `• Market Cap: *$${formatNumber(marketData.marketCap)}*\n` +
     `• Likuiditas: *$${formatNumber(effectiveLiquidity)}*\n` +
     `• Anti-Rug Score: *${safety.score}/100* (✅ Aman)\n` +
@@ -1014,4 +1014,12 @@ function formatNumber(num: number): string {
   if (num >= 1_000_000) return (num / 1_000_000).toFixed(2) + 'M';
   if (num >= 1_000) return (num / 1_000).toFixed(2) + 'K';
   return num.toFixed(2);
+}
+
+export function formatPrice(val: number): string {
+  if (!val || isNaN(val)) return '$0.00';
+  if (val < 0.000001) return '$' + val.toExponential(3);
+  if (val < 0.01) return '$' + val.toFixed(6);
+  if (val < 1) return '$' + val.toFixed(4);
+  return '$' + val.toFixed(2);
 }

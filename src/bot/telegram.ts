@@ -564,7 +564,7 @@ async function handleTokenAuditAndSnipe(ctx: any, tokenMint: string) {
   let text = `🪙 *${market.symbol}* - ${market.name}\n` +
     `📝 \`${tokenMint}\`\n\n` +
     `📊 *Data Pasar:*\n` +
-    `• Harga: *$${market.priceUsd < 0.01 ? market.priceUsd.toExponential(4) : market.priceUsd.toFixed(6)}*\n` +
+    `• Harga: *${formatPrice(market.priceUsd)}*\n` +
     `• Market Cap: *$${formatNumber(market.marketCap)}*\n` +
     `• Likuiditas: *$${formatNumber(market.liquidityUsd)}*\n` +
     `• Perubahan 24 Jam: *${market.priceChange24h >= 0 ? '+' : ''}${market.priceChange24h.toFixed(2)}%*\n\n` +
