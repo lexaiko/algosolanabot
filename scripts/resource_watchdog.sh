@@ -8,11 +8,15 @@
 
 LOG_DIR="/home/semesta/tradingbot/logs"
 LOG_FILE="$LOG_DIR/kill_switch.log"
+FLAG_FILE="$LOG_DIR/.stopped_by_watchdog"
 mkdir -p "$LOG_DIR"
 
 MIN_AVAIL_RAM_KB=150000    # 150 MB minimum available RAM before emergency shutdown
 SAFE_RECOVER_RAM_KB=400000 # 400 MB available RAM before auto-reviving bots
 BOTS_STOPPED_BY_WATCHDOG=0
+if [ -f "$FLAG_FILE" ]; then
+  BOTS_STOPPED_BY_WATCHDOG=1
+fi
 RECOVER_COUNT=0
 
 export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
@@ -59,6 +63,7 @@ while true; do
         
         # Stop both bots safely
         pm2 stop solana-tradingbot solana-algobot >> "$LOG_FILE" 2>&1
+        touch "$FLAG_FILE"
         BOTS_STOPPED_BY_WATCHDOG=1
         RECOVER_COUNT=0
       fi
@@ -75,6 +80,7 @@ while true; do
           
           # Start both bots
           pm2 start solana-tradingbot solana-algobot >> "$LOG_FILE" 2>&1
+          rm -f "$FLAG_FILE"
           BOTS_STOPPED_BY_WATCHDOG=0
           RECOVER_COUNT=0
           
