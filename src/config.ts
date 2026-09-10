@@ -91,8 +91,9 @@ export const CONFIG = {
   FLASH_EXIT_DROP_PCT: Number(process.env.FLASH_EXIT_DROP_PCT) || 30.0, // Emergency exit if pool drops > 30%
 
   // Real Institutional Alpha: True Net PnL, Rolling Alpha & Narrative Shield
-  ESTIMATED_BUY_FEE_SOL: Number(process.env.ESTIMATED_BUY_FEE_SOL) || 0.0010, // Base + Priority + Jito tip + Rent
-  ESTIMATED_SELL_FEE_SOL: Number(process.env.ESTIMATED_SELL_FEE_SOL) || 0.0006, // Base + Priority + Jito tip
+  // Calibrated to live Solana Mainnet metrics (Base 5000 lamports + p75 Priority Fee + Jito Tip Floor)
+  ESTIMATED_BUY_FEE_SOL: Number(process.env.ESTIMATED_BUY_FEE_SOL) || 0.00035, // Base + Priority (~0.00020) + Jito tip (~0.00010)
+  ESTIMATED_SELL_FEE_SOL: Number(process.env.ESTIMATED_SELL_FEE_SOL) || 0.00025, // Base + Priority (~0.00015) + Jito tip (~0.00005)
   MAX_POSITIONS_PER_NARRATIVE: Number(process.env.MAX_POSITIONS_PER_NARRATIVE) || 2, // Max 2 tokens per narrative/sector
   ROLLING_WINDOW_DAYS: Number(process.env.ROLLING_WINDOW_DAYS) || 7, // 7-day alpha decay evaluation
   VOLATILITY_ADAPTIVE_EXITS: process.env.VOLATILITY_ADAPTIVE_EXITS !== 'false',
