@@ -313,6 +313,20 @@ export async function executeBuyToken(
     return { success: false, message: 'Candle 5 menit terlalu overextended' };
   }
 
+  // Institutional Risk Control 4b: Upper Wick Rejection Guard (Pucuk Guard)
+  if (dataReason?.upperWickRatio !== undefined && dataReason.upperWickRatio > 0.40) {
+    console.log(`[AutoTrade] 🛡️ Upper Wick Rejection: Jarum atas ${(dataReason.upperWickRatio * 100).toFixed(1)}% > 40% dari body (${marketData.symbol})`);
+    if (shouldNotifyFilterSkip) {
+      const alertMsg = `⚠️ *ORDER DIBATALKAN: UPPER WICK REJECTION (Pucuk Guard)*\n\n` +
+        `🪙 *Token:* ${marketData.symbol} (${marketData.name})\n` +
+        `📉 *Jarum Atas (Upper Wick):* *${(dataReason.upperWickRatio * 100).toFixed(0)}%* dari body candle (Batas Maksimal: 40%)\n` +
+        `🛡️ *Indikasi:* Dev/insider terdeteksi mendistribusikan koin / jualan di pucuk.\n\n` +
+        `_Bot menolak membeli koin yang baru saja terbanting dari pucuknya agar modal Anda tidak menjadi exit liquidity!_`;
+      await notify(alertMsg);
+    }
+    return { success: false, message: 'Upper wick candle 5 menit terlalu panjang (> 40% dari body)' };
+  }
+
   // 2. Anti-Rug Safety Audit (Result from concurrent Promise.all)
   if (!safety.isSafe) {
     console.log(`[AutoTrade] 🛡️ Anti-Rug failed for ${marketData.symbol}: score ${safety.score}/100, risks: ${safety.risks.join(', ')}`);

@@ -67,6 +67,26 @@ export class EntryEngine {
       };
     }
 
+    // Invalidation 3b: Upper Wick Rejection Guard (Pucuk Guard / Anti-Distribution)
+    // Rejects parabolic coins if the 5m candle has a long upper wick (> 40% of body)
+    // which signals dev/insider selling into strength / top-wick distribution!
+    const upperWickRatio = features.upperWickRatio !== undefined ? features.upperWickRatio : (
+      features.return5m > 0 && features.drawdownFromPeakPct > 0 
+        ? ((features.drawdownFromPeakPct / 100) / Math.max(0.01, 1 - features.drawdownFromPeakPct / 100)) / Math.max(0.01, features.return5m / (100 + features.return5m))
+        : (features.drawdownFromPeakPct > 3.0 ? 999.0 : 0)
+    );
+
+    if (upperWickRatio > 0.40) {
+      return {
+        shouldEnter: false,
+        state: 'INVALIDATED',
+        compositeScore: score,
+        reason: `Jarum atas candle terlalu panjang (Upper Wick ${(upperWickRatio * 100).toFixed(0)}% > 40% dari body). Dev/insider terdeteksi jualan di pucuk (Distribution Phase)`,
+        explanation: scoreResult.explanation,
+        invalidationReason: 'UPPER_WICK_DISTRIBUTION_REJECTION'
+      };
+    }
+
     // Invalidation 4: Dual-Engine Entry - Parabolic Breakout vs Top-Tick Pucuk Trap
     // If token is in a genuine Parabolic Breakout (Volume shock >= 1.8x, heavy buy dominance >= 1.75x, positive whale flow),
     // it is ALLOWED to enter directly at the peak because momentum is violently expanding!

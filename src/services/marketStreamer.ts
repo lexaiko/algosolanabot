@@ -320,6 +320,18 @@ async function evaluateWatchlistCandidateOnTick(item: WatchedCandidate, curveSta
   }
   const drawdownFromPeakPct = peakPriceUsd > 0 ? Math.max(0, ((peakPriceUsd - latest.priceUsd) / peakPriceUsd) * 100) : 0;
 
+  // Pucuk Guard: Upper Wick Rejection (> 40% of candle body)
+  const openPrice = oldest.priceUsd;
+  const currentPrice = latest.priceUsd;
+  const candleBody = Math.max(0, currentPrice - openPrice);
+  const upperWick = Math.max(0, peakPriceUsd - currentPrice);
+  const upperWickRatio = candleBody > 0 ? (upperWick / candleBody) : (upperWick > 0 ? 999.0 : 0);
+
+  if (upperWickRatio > 0.40) {
+    console.log(`[MarketStreamer] 🛑 REJECTED: UPPER_WICK_REJECTION for ${item.symbol}: Jarum atas ${(upperWickRatio * 100).toFixed(0)}% > 40% dari body (Peak: $${peakPriceUsd.toFixed(6)} -> Current: $${currentPrice.toFixed(6)})`);
+    return;
+  }
+
   // Compute 1m return (checks if latest tick is green rebound or dropping)
   const oneMinAgo = now - 60000;
   const tick1mAgo = item.priceHistory.find(p => p.timestamp >= oneMinAgo) || oldest;
@@ -360,6 +372,7 @@ async function evaluateWatchlistCandidateOnTick(item: WatchedCandidate, curveSta
     atrPct: Math.max(3.5, realizedVol * 1.2),
     breakoutDistancePct: Math.max(0, effectiveRet5m - 2.0),
     drawdownFromPeakPct,
+    upperWickRatio,
     volume5mUsd: realVol5mUsd,
     volumeAcceleration: rvol5m,
     buySellRatio: realBuySellRatio,
@@ -446,6 +459,7 @@ async function evaluateWatchlistCandidateOnTick(item: WatchedCandidate, curveSta
         volume5mUsd: vector.volume5mUsd,
         whaleNetFlowSol: vector.whaleNetFlowSol,
         drawdownFromPeakPct: vector.drawdownFromPeakPct,
+        upperWickRatio: vector.upperWickRatio,
         reboundTickPct: vector.return1m
       }
     );

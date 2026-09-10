@@ -113,6 +113,7 @@ export interface ExecutionDataReason {
   volume5mUsd?: number;
   whaleNetFlowSol?: number;
   drawdownFromPeakPct?: number;
+  upperWickRatio?: number;
   reboundTickPct?: number;
   buys5m?: number;
   sells5m?: number;

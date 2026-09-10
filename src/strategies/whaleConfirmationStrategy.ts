@@ -32,6 +32,11 @@ export class WhaleConfirmationStrategy implements IStrategy {
       return null;
     }
 
+    // Condition 5: Reject upper wick distribution (> 40% upper shadow / jarum atas)
+    if (features.upperWickRatio !== undefined && features.upperWickRatio > 0.40) {
+      return null;
+    }
+
     const confidence = Math.min(0.95, 0.70 + ((features.smartMoneyAccumulationScore - 65) / 100));
 
     return {
