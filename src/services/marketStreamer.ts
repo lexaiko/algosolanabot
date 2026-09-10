@@ -3,7 +3,7 @@ import { PublicKey } from '@solana/web3.js';
 import { getDedicatedConnection } from './solanaConnection';
 import { getBondingCurveAddress, decodeBondingCurveBuffer } from './bondingCurve';
 import { getSolPriceUsd, getTokenMarketData, getMultiTokenMarketData } from './dexscreener';
-import { getOpenPositionByToken, getOpenPositions } from '../db/index';
+import { getOpenPositionByToken, getOpenPositions, getLastClosedPosition } from '../db/index';
 import { executeBuyToken } from './tradeManager';
 import { entryEngine } from '../execution';
 import { adaptiveLearningEngine } from '../strategies/adaptiveLearningEngine';
@@ -331,16 +331,21 @@ async function evaluateWatchlistCandidateOnTick(item: WatchedCandidate, curveSta
     realMarketData = await getTokenMarketData(item.tokenMint);
   } catch {}
 
+  // Fail-Safe Gate: Do not trade blindly if market data is unavailable due to rate limits or network issues!
+  if (!realMarketData || !realMarketData.priceUsd) {
+    return;
+  }
+
   const tickVelocity = item.tickCount;
-  const buys5m = realMarketData?.txns5mBuys || 0;
-  const sells5m = realMarketData?.txns5mSells || 0;
+  const buys5m = realMarketData.txns5mBuys || 0;
+  const sells5m = realMarketData.txns5mSells || 0;
   const tradeCount5m = buys5m + sells5m;
   const realBuySellRatio = sells5m > 0 ? (buys5m / sells5m) : (buys5m > 0 ? 2.5 : 1.0);
   const realFlowImbalance = tradeCount5m > 0 ? (buys5m - sells5m) / tradeCount5m : 0;
-  const realVol5mUsd = realMarketData?.volume5m || (item.lastLiquidityUsd * 0.15);
-  const vol1hUsd = realMarketData?.volume1h || ((realMarketData?.volume24h || 0) / 24);
+  const realVol5mUsd = realMarketData.volume5m || 0;
+  const vol1hUsd = realMarketData.volume1h || ((realMarketData.volume24h || 0) / 24);
   const rvol5m = vol1hUsd > 0 ? Math.min(10.0, Math.max(1.0, (realVol5mUsd * 12) / vol1hUsd)) : Math.min(10.0, Math.max(1.0, tickVelocity / 4.0));
-  const effectiveRet5m = realMarketData?.priceChange5m ?? priceChangePct;
+  const effectiveRet5m = realMarketData.priceChange5m ?? priceChangePct;
   const realizedVol = Math.max(4.0, Math.abs(effectiveRet5m) * 1.3);
 
   // Build Feature Vector from REAL on-chain/AMM data
@@ -361,7 +366,7 @@ async function evaluateWatchlistCandidateOnTick(item: WatchedCandidate, curveSta
     flowImbalance: realFlowImbalance,
     tradeCount5m: tradeCount5m > 0 ? tradeCount5m : tickVelocity,
     avgTradeSizeUsd: tradeCount5m > 0 ? realVol5mUsd / tradeCount5m : 80,
-    liquidityUsd: realMarketData?.liquidityUsd || item.lastLiquidityUsd,
+    liquidityUsd: realMarketData.liquidityUsd || item.lastLiquidityUsd,
     liquidityChangePct: 0,
     estimatedPriceImpactPct: 0.8,
     whaleNetFlowSol: (realBuySellRatio >= 1.7 && tradeCount5m >= 8) ? 3.5 : (realSol > 30 ? 2.0 : 0.5),
@@ -395,6 +400,26 @@ async function evaluateWatchlistCandidateOnTick(item: WatchedCandidate, curveSta
   const minScore = adaptiveLearningEngine.getMinEntryScore();
 
   if (decision.shouldEnter && decision.compositeScore >= minScore) {
+    // Smart Decision Re-Entry Guard for Live Stream
+    const lastClosed = getLastClosedPosition(item.tokenMint);
+    if (lastClosed && lastClosed.closed_at) {
+      const msSinceClose = now - new Date(lastClosed.closed_at).getTime();
+      const minsSinceClose = msSinceClose / 60000;
+      if (lastClosed.pnl_pct <= 0) {
+        if (minsSinceClose < 60) {
+          console.log(`[MarketStreamer] 🛑 RE-ENTRY REJECTED for ${item.symbol}: Closed at loss ${minsSinceClose.toFixed(0)}m ago < 60m`);
+          return;
+        }
+      } else {
+        if (minsSinceClose < 10) return;
+        const prevPeak = lastClosed.peak_price_usd || lastClosed.entry_price_usd;
+        if (realMarketData.priceUsd < prevPeak * 0.98) {
+          console.log(`[MarketStreamer] 🛑 RE-ENTRY REJECTED for ${item.symbol}: Price $${realMarketData.priceUsd.toFixed(6)} < Prev Peak $${prevPeak.toFixed(6)}`);
+          return;
+        }
+      }
+    }
+
     console.log(`[MarketStreamer] 🎯 INSTANT WEBSOCKET SIGNAL: ${item.symbol} Score=${decision.compositeScore}/${minScore} (+${priceChangePct.toFixed(1)}% 5m velocity)!`);
 
     const isBreakout = decision.reason.includes('PARABOLIC_BREAKOUT') || (vector.volumeAcceleration >= 1.8 && vector.buySellRatio >= 1.75);

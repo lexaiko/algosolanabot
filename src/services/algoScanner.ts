@@ -2,7 +2,7 @@ import axios from 'axios';
 import { getTokenMarketData, getMultiTokenMarketData, getSolPriceUsd } from './dexscreener';
 import { checkTokenSafety } from './antirug';
 import { executeBuyToken } from './tradeManager';
-import { getOpenPositions, getOpenPositionByToken, getPaperBalance, getWhaleQueue, isTokenBlacklisted } from '../db/index';
+import { getOpenPositions, getOpenPositionByToken, getLastClosedPosition, getPaperBalance, getWhaleQueue, isTokenBlacklisted } from '../db/index';
 import { discoveryFunnel } from '../market/discoveryFunnel';
 import { opportunityScorer } from '../execution/opportunityScorer';
 import { entryEngine } from '../execution/entryEngine';
@@ -16,7 +16,7 @@ import { CONFIG } from '../config';
  * 1. Collects candidates from GeckoTerminal Solana Trending Pools (Real on-chain DEX volume across Raydium, Meteora, Orca).
  * 2. Fetches DexScreener Solana High Volume Search & Trending Pairs (Real AMM activity, NOT paid ads).
  * 3. Enriches with Local SQLite Whale Queue targets.
- * 4. Discards 100% of micro-liquidity (<$15k) traps upfront.
+ * 4. Discards 100% of micro-liquidity (<$35k) traps upfront.
  * 5. Sorts genuine runners by 5m volume & velocity descending.
  */
 export async function getOrganicTrendingTokens(limit: number = 18): Promise<Array<{
@@ -113,8 +113,8 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
     const ret5m = m.priceChange5m || 0;
     const ret1h = m.priceChange1h || 0;
 
-    // Upstream Quality Gate: Minimum $15k liquidity and $30k 24h volume
-    if (liq >= 15000 && vol24h >= 30000) {
+    // Upstream Quality Gate: Minimum $35k liquidity and $30k 24h volume
+    if (liq >= 35000 && vol24h >= 30000) {
       validRunners.push({
         tokenMint: mint,
         poolName: `${m.symbol} / SOL`,
@@ -427,14 +427,69 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
       const scoreResult = opportunityScorer.scoreOpportunity(vector, signals);
       const entryDecision = entryEngine.evaluateEntryTiming(vector, signals);
 
+      // 1. Pucuk & Exhaustion Filter (Anti-Late Distribution & Anti-FOMO Spike)
+      let isExhausted = false;
+      let exhaustionReason = '';
+      if (ret1h > 70.0 && ret5m < 0) {
+        isExhausted = true;
+        exhaustionReason = `POST_PUMP_EXHAUSTION (1h +${ret1h.toFixed(0)}% with 5m rolling down ${ret5m.toFixed(1)}%)`;
+      } else if (ret5m > 30.0) {
+        isExhausted = true;
+        exhaustionReason = `PARABOLIC_FOMO_SPIKE (+${ret5m.toFixed(1)}% 5m candle without base)`;
+      }
+
+      // 2. Smart Decision Re-Entry Guard (Only allows profitable Wave Continuation)
+      let isReEntryRejected = false;
+      let reEntryRejectReason = '';
+      const lastClosed = getLastClosedPosition(item.tokenMint);
+      if (lastClosed && lastClosed.closed_at) {
+        const msSinceClose = Date.now() - new Date(lastClosed.closed_at).getTime();
+        const minsSinceClose = msSinceClose / 60000;
+
+        if (lastClosed.pnl_pct <= 0) {
+          // Rule A: Previous Loss -> Strict 60m Cooldown (never catch a falling knife)
+          if (minsSinceClose < 60) {
+            isReEntryRejected = true;
+            reEntryRejectReason = `RE_ENTRY_LOSS_COOLDOWN (Closed at ${lastClosed.pnl_pct.toFixed(1)}% ${minsSinceClose.toFixed(0)}m ago < 60m)`;
+          }
+        } else {
+          // Rule B: Previous Win -> Smart Decision Re-Entry
+          // Must rest at least 10m to avoid post-exit churn
+          if (minsSinceClose < 10) {
+            isReEntryRejected = true;
+            reEntryRejectReason = `RE_ENTRY_CHURN_GUARD (Exited in profit just ${minsSinceClose.toFixed(0)}m ago < 10m)`;
+          } else {
+            const prevPeak = lastClosed.peak_price_usd || lastClosed.entry_price_usd;
+            const isNewHighBreakout = market.priceUsd >= prevPeak * 0.98;
+            const hasStrongFlow = buySellRatio >= 1.8 && volumeAcceleration >= 1.4;
+
+            if (!isNewHighBreakout) {
+              isReEntryRejected = true;
+              reEntryRejectReason = `RE_ENTRY_BELOW_PEAK (Price $${market.priceUsd.toFixed(6)} < Prev Peak $${prevPeak.toFixed(6)} - catching dump)`;
+            } else if (!hasStrongFlow) {
+              isReEntryRejected = true;
+              reEntryRejectReason = `RE_ENTRY_WEAK_FLOW (Buy/Sell ratio ${buySellRatio.toFixed(1)} < 1.8 for re-entry)`;
+            } else {
+              console.log(`[AlgoScanner] 🌊 APPROVED SMART RE-ENTRY WAVE for ${market.symbol}! (Prev Win: +${lastClosed.pnl_pct.toFixed(1)}%, New High Confirmed: $${market.priceUsd.toFixed(6)} >= $${prevPeak.toFixed(6)})`);
+            }
+          }
+        }
+      }
+
       const dynamicMinScore = adaptiveLearningEngine.getMinEntryScore();
-      const isPassed = funnelEval.passed && entryDecision.shouldEnter && scoreResult.compositeScore >= dynamicMinScore;
+      let isPassed = funnelEval.passed && entryDecision.shouldEnter && scoreResult.compositeScore >= dynamicMinScore;
       
       let rejectReason: string | undefined = undefined;
       if (!funnelEval.passed) {
         rejectReason = funnelEval.reason;
       } else if (!entryDecision.shouldEnter) {
         rejectReason = entryDecision.reason;
+      } else if (isExhausted) {
+        isPassed = false;
+        rejectReason = exhaustionReason;
+      } else if (isReEntryRejected) {
+        isPassed = false;
+        rejectReason = reEntryRejectReason;
       }
 
       // Tactical Classification
