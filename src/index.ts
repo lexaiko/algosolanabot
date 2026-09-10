@@ -20,25 +20,37 @@ async function main() {
   await startMarketStreamer();
   startAlgoScanner();
 
-  // 3. Start Telegram Bot
-  if (!CONFIG.TELEGRAM_BOT_TOKEN) {
-    console.warn('\n⚠️ [Telegram] PERINGATAN: TELEGRAM_BOT_TOKEN belum diatur di file .env.');
-    console.warn('👉 Buat bot baru di https://t.me/BotFather, salin tokennya, lalu masukkan ke file .env.\n');
-  } else {
-    try {
-      const me = await bot.telegram.getMe();
-      console.log(`[Telegram] 🤖 Bot online: @${me.username} (${me.first_name})`);
-      
-      // Start polling non-blocking
-      bot.launch({ dropPendingUpdates: true }).catch((err) => {
-        console.error('[Telegram] Polling error:', err.message);
-      });
-      console.log(`[Telegram] 🚀 Polling aktif. Bot siap menerima sinyal & perintah di Telegram!`);
-    } catch (err: any) {
-      console.error('[Telegram] ❌ Gagal menghubungkan bot Telegram:', err.message);
-      console.warn('Pastikan TELEGRAM_BOT_TOKEN di .env sudah valid.');
+  // 3. Start Telegram Bot with Resilient Auto-Retry Loop
+  async function startTelegramWithRetry() {
+    if (!CONFIG.TELEGRAM_BOT_TOKEN) {
+      console.warn('\n⚠️ [Telegram] PERINGATAN: TELEGRAM_BOT_TOKEN belum diatur di file .env.');
+      console.warn('👉 Buat bot baru di https://t.me/BotFather, salin tokennya, lalu masukkan ke file .env.\n');
+      return;
+    }
+
+    let delayMs = 3000;
+    let attempt = 0;
+
+    while (true) {
+      attempt++;
+      try {
+        const me = await bot.telegram.getMe();
+        console.log(`[Telegram] 🤖 Bot online: @${me.username} (${me.first_name})`);
+
+        await bot.launch({ dropPendingUpdates: true });
+        console.log(`[Telegram] 🚀 Polling aktif. Bot siap menerima sinyal & perintah di Telegram!`);
+        break;
+      } catch (err: any) {
+        console.error(`[Telegram] ⚠️ Koneksi Telegram gagal (Percobaan #${attempt}): ${err.message}. Mencoba lagi dalam ${Math.round(delayMs / 1000)}s...`);
+        await new Promise(res => setTimeout(res, delayMs));
+        delayMs = Math.min(delayMs * 1.5, 30000);
+      }
     }
   }
+
+  startTelegramWithRetry().catch((err) => {
+    console.error('[Telegram] Launcher error:', err);
+  });
 
   // Graceful shutdown
   const shutdown = () => {
