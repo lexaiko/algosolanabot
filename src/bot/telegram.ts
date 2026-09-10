@@ -72,7 +72,13 @@ const sendAdminAlert = async (msg: string, extra?: any) => {
         ...extra
       });
     } catch (err: any) {
-      console.error('[Telegram] Gagal kirim pesan ke admin:', err.message);
+      console.warn('[Telegram] Gagal kirim Markdown ke admin, fallback plain text:', err.message);
+      try {
+        const cleanText = msg.replace(/[*_`\[\]]/g, '');
+        await bot.telegram.sendMessage(CONFIG.TELEGRAM_ADMIN_ID, cleanText, extra);
+      } catch (fallbackErr: any) {
+        console.error('[Telegram] Gagal kirim pesan fallback ke admin:', fallbackErr.message);
+      }
     }
   }
 
@@ -84,9 +90,14 @@ const sendAdminAlert = async (msg: string, extra?: any) => {
         bot.telegram.sendMessage(w.user_id, msg, {
           parse_mode: 'Markdown',
           ...extra
-        }).catch((err: any) => {
+        }).catch(async (err: any) => {
           if (err?.response?.error_code === 403) {
             removeWatcher(w.user_id);
+          } else {
+            try {
+              const cleanText = msg.replace(/[*_`\[\]]/g, '');
+              await bot.telegram.sendMessage(w.user_id, cleanText, extra);
+            } catch {}
           }
         });
       }

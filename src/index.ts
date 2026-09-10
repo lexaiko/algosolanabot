@@ -46,7 +46,7 @@ async function main() {
     stopPositionManager();
     stopMarketStreamer();
     stopAlgoScanner();
-    bot.stop();
+    try { bot.stop(); } catch {}
     process.exit(0);
   };
 
