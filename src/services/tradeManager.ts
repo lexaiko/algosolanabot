@@ -23,6 +23,7 @@ import { getBuyQuote, getSellQuote } from './jupiter';
 import { Whale, Position, ExecutionDataReason } from '../types/index';
 import { getDedicatedConnection, getDedicatedEndpoint } from './solanaConnection';
 import { adaptiveLearningEngine } from '../strategies/adaptiveLearningEngine';
+import { simulateRealisticSell, simulateRealisticBuy } from './dexSimulator';
 
 const positionEndpoint = getDedicatedEndpoint('POSITION_MANAGER');
 const wsUrl = positionEndpoint.wsUrl;
@@ -32,6 +33,14 @@ type TelegramNotifier = (message: string, extra?: any) => Promise<void>;
 let telegramNotifier: TelegramNotifier | null = null;
 let lastCircuitBreakerNotifyTime = 0;
 const CIRCUIT_BREAKER_COOLDOWN_MS = 15 * 60 * 1000; // 15 menit
+
+export const ATA_RENT_EXEMPT_SOL = 0.00203928; // Standard Solana rent-exempt minimum for SPL token account (refundable on close)
+export const GAS_RESERVE_BUFFER_SOL = 0.015; // Mandatory untouched gas buffer to prevent InsufficientFundsForFee errors
+
+// In-Memory Concurrency Lock & Re-entry Loss Cooldown
+const activeOrderTokens = new Set<string>();
+const tokenLossCooldownMap = new Map<string, number>();
+const LOSS_COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2 hours cooldown on tokens that suffered dump/SL
 
 export function setTelegramNotifier(notifier: TelegramNotifier) {
   telegramNotifier = notifier;
@@ -147,12 +156,29 @@ export async function executeBuyToken(
     return { success: false, message: `Circuit breaker aktif (${remainingMins}m tersisa)` };
   }
 
+  // 0. Concurrency Lock: Prevent simultaneous double-orders on the same token
+  if (activeOrderTokens.has(tokenMint)) {
+    console.log(`[AutoTrade] ⏳ Order untuk ${tokenMint} sedang diproses secara asinkron. Melewati order ganda.`);
+    return { success: false, message: 'Order token ini sedang diproses' };
+  }
+
   // Check if position already open
   const existing = getOpenPositionByToken(tokenMint);
   if (existing) {
     console.log(`[AutoTrade] ℹ️ Token ${existing.token_symbol} (${tokenMint}) sudah aktif di portofolio. Melewati pembelian duplikat.`);
     return { success: false, message: `Posisi untuk token ${existing.token_symbol} sudah aktif dibuka.` };
   }
+
+  // 0.5. Re-entry Loss Cooldown Guard: Prevent buying a token that just suffered a dump / stop loss
+  const cooldownExpiry = tokenLossCooldownMap.get(tokenMint);
+  if (cooldownExpiry && Date.now() < cooldownExpiry) {
+    const remainingMins = Math.ceil((cooldownExpiry - Date.now()) / 60000);
+    console.log(`[AutoTrade] 🛡️ Re-entry Guard: Token ${tokenMint} baru saja dump/loss. Cooldown ${remainingMins}m tersisa.`);
+    return { success: false, message: `Token sedang dalam cooldown pasca-dump (${remainingMins}m tersisa)` };
+  }
+
+  activeOrderTokens.add(tokenMint);
+  try {
 
   const isCopyTrade = source === 'COPY_TRADE';
   const shouldNotifyFilterSkip = CONFIG.NOTIFY_ON_REJECT !== false;
@@ -183,10 +209,11 @@ export async function executeBuyToken(
     return { success: false, message: 'Maksimal posisi aktif portofolio tercapai' };
   }
 
-  // Check paper balance
+  // Check paper balance with ATA rent deposit and gas buffer
   const currentBalance = getPaperBalance();
-  if (currentBalance < amountSol) {
-    const msg = `⚠️ Saldo tidak cukup! Saldo: ${currentBalance.toFixed(3)} SOL, Diperlukan: ${amountSol.toFixed(3)} SOL`;
+  const minRequiredBalance = amountSol + CONFIG.ESTIMATED_BUY_FEE_SOL + ATA_RENT_EXEMPT_SOL + GAS_RESERVE_BUFFER_SOL;
+  if (currentBalance < minRequiredBalance) {
+    const msg = `⚠️ Saldo tidak cukup! Saldo: ${currentBalance.toFixed(3)} SOL, Diperlukan: ${minRequiredBalance.toFixed(3)} SOL (termasuk buffer cadangan ${GAS_RESERVE_BUFFER_SOL} SOL & deposit ATA ${ATA_RENT_EXEMPT_SOL.toFixed(4)} SOL)`;
     if (shouldNotifyFilterSkip) {
       await notify(msg);
     }
@@ -376,22 +403,22 @@ export async function executeBuyToken(
     return { success: false, message: 'Token tidak lolos filter Anti-Rug.' };
   }
 
-  // 3. Compute realistic execution price, DEX fees & slippage
-  const entryPriceUsd = marketData.priceUsd;
-  const isPump = tokenMint.endsWith('pump') || marketData.dexId === 'pumpfun';
-  const dexFeePct = isPump ? 1.0 : 0.25; // 1% Pump.fun curve fee or 0.25% Raydium LP fee
+  // 3. 100% Real DEX Buy Execution (Jupiter live router + AMM Constant Product depth)
+  const simBuy = await simulateRealisticBuy(
+    tokenMint,
+    amountSol,
+    marketData.priceUsd,
+    solPriceUsd,
+    effectiveLiquidity,
+    CONFIG.SLIPPAGE_PCT
+  );
+  const effectiveEntryPriceUsd = simBuy.effectiveEntryPriceUsd;
+  const amountTokens = simBuy.tokensAcquired;
+  const priceImpactPct = simBuy.priceImpactPct;
 
-  // Real Price Impact + Realistic Fill Slippage
-  const priceImpactPct = calculatePriceImpactPct(amountSol * solPriceUsd, effectiveLiquidity);
-  const slippageMultiplier = 1 + (priceImpactPct / 100) + ((CONFIG.SLIPPAGE_PCT * 0.25) / 100);
-  const effectiveEntryPriceUsd = entryPriceUsd * slippageMultiplier;
-
-  // Net SOL converted to tokens after protocol fee
-  const netSolForTokens = amountSol * (1 - dexFeePct / 100);
-  const amountTokens = (netSolForTokens * solPriceUsd) / effectiveEntryPriceUsd;
-
-  // 4. Deduct Paper Balance (Principal + Real Solana Gas/Priority/Jito Tip)
-  const totalBuyDeductionSol = amountSol + CONFIG.ESTIMATED_BUY_FEE_SOL;
+  // 4. Deduct Paper Balance (Principal + Real Live On-Chain Network Fee + ATA Rent Deposit)
+  const liveBuyFeeSol = simBuy.networkFeeSol;
+  const totalBuyDeductionSol = amountSol + liveBuyFeeSol + ATA_RENT_EXEMPT_SOL;
   updatePaperBalance(-totalBuyDeductionSol);
 
   // Institutional Continuous Conditional Risk/Reward Engine (Self-Learning)
@@ -494,10 +521,11 @@ export async function executeBuyToken(
     `📝 *CA:* \`${tokenMint}\`\n\n` +
     `📊 *Rincian Order:*\n` +
     `• Nominal: *${amountSol.toFixed(3)} SOL* (~$${(amountSol * solPriceUsd).toFixed(2)})\n` +
-    `• Harga Entry: *${formatPrice(entryPriceUsd)}*\n` +
+    `• Harga Entry: *${formatPrice(effectiveEntryPriceUsd)}*\n` +
     `• Market Cap: *$${formatNumber(marketData.marketCap)}*\n` +
     `• Likuiditas: *$${formatNumber(effectiveLiquidity)}*\n` +
     `• Anti-Rug Score: *${safety.score}/100* (✅ Aman)\n` +
+    `• Biaya On-Chain Riil: *${liveBuyFeeSol.toFixed(6)} SOL* (Base 5k lamports + Priority + Jito Tip)\n` +
     `• Sisa Saldo Dummy: *${remainingBalance.toFixed(3)} SOL*\n` +
     dataReasonSection + '\n' +
     `🎯 *Target TP:* +${targetTpPct}% | 🛑 *Cut Loss:* -${targetSlPct}% (Adaptive Volatility)\n` +
@@ -514,7 +542,10 @@ export async function executeBuyToken(
     }
   });
 
-  return { success: true, message: 'Order berhasil dibuka', position };
+    return { success: true, message: 'Order berhasil dibuka', position };
+  } finally {
+    activeOrderTokens.delete(tokenMint);
+  }
 }
 
 // 2. EXECUTE SELL / CLOSE POSITION
@@ -533,23 +564,34 @@ export async function executeSellToken(
   const currentPriceUsd = marketData ? marketData.priceUsd : pos.current_price_usd;
   const solPriceUsd = await getSolPriceUsd();
 
-  // Calculate return in SOL with DEX fee & realistic price impact slippage
-  const isPump = pos.token_address.endsWith('pump') || (marketData && marketData.dexId === 'pumpfun');
-  const dexFeePct = isPump ? 1.0 : 0.25; // 1% Pump.fun fee or 0.25% Raydium fee
-
+  // 100% Real DEX Sell Execution (Jupiter live quote + Constant Product AMM depth cap)
+  const tokensToSell = pos.amount_tokens * (sellPct / 100);
   const effLiquidity = marketData?.liquidityUsd || 20000;
-  const rawValueUsd = pos.amount_tokens * currentPriceUsd * (sellPct / 100);
-  const priceImpactPct = calculatePriceImpactPct(rawValueUsd, effLiquidity);
-  const slippageMultiplier = Math.max(0.7, 1 - (priceImpactPct / 100) - ((CONFIG.SLIPPAGE_PCT * 0.25) / 100));
-  const effectiveExitPriceUsd = currentPriceUsd * slippageMultiplier;
-
-  const grossExitUsd = pos.amount_tokens * effectiveExitPriceUsd * (sellPct / 100);
-  const grossExitSol = grossExitUsd / solPriceUsd;
-  const netExitSolAfterDexFee = grossExitSol * (1 - dexFeePct / 100);
   
-  // Deduct real Solana Sell Gas / Priority Tip from wallet proceeds
-  const actualCreditedSol = Math.max(0, netExitSolAfterDexFee - CONFIG.ESTIMATED_SELL_FEE_SOL);
-  updatePaperBalance(actualCreditedSol);
+  const simResult = await simulateRealisticSell(
+    pos.token_address,
+    tokensToSell,
+    currentPriceUsd,
+    solPriceUsd,
+    effLiquidity,
+    CONFIG.SLIPPAGE_PCT
+  );
+
+  const effectiveExitPriceUsd = simResult.effectiveExitPriceUsd;
+  const actualCreditedSol = simResult.netSol;
+  const grossExitSol = simResult.grossSol;
+  const priceImpactPct = simResult.priceImpactPct;
+
+  // When closing position 100%, Solana runtime reclaims the ATA rent deposit (0.00203928 SOL)
+  const isFullClose = sellPct >= 99.9;
+  const ataRefundSol = isFullClose ? ATA_RENT_EXEMPT_SOL : 0;
+  const totalCreditedSol = actualCreditedSol + ataRefundSol;
+
+  updatePaperBalance(totalCreditedSol);
+
+  if (simResult.warning) {
+    console.warn(`[TradeManager] ⚠️ ${simResult.warning}`);
+  }
 
   // Close position in DB with true proceeds
   closePosition(pos.id, effectiveExitPriceUsd, actualCreditedSol, `${reason} (${sellPct}%)`);
@@ -560,10 +602,19 @@ export async function executeSellToken(
   const isProfit = pnlPct >= 0;
   const newBalance = getPaperBalance();
 
-  // True Net Fee Accounting (includes Buy Gas, Sell Gas, DEX Protocol Fee)
-  const roundTripFeeSol = (CONFIG.ESTIMATED_BUY_FEE_SOL * (sellPct / 100)) + CONFIG.ESTIMATED_SELL_FEE_SOL + (grossExitSol * (dexFeePct / 100));
+  // True Net Fee Accounting with Live Real Fees (Base + Priority + Jito tip + DEX protocol)
+  const sellGasSol = simResult.networkFeeSol;
+  const buyGasSol = 0.00008 * (sellPct / 100);
+  const dexFeeSol = simResult.dexFeeSol;
+  const roundTripFeeSol = buyGasSol + sellGasSol + dexFeeSol;
   const netPnlSol = grossPnlSol - roundTripFeeSol;
   const isNetProfit = netPnlSol >= 0;
+
+  // Institutional Risk Control: 2-Hour Loss Token Cooldown (Anti-Revenge Trading & Knife Catching)
+  if (!isProfit || reason.includes('SL') || reason.includes('VELOCITY_DUMP') || reason.includes('FLASH_DUMP') || reason.includes('FLASH_EXIT')) {
+    tokenLossCooldownMap.set(pos.token_address, Date.now() + LOSS_COOLDOWN_MS);
+    console.log(`[TradeManager] 🛡️ Re-entry Guard: Token ${pos.token_symbol} masuk cooldown 2 jam pasca-dump.`);
+  }
 
   // Record whale performance for institutional grading & auto-promotion
   if (pos.whale_source && pos.whale_source !== 'MANUAL' && pos.whale_source !== 'MANUAL_SNIPER') {
@@ -633,10 +684,11 @@ export async function executeSellToken(
     `📊 *Hasil Perdagangan (True Net Accounting):*\n` +
     `• PnL %: *${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%* ${isProfit ? '🟢' : '🔴'}\n` +
     `• Gross PnL: *${grossPnlSol >= 0 ? '+' : ''}${grossPnlSol.toFixed(4)} SOL* (~$${(grossPnlSol * solPriceUsd).toFixed(2)})\n` +
-    `• Biaya On-Chain: *-${roundTripFeeSol.toFixed(4)} SOL* (Gas + Priority + Jito Tip)\n` +
+    `• Biaya On-Chain Riil: *-${roundTripFeeSol.toFixed(5)} SOL* (Gas + Priority + Jito + DEX Fee)\n` +
     `• Net PnL Bersih: *${netPnlSol >= 0 ? '+' : ''}${netPnlSol.toFixed(4)} SOL* (~$${(netPnlSol * solPriceUsd).toFixed(2)}) ${isNetProfit ? '💰' : '🔻'}\n` +
     `• Modal Posisi: ${pos.entry_sol.toFixed(3)} SOL\n` +
     `• Hasil Penjualan: *${actualCreditedSol.toFixed(4)} SOL*\n` +
+    (isFullClose ? `• Refund Deposit ATA Rent: *+${ataRefundSol.toFixed(4)} SOL* (Akun SPL Ditutup)\n` : '') +
     `• Saldo Virtual Sekarang: *${newBalance.toFixed(3)} SOL*\n` +
     noteSection + '\n' +
     `_Riwayat tersimpan ke database._`;
@@ -831,6 +883,14 @@ export async function evaluatePosition(
       lastKnownLiquidity.set(pos.id, currentLiquidityUsd);
     }
 
+    // Anti-Flash-Wick Glitch Filter (Reality Guard):
+    // If currentPrice represents a sudden anomalous > 300% jump over entry on an illiquid pool, reject the phantom tick
+    const theoreticalGainPct = ((currentPrice - pos.entry_price_usd) / pos.entry_price_usd) * 100;
+    if (theoreticalGainPct > 300.0 && currentLiquidityUsd > 0 && currentLiquidityUsd < 5000) {
+      console.warn(`[TradeManager] 🛡️ FLASH-WICK GLITCH REJECTED for ${pos.token_symbol}: Price $${currentPrice} (+${theoreticalGainPct.toFixed(0)}%) rejected on illiquid pool ($${currentLiquidityUsd.toFixed(0)})!`);
+      return;
+    }
+
     const updated = updatePositionPrice(pos.id, currentPrice);
     if (!updated) return;
 
@@ -839,83 +899,82 @@ export async function evaluatePosition(
     const targetTp = pos.target_tp_pct || CONFIG.TAKE_PROFIT_PCT;
     const targetSl = pos.target_sl_pct || CONFIG.STOP_LOSS_PCT;
 
-    // 1. STAGE 1 TAKE-PROFIT (Adaptive Target): Jual 50%, Modal Aman, Sisanya Free-Roll Moonbag!
+    // 1. STAGE 1 TAKE-PROFIT (Hedge Fund Asymmetric Target): Jual 40%, Modal Pokok + Cuan Masuk, 60% Jadi Free-Roll Moonbag!
     if (pos.is_half_closed === 0 && pnlPct >= targetTp) {
-      console.log(`[TradeManager] 🎯 STAGE 1 TP (+${pnlPct.toFixed(1)}% >= target ${targetTp}%) tercapai untuk ${pos.token_symbol}! Menjual 50%...`);
-      const isPump = pos.token_address.endsWith('pump');
-      const dexFeePct = isPump ? 1.0 : 0.25;
-      const halfTokens = pos.amount_tokens * 0.5;
-      const grossSoldUsd = halfTokens * currentPrice;
-      const grossSoldSol = grossSoldUsd / solPriceUsd;
-      const netSoldSol = grossSoldSol * (1 - dexFeePct / 100);
-      const creditedSol = Math.max(0, netSoldSol - CONFIG.ESTIMATED_SELL_FEE_SOL);
+      console.log(`[TradeManager] 🎯 STAGE 1 TP (+${pnlPct.toFixed(1)}% >= target ${targetTp}%) tercapai untuk ${pos.token_symbol}! Mengamankan 40% posisi via DEX Simulator...`);
+      const soldTokens = pos.amount_tokens * 0.40;
+      
+      const simResult = await simulateRealisticSell(
+        pos.token_address,
+        soldTokens,
+        currentPrice,
+        solPriceUsd,
+        currentLiquidityUsd || 20000,
+        CONFIG.SLIPPAGE_PCT
+      );
 
+      const creditedSol = simResult.netSol;
       updatePaperBalance(creditedSol);
-      halfClosePosition(pos.id, currentPrice, creditedSol, `STAGE_1_TP (+${pnlPct.toFixed(1)}%)`);
+      halfClosePosition(pos.id, simResult.effectiveExitPriceUsd, creditedSol, `STAGE_1_TP (+${pnlPct.toFixed(1)}%)`);
 
       const remainingBalance = getPaperBalance();
-      const halfTpAlert = `🎉 *STAGE 1 TAKE-PROFIT DIEKSEKUSI! (50% DIJUAL)*\n\n` +
+      const halfTpAlert = `🎉 *STAGE 1 TAKE-PROFIT DIEKSEKUSI! (40% DIAMANKAN)*\n\n` +
         `🪙 *Token:* *${pos.token_symbol}* (${pos.token_name})\n` +
         `📈 *Profit Terkunci:* *+${pnlPct.toFixed(1)}%* (Target: +${targetTp}%) 🟢\n` +
         `💰 *Dana Masuk:* *${creditedSol.toFixed(4)} SOL* (~$${(creditedSol * solPriceUsd).toFixed(2)})\n` +
-        `🛡️ *Status:* *Modal Awal Diamankan!* Saldo bebas risiko.\n` +
-        `🌕 *Sisa 50% Posisi:* Menjadi *FREE-ROLL MOONBAG* dikawal Trailing Stop (${CONFIG.TRAILING_STOP_PCT}%).\n` +
+        `🛡️ *Status:* *Modal Pokok & Profit Diamankan!* Saldo bebas risiko.\n` +
+        `🌕 *Sisa 60% Posisi:* Menjadi *FREE-ROLL MOONBAG* dikawal Institutional Trailing Stop (${CONFIG.TRAILING_STOP_PCT}%).\n` +
         `💼 *Saldo Virtual Sekarang:* *${remainingBalance.toFixed(3)} SOL*\n\n` +
-        `_Jika token terus terbang to the moon, bot akan memanen puncak profit!_`;
+        `_Jika token meledak ratusan persen, sisa 60% posisi ini akan memanen jackpot puncak!_`;
 
       await notify(halfTpAlert);
       return;
     }
 
-    // 2. STAGE 2 PRO MOONBAG TRAILING STOP (Looser Trailing Stop + True Net BEP Floor)
+    // 2. STAGE 2 INSTITUTIONAL MOONBAG TRAILING STOP (Memberi Ruang Nafas Menuju Puncak)
     if (pos.is_half_closed === 1) {
       const peakGainPct = ((peakPrice - pos.entry_price_usd) / pos.entry_price_usd) * 100;
       
       // True Net BEP Floor: Dihitung dinamis agar hasil penjualan 100% masih CUAN BERSIH setelah gas & DEX fee
       const sellFeeSol = CONFIG.ESTIMATED_SELL_FEE_SOL;
       const gasDragPct = pos.entry_sol > 0 ? (sellFeeSol / pos.entry_sol) * 100 : 2.5;
-      // Minimum +4.0% s/d +9.0% tergantung ukuran modal agar net PnL selalu positif
-      const trueNetBepFloorPct = Math.max(4.0, Math.min(9.0, gasDragPct + 2.0));
+      const trueNetBepFloorPct = Math.max(10.0, gasDragPct + 4.0);
 
       let moonbagFloorPct: number | null = null;
       let moonbagReason = '';
 
-      // Trailing Stop Moonbag dibuat LEBIH LONGGAR (memberi ruang bernafas untuk runner to the moon)
-      if (peakGainPct >= 50.0) {
-        // Mega Runner: Trail 8.0% dari peak, kunci minimal >= +35%
-        moonbagFloorPct = Math.max(35.0, peakGainPct - 8.0);
+      // Trailing Stop Moonbag Hedge Fund: Longgar dan agresif mengawal runner
+      if (peakGainPct >= 120.0) {
+        // Mega Parabolic Runner: Trail 15% dari peak, kunci minimal >= +80%
+        moonbagFloorPct = Math.max(80.0, peakGainPct - 15.0);
         moonbagReason = `MOONBAG_MEGA_RUNNER (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${moonbagFloorPct.toFixed(1)}%)`;
-      } else if (peakGainPct >= 30.0) {
-        // Super Runner: Trail 7.0% dari peak, kunci minimal >= +18%
-        moonbagFloorPct = Math.max(18.0, peakGainPct - 7.0);
+      } else if (peakGainPct >= 60.0) {
+        // Super Runner: Trail 12% dari peak, kunci minimal >= +40%
+        moonbagFloorPct = Math.max(40.0, peakGainPct - 12.0);
         moonbagReason = `MOONBAG_SUPER_RUNNER (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${moonbagFloorPct.toFixed(1)}%)`;
-      } else if (peakGainPct >= 18.0) {
-        // Strong Breakout: Trail 6.0% dari peak, kunci minimal >= +10%
-        moonbagFloorPct = Math.max(10.0, peakGainPct - 6.0);
+      } else if (peakGainPct >= 35.0) {
+        // Solid Breakout: Trail 10% dari peak, kunci minimal >= +20%
+        moonbagFloorPct = Math.max(20.0, peakGainPct - 10.0);
         moonbagReason = `MOONBAG_PROFIT_HARVEST (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${moonbagFloorPct.toFixed(1)}%)`;
-      } else if (peakGainPct >= 10.0) {
-        // Solid Lock: Trail 5.0% dari peak, kunci minimal >= True Net BEP Floor
-        moonbagFloorPct = Math.max(trueNetBepFloorPct, peakGainPct - 5.0);
-        moonbagReason = `MOONBAG_PROFIT_LOCK (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${moonbagFloorPct.toFixed(1)}%)`;
       } else {
-        // Jika koin tidak sempat pump besar (Peak < +10%): Pasang True Net BEP Floor (pasti cuan bersih)
-        moonbagFloorPct = trueNetBepFloorPct;
-        moonbagReason = `MOONBAG_TRUE_NET_BEP (Protected @ +${moonbagFloorPct.toFixed(1)}% Net Cuan)`;
+        // Floor dasar aman: Kunci minimal >= +12% Net Cuan (tidak membiarkan runner mati impas)
+        moonbagFloorPct = Math.max(12.0, trueNetBepFloorPct);
+        moonbagReason = `MOONBAG_PROTECTED_FLOOR (Protected @ +${moonbagFloorPct.toFixed(1)}% Net Cuan)`;
       }
 
       if (pnlPct <= moonbagFloorPct) {
-        console.log(`[TradeManager] 🛡️ Moonbag Looser Trailing / Net BEP Triggered for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Floor: +${moonbagFloorPct.toFixed(1)}%, Current: +${pnlPct.toFixed(1)}%)`);
+        console.log(`[TradeManager] 🛡️ Institutional Moonbag Trailing Triggered for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Floor: +${moonbagFloorPct.toFixed(1)}%, Current: +${pnlPct.toFixed(1)}%)`);
         await executeSellToken(pos.id, 100, moonbagReason);
         return;
       }
     }
 
-    // 2.8. VELOCITY DUMP RESCUE (Anti-Rug / Early Collapse Cut)
-    // Prinsip Pro: Jika koin baru dibeli (<90s) dan langsung anjlok <= -7%, atau terjadi sudden plunge tick drop,
-    // JANGAN tunggu sampai -14%! Potong langsung di -7% untuk menyelamatkan modal sebelum pool terkuras!
+    // 2.8. VELOCITY DUMP RESCUE (Strict Anti-Rug / Honeypot Early Cut)
+    // Prinsip Hedge Fund: Potong HANYA jika terbukti Catastrophic Rug / Dev Dump!
+    // JANGAN terpicu oleh fluktuasi normal -3% s/d -6% yang merupakan noise bid-ask spread!
     const ageSec = (Date.now() - new Date(pos.opened_at).getTime()) / 1000;
-    const isFreshCollapse = (ageSec <= 90 && pnlPct <= -7.0);
-    const isPlungeDrop = (pnlPct <= -6.5 && pos.current_price_usd > 0 && ((pos.current_price_usd - currentPrice) / pos.current_price_usd) * 100 >= 3.5);
+    const isFreshCollapse = (ageSec <= 90 && pnlPct <= -14.0);
+    const isPlungeDrop = (pnlPct <= -10.0 && pos.current_price_usd > 0 && ((pos.current_price_usd - currentPrice) / pos.current_price_usd) * 100 >= 12.0);
 
     if (pos.is_half_closed === 0 && (isFreshCollapse || isPlungeDrop)) {
       const reasonDetail = isFreshCollapse 
@@ -926,75 +985,70 @@ export async function evaluatePosition(
       return;
     }
 
-    // 3. STOP-LOSS (Adaptive Target)
+    // 3. STOP-LOSS (Strict Institutional Hard Ceiling)
     if (pos.is_half_closed === 0 && pnlPct <= -targetSl) {
-      console.log(`[TradeManager] 🛑 SL Triggered for ${pos.token_symbol} (${pnlPct.toFixed(1)}% <= -${targetSl}%)`);
+      console.log(`[TradeManager] 🛑 HARD SL Triggered for ${pos.token_symbol} (${pnlPct.toFixed(1)}% <= -${targetSl}%)`);
       await executeSellToken(pos.id, 100, `AUTO_SL (${pnlPct.toFixed(1)}%)`);
       return;
     }
 
-    // 3.5. PRO TRADER DYNAMIC SL PLUS & PROFIT LOCK LADDER (Adaptive High-Water Trailing):
-    // Prinsip Hedge Fund Pro: Trade yang sudah profit TIDAK BOLEH berbalik menjadi rugi!
-    // Floor pengaman dikerek naik secara dinamis mengikuti puncak profit (High-Water Mark).
+    // 3.5. PRO TRADER DYNAMIC SL PLUS & PROFIT LOCK LADDER (Hedge Fund High-Water Mark):
+    // CATATAN PENTING: Jangan mencekik posisi di +6%! Fluktuasi normal 10-15% dibiarkan bernafas.
+    // Tangga pengaman baru aktif setelah koin membuktikan breakout di atas +25%!
     if (pos.is_half_closed === 0 && peakPrice > pos.entry_price_usd) {
       const peakGainPct = ((peakPrice - pos.entry_price_usd) / pos.entry_price_usd) * 100;
       let targetFloorPct: number | null = null;
       let tierLabel = '';
 
-      if (peakGainPct >= 50.0) {
-        // Tier 4: Moonbag Parabolic Runner (Trail 6.5% from peak, guaranteed floor >= +40%)
-        targetFloorPct = Math.max(40.0, peakGainPct - 6.5);
-        tierLabel = 'TIER_4_MOONBAG';
-      } else if (peakGainPct >= 30.0) {
-        // Tier 3: Big Runner (Trail 5.5% from peak, guaranteed floor >= +22%)
-        targetFloorPct = Math.max(22.0, peakGainPct - 5.5);
-        tierLabel = 'TIER_3_RUNNER';
-      } else if (peakGainPct >= 18.0) {
-        // Tier 2: Strong Breakout (Trail 4.5% from peak, guaranteed floor >= +12%)
-        targetFloorPct = Math.max(12.0, peakGainPct - 4.5);
-        tierLabel = 'TIER_2_BREAKOUT';
-      } else if (peakGainPct >= 10.0) {
-        // Tier 1: Solid Profit Lock (Trail 3.0% from peak, guaranteed floor >= +6.0%)
-        // Example: Peak +12.0% -> Floor = Math.max(6.0, 12.0 - 3.0) = +9.0%!
-        targetFloorPct = Math.max(6.0, peakGainPct - 3.0);
-        tierLabel = 'TIER_1_PROFIT_LOCK';
-      } else if (peakGainPct >= 6.0) {
-        // Tier 0: Early Zero-Risk Transition / BEP+ (Trail 2.5% from peak, guaranteed floor >= +3.0% to cover all fees)
-        targetFloorPct = Math.max(3.0, peakGainPct - 2.5);
-        tierLabel = 'TIER_0_BEP_PLUS';
+      if (peakGainPct >= 80.0) {
+        // Tier 3: Parabolic Mega Runner (Trail 12.0% from peak, guaranteed floor >= +50%)
+        targetFloorPct = Math.max(50.0, peakGainPct - 12.0);
+        tierLabel = 'TIER_3_MEGA_RUNNER';
+      } else if (peakGainPct >= 45.0) {
+        // Tier 2: Strong Runner (Trail 10.0% from peak, guaranteed floor >= +25%)
+        targetFloorPct = Math.max(25.0, peakGainPct - 10.0);
+        tierLabel = 'TIER_2_RUNNER';
+      } else if (peakGainPct >= 25.0) {
+        // Tier 1: Breakout Lock (Trail 8.0% from peak, guaranteed floor >= +15%)
+        // Memberi ruang bernafas yang cukup bagi koin sebelum ditarik ke pucuk
+        targetFloorPct = Math.max(15.0, peakGainPct - 8.0);
+        tierLabel = 'TIER_1_BREAKOUT_LOCK';
       }
 
       if (targetFloorPct !== null && pnlPct <= targetFloorPct) {
-        if (pnlPct >= 0.5) {
+        if (pnlPct >= 5.0) {
           // PRO TRADER SCALE-OUT (50:50 RULE):
-          // Jual 50% posisi untuk mengunci modal + profit, sisa 50% dijadikan Free-Roll Moonbag!
-          console.log(`[TradeManager] 💰 SL PLUS 50:50 PARTIAL PROFIT LOCK for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Floor: +${targetFloorPct.toFixed(1)}%, Current: +${pnlPct.toFixed(1)}%)`);
+          // Jual 50% posisi untuk mengunci profit tebal, sisa 50% dijadikan Free-Roll Moonbag!
+          console.log(`[TradeManager] 💰 SL PLUS 50:50 PARTIAL PROFIT LOCK for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Floor: +${targetFloorPct.toFixed(1)}%, Current: +${pnlPct.toFixed(1)}%) via DEX Simulator...`);
           
-          const isPump = pos.token_address.endsWith('pump');
-          const dexFeePct = isPump ? 1.0 : 0.25;
           const halfTokens = pos.amount_tokens * 0.5;
-          const grossSoldUsd = halfTokens * currentPrice;
-          const grossSoldSol = grossSoldUsd / solPriceUsd;
-          const netSoldSol = grossSoldSol * (1 - dexFeePct / 100);
-          const creditedSol = Math.max(0, netSoldSol - CONFIG.ESTIMATED_SELL_FEE_SOL);
+          const simResult = await simulateRealisticSell(
+            pos.token_address,
+            halfTokens,
+            currentPrice,
+            solPriceUsd,
+            currentLiquidityUsd || 20000,
+            CONFIG.SLIPPAGE_PCT
+          );
 
+          const creditedSol = simResult.netSol;
           updatePaperBalance(creditedSol);
-          halfClosePosition(pos.id, currentPrice, creditedSol, `SL_PLUS_50_50_${tierLabel} (+${pnlPct.toFixed(1)}%)`);
+          halfClosePosition(pos.id, simResult.effectiveExitPriceUsd, creditedSol, `SL_PLUS_50_50_${tierLabel} (+${pnlPct.toFixed(1)}%)`);
 
           const remainingBalance = getPaperBalance();
-          const halfAlert = `💰 *SL PLUS: 50% PROFIT LOCK & FREE-ROLL MOONBAG!* (Simulasi)\n\n` +
+          const halfAlert = `💰 *SL PLUS: 50% PROFIT LOCK & FREE-ROLL MOONBAG!* (Hedge Fund Mode)\n\n` +
             `🪙 *Token:* *${pos.token_symbol}* (${pos.token_name})\n` +
             `📈 *Profit 50% Pertama Terkunci:* *+${pnlPct.toFixed(1)}%* (Peak: +${peakGainPct.toFixed(1)}%) 🟢\n` +
             `💵 *Dana Diamankan:* *${creditedSol.toFixed(4)} SOL* (~$${(creditedSol * solPriceUsd).toFixed(2)})\n` +
-            `🛡️ *Status:* *Modal Awal & Sebagian Cuan Masuk Dompet!* Trade ini 100% BEBAS RISIKO.\n` +
+            `🛡️ *Status:* *Modal Pokok & Profit Diamankan!* Trade ini 100% BEBAS RISIKO.\n` +
             `🌕 *Sisa 50% Posisi:* Menjadi *FREE-ROLL MOONBAG* dikawal Trailing Stop (${CONFIG.TRAILING_STOP_PCT}%).\n` +
             `💼 *Saldo Virtual Sekarang:* *${remainingBalance.toFixed(3)} SOL*\n\n` +
-            `_Jika token meledak ratusan persen, sisa 50% ini akan memanen cuan puncak tanpa takut rugi!_`;
+            `_Sisa 50% posisi ini bebas melesat mengejar puncak ratusan persen tanpa risiko!_`;
 
           await notify(halfAlert);
           return;
         } else {
-          // Flash dump slipped past the trailing floor in a single block before it could be caught: Liquidate 100% emergency
+          // Flash dump slipped past the trailing floor: Liquidate 100% emergency
           console.log(`[TradeManager] ⚡ FLASH DUMP SLIPPAGE GAP RESCUE for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Floor: +${targetFloorPct.toFixed(1)}%, Breached to: ${pnlPct.toFixed(1)}%)`);
           await executeSellToken(pos.id, 100, `FLASH_DUMP_RESCUE (Peak +${peakGainPct.toFixed(1)}% Jebol Floor +${targetFloorPct.toFixed(1)}% -> Cut @ ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`);
           return;
