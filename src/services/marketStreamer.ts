@@ -348,14 +348,40 @@ async function evaluateWatchlistCandidateOnTick(item: WatchedCandidate, curveSta
     return;
   }
 
-  const tickVelocity = item.tickCount;
+  const liquidityUsd = realMarketData.liquidityUsd || item.lastLiquidityUsd || 0;
+  const realVol5mUsd = realMarketData.volume5m || 0;
+  const vol1hUsd = realMarketData.volume1h || ((realMarketData.volume24h || 0) / 24);
+  const volume24hUsd = realMarketData.volume24h || 0;
   const buys5m = realMarketData.txns5mBuys || 0;
   const sells5m = realMarketData.txns5mSells || 0;
   const tradeCount5m = buys5m + sells5m;
-  const realBuySellRatio = sells5m > 0 ? (buys5m / sells5m) : (buys5m > 0 ? 2.5 : 1.0);
+
+  // 1. INSTITUTIONAL LIQUIDITY FLOOR: Reject pools with < $25,000 liquidity (Prevents slippage death & micro-cap rugs)
+  const minLiq = CONFIG.MIN_LIQUIDITY_USD || 25000;
+  if (liquidityUsd < minLiq) {
+    return;
+  }
+
+  // 2. ACTIVE MARKET PARTICIPATION: Reject dead pools (< 8 trades in 5m or < $15k 5m volume)
+  if (tradeCount5m < 8 || (realVol5mUsd < 15000 && volume24hUsd < 50000)) {
+    return;
+  }
+
+  // 3. ORDER FLOW DOMINANCE: Must have genuine buy dominance with sufficient trade count
+  const realBuySellRatio = sells5m > 0 ? (buys5m / sells5m) : (buys5m >= 8 ? 2.5 : 1.0);
+  if (realBuySellRatio < 1.35) {
+    return;
+  }
+
+  // 4. REAL DYNAMIC PRICE IMPACT: Never enter if our order causes > 1.5% pool impact
+  const buyAmountUsd = (CONFIG.DEFAULT_BUY_AMOUNT_SOL || 0.05) * 180;
+  const estImpactPct = liquidityUsd > 0 ? (buyAmountUsd / (liquidityUsd * 0.5)) * 100 : 99;
+  if (estImpactPct > 1.5) {
+    return;
+  }
+
+  const tickVelocity = item.tickCount;
   const realFlowImbalance = tradeCount5m > 0 ? (buys5m - sells5m) / tradeCount5m : 0;
-  const realVol5mUsd = realMarketData.volume5m || 0;
-  const vol1hUsd = realMarketData.volume1h || ((realMarketData.volume24h || 0) / 24);
   const rvol5m = vol1hUsd > 0 ? Math.min(10.0, Math.max(1.0, (realVol5mUsd * 12) / vol1hUsd)) : Math.min(10.0, Math.max(1.0, tickVelocity / 4.0));
   const effectiveRet5m = realMarketData.priceChange5m ?? priceChangePct;
   const realizedVol = Math.max(4.0, Math.abs(effectiveRet5m) * 1.3);
@@ -379,9 +405,9 @@ async function evaluateWatchlistCandidateOnTick(item: WatchedCandidate, curveSta
     flowImbalance: realFlowImbalance,
     tradeCount5m: tradeCount5m > 0 ? tradeCount5m : tickVelocity,
     avgTradeSizeUsd: tradeCount5m > 0 ? realVol5mUsd / tradeCount5m : 80,
-    liquidityUsd: realMarketData.liquidityUsd || item.lastLiquidityUsd,
+    liquidityUsd: liquidityUsd,
     liquidityChangePct: 0,
-    estimatedPriceImpactPct: 0.8,
+    estimatedPriceImpactPct: estImpactPct,
     whaleNetFlowSol: (realBuySellRatio >= 1.7 && tradeCount5m >= 8) ? 3.5 : (realSol > 30 ? 2.0 : 0.5),
     smartMoneyAccumulationScore: realBuySellRatio >= 1.75 ? 85 : 45,
     cabalClusterRiskScore: 10,

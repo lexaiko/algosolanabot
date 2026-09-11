@@ -47,11 +47,11 @@ export class AdaptiveLearningEngine {
     consensusBonus: 10
   };
 
-  private minEntryScore: number = 66;
-  private baseSlPct: number = 12.0;
-  private baseTpMultiplier: number = 3.2;
-  private trailingStopPct: number = 18.0;
-  private bepTriggerPct: number = 10.0;
+  private minEntryScore: number = 75; // Hedge Fund standard: only take A+ setups (>= 75 score)
+  private baseSlPct: number = 8.5; // Strict capital preservation ceiling
+  private baseTpMultiplier: number = 4.0; // High asymmetry payoff target
+  private trailingStopPct: number = 12.0;
+  private bepTriggerPct: number = 20.0;
   private sampleTradeCount: number = 0;
 
   constructor() {
@@ -70,11 +70,11 @@ export class AdaptiveLearningEngine {
       this.weights.whaleWeight = getLearnedParameter('weight_whale', 15);
       this.weights.consensusBonus = getLearnedParameter('weight_consensus', 10);
 
-      this.minEntryScore = getLearnedParameter('min_entry_score', 66);
-      this.baseSlPct = getLearnedParameter('base_sl_pct', 12.0);
-      this.baseTpMultiplier = getLearnedParameter('base_tp_multiplier', 3.2);
-      this.trailingStopPct = getLearnedParameter('trailing_stop_pct', 18.0);
-      this.bepTriggerPct = getLearnedParameter('bep_trigger_pct', 10.0);
+      this.minEntryScore = Math.max(75, getLearnedParameter('min_entry_score', 75));
+      this.baseSlPct = Math.min(8.5, getLearnedParameter('base_sl_pct', 8.5));
+      this.baseTpMultiplier = Math.max(4.0, getLearnedParameter('base_tp_multiplier', 4.0));
+      this.trailingStopPct = getLearnedParameter('trailing_stop_pct', 12.0);
+      this.bepTriggerPct = getLearnedParameter('bep_trigger_pct', 20.0);
 
       // Count historical closed trades for sample count
       const countRow = db.prepare("SELECT COUNT(*) as count FROM trade_history WHERE action = 'SELL'").get() as { count: number } | undefined;
@@ -105,20 +105,20 @@ export class AdaptiveLearningEngine {
    * Returns live dynamic Take-Profit & Stop-Loss targets adapted to current volatility
    */
   public getDynamicTpSl(realizedVol: number = 0, atrPct: number = 0): DynamicTpSlTargets {
-    // Volatility adaptation: higher volatility expands TP multiplier and provides adequate SL noise cushion
+    // Hedge Fund Quant Asymmetry: Cap losses strictly, allow targets to expand dynamically
     const vol = Math.max(realizedVol, atrPct);
-    const volSlAdjustment = Math.min(3.5, vol * 0.1);
-    const targetSlPct = Math.min(22.0, Math.max(15.0, this.baseSlPct + volSlAdjustment + 3.0));
+    const volSlAdjustment = Math.min(1.5, vol * 0.05);
+    const targetSlPct = Math.min(9.5, Math.max(7.5, this.baseSlPct + volSlAdjustment));
 
-    // Dynamic TP multiplier expands on high volatility to capture meme runners
-    const dynamicTpMultiplier = this.baseTpMultiplier + Math.min(1.5, vol / 15.0);
-    const targetTpPct = Math.min(85.0, Math.max(35.0, targetSlPct * dynamicTpMultiplier));
+    // Dynamic TP multiplier expands on high volatility to capture massive meme runners
+    const dynamicTpMultiplier = this.baseTpMultiplier + Math.min(2.5, vol / 12.0);
+    const targetTpPct = Math.min(150.0, Math.max(45.0, targetSlPct * dynamicTpMultiplier));
 
     return {
       targetTpPct: Math.round(targetTpPct * 10) / 10,
       targetSlPct: Math.round(targetSlPct * 10) / 10,
       trailingStopPct: Math.round(this.trailingStopPct * 10) / 10,
-      bepTriggerPct: 7.0, // Fast Break-Even: Move SL to +1% as soon as price reaches +7%
+      bepTriggerPct: 20.0, // Only transition to protective floor after a solid +20% pump
       rrRatio: Math.round((targetTpPct / targetSlPct) * 10) / 10
     };
   }

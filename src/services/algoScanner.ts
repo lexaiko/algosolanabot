@@ -43,7 +43,7 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
   // 1. Raydium Official v3 Pools by 24h Volume (Pure on-chain DEX AMM leaders, ZERO keywords!)
   try {
     const rayRes = await axios.get('https://api-v3.raydium.io/pools/info/list?poolType=all&poolSortField=volume24h&sortType=desc&pageSize=40&page=1', {
-      timeout: 5000,
+      timeout: 10000,
       headers: { 'User-Agent': 'Mozilla/5.0' }
     });
     const pools = rayRes.data?.data?.data || [];
@@ -53,6 +53,22 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
     }
   } catch (err: any) {
     console.warn('[AlgoScanner] Raydium v3 pools unavailable:', err.message);
+  }
+
+  // 1b. DexScreener Top Boosted Solana Velocity Tokens (Hot runners with verified organic volume & community velocity)
+  try {
+    const boostRes = await axios.get('https://api.dexscreener.com/token-boosts/top/v1', {
+      timeout: 6000,
+      headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
+    });
+    const items = Array.isArray(boostRes.data) ? boostRes.data : [];
+    for (const item of items) {
+      if (item.chainId === 'solana' && item.tokenAddress && !isExcluded(item.tokenAddress)) {
+        rawMints.add(item.tokenAddress);
+      }
+    }
+  } catch (err: any) {
+    console.warn('[AlgoScanner] DexScreener boosted pools unavailable:', err.message);
   }
 
   // 2. GeckoTerminal Multi-Page Trending Pools (Solana network-wide on-chain velocity across Raydium, Orca, Meteora)
@@ -113,8 +129,8 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
     const ret5m = m.priceChange5m || 0;
     const ret1h = m.priceChange1h || 0;
 
-    // Upstream Quality Gate: Minimum $35k liquidity and $30k 24h volume
-    if (liq >= 35000 && vol24h >= 30000) {
+    // Upstream Quality Gate: Minimum $35k liquidity, $30k 24h volume, and NOT in bleeding 1h dump (ret1h >= -5.0%)
+    if (liq >= 35000 && vol24h >= 30000 && ret1h >= -5.0) {
       validRunners.push({
         tokenMint: mint,
         poolName: `${m.symbol} / SOL`,
@@ -127,10 +143,12 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
     }
   }
 
-  // Sort by Momentum Velocity & Volatility (Favors active movers over stagnant mega-caps)
+  // Sort by Positive Momentum Velocity & Volatility (Favors genuine uptrend runners over bleeding dumps)
   validRunners.sort((a, b) => {
-    const scoreA = (Math.abs(a.priceChange5m) * 2.5 + Math.abs(a.priceChange1h) * 0.8) * Math.log10(Math.max(10, a.volume5m));
-    const scoreB = (Math.abs(b.priceChange5m) * 2.5 + Math.abs(b.priceChange1h) * 0.8) * Math.log10(Math.max(10, b.volume5m));
+    const momA = (a.priceChange5m * 2.0 + a.priceChange1h * 0.8);
+    const momB = (b.priceChange5m * 2.0 + b.priceChange1h * 0.8);
+    const scoreA = Math.max(0.1, momA) * Math.log10(Math.max(10, a.volume5m));
+    const scoreB = Math.max(0.1, momB) * Math.log10(Math.max(10, b.volume5m));
     return scoreB - scoreA;
   });
 
