@@ -29,13 +29,26 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
   pairAddress?: string;
 }>> {
   const isExcluded = (mint: string) => {
-    return !mint ||
+    if (!mint) return true;
+    if (
       mint === 'So11111111111111111111111111111111111111112' || // WSOL
       mint === 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v' || // USDC
       mint === 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB' || // USDT
       mint === '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R' || // RAY
       mint === 'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN' ||   // JUP
-      isTokenBlacklisted(mint);
+      isTokenBlacklisted(mint)
+    ) return true;
+
+    // Strict 24-Hour Quarantine (1440m) for any token that triggered Stop-Loss or Rescue Dump
+    const lastClosed = getLastClosedPosition(mint);
+    if (lastClosed && lastClosed.closed_at) {
+      const msSince = Date.now() - new Date(lastClosed.closed_at).getTime();
+      const minsSince = msSince / 60000;
+      if (lastClosed.pnl_pct <= 0 || (lastClosed.close_reason && (lastClosed.close_reason.includes('SL') || lastClosed.close_reason.includes('DUMP')))) {
+        if (minsSince < 1440) return true; // Exclude from candidate ingestion
+      }
+    }
+    return false;
   };
 
   const rawMints = new Set<string>();
@@ -473,11 +486,11 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
         const msSinceClose = Date.now() - new Date(lastClosed.closed_at).getTime();
         const minsSinceClose = msSinceClose / 60000;
 
-        if (lastClosed.pnl_pct <= 0) {
-          // Rule A: Previous Loss -> Strict 60m Cooldown (never catch a falling knife)
-          if (minsSinceClose < 60) {
+        if (lastClosed.pnl_pct <= 0 || (lastClosed.close_reason && (lastClosed.close_reason.includes('SL') || lastClosed.close_reason.includes('DUMP')))) {
+          // Rule A: Previous Loss -> Strict 24-Hour Quarantine (1440m) (never catch a falling knife)
+          if (minsSinceClose < 1440) {
             isReEntryRejected = true;
-            reEntryRejectReason = `RE_ENTRY_LOSS_COOLDOWN (Closed at ${lastClosed.pnl_pct.toFixed(1)}% ${minsSinceClose.toFixed(0)}m ago < 60m)`;
+            reEntryRejectReason = `RE_ENTRY_LOSS_COOLDOWN (Closed at ${lastClosed.pnl_pct.toFixed(1)}% ${minsSinceClose.toFixed(0)}m ago < 1440m / 24h quarantine)`;
           }
         } else {
           // Rule B: Previous Win -> Smart Decision Re-Entry
@@ -503,7 +516,7 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
         }
       }
 
-      const dynamicMinScore = adaptiveLearningEngine.getMinEntryScore();
+      const dynamicMinScore = Math.max(75, adaptiveLearningEngine.getMinEntryScore());
       let isPassed = funnelEval.passed && entryDecision.shouldEnter && scoreResult.compositeScore >= dynamicMinScore;
       
       let rejectReason: string | undefined = undefined;
@@ -564,7 +577,7 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
 export async function runAlgoScanCycle() {
   try {
     console.log(`[AlgoScanner] 🔍 Menjalankan siklus scan pasar kuantitatif otonom...`);
-    const dynamicMinScore = adaptiveLearningEngine.getMinEntryScore();
+    const dynamicMinScore = Math.max(75, adaptiveLearningEngine.getMinEntryScore());
     const candidates = await scanMarketOnce(6);
 
     // Push volatile candidates directly into MarketStreamer live WebSocket watchlist

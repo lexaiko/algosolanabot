@@ -884,10 +884,12 @@ export async function evaluatePosition(
     }
 
     // Anti-Flash-Wick Glitch Filter (Reality Guard):
-    // If currentPrice represents a sudden anomalous > 300% jump over entry on an illiquid pool, reject the phantom tick
+    // If currentPrice represents a sudden anomalous > 200% jump over entry on an illiquid pool or a 4x sudden tick jump, reject the phantom tick
     const theoreticalGainPct = ((currentPrice - pos.entry_price_usd) / pos.entry_price_usd) * 100;
-    if (theoreticalGainPct > 300.0 && currentLiquidityUsd > 0 && currentLiquidityUsd < 5000) {
-      console.warn(`[TradeManager] 🛡️ FLASH-WICK GLITCH REJECTED for ${pos.token_symbol}: Price $${currentPrice} (+${theoreticalGainPct.toFixed(0)}%) rejected on illiquid pool ($${currentLiquidityUsd.toFixed(0)})!`);
+    const currentPeak = pos.peak_price_usd || pos.entry_price_usd;
+    const jumpFromPeak = currentPeak > 0 ? (currentPrice / currentPeak) : 1;
+    if ((theoreticalGainPct > 200.0 && currentLiquidityUsd > 0 && currentLiquidityUsd < 15000) || (jumpFromPeak > 4.0 && currentLiquidityUsd < 50000)) {
+      console.warn(`[TradeManager] 🛡️ FLASH-WICK GLITCH REJECTED for ${pos.token_symbol}: Price $${currentPrice} (+${theoreticalGainPct.toFixed(0)}%, ${jumpFromPeak.toFixed(1)}x jump) rejected on pool ($${currentLiquidityUsd.toFixed(0)})!`);
       return;
     }
 
@@ -912,6 +914,14 @@ export async function evaluatePosition(
         currentLiquidityUsd || 20000,
         CONFIG.SLIPPAGE_PCT
       );
+
+      // REALITY GUARD (LEVERCAT Phantom Spike Buster):
+      // If DexScreener experienced a phantom tick spike (+1500%) but real on-chain DEX quote is <= entry price,
+      // REJECT the TP and DO NOT execute a partial exit at a loss!
+      if (simResult.effectiveExitPriceUsd <= pos.entry_price_usd) {
+        console.warn(`[TradeManager] 🛡️ PHANTOM TP BLOCKED for ${pos.token_symbol}: DexScreener reported +${pnlPct.toFixed(1)}% ($${currentPrice.toFixed(6)}) but on-chain DEX quote is $${simResult.effectiveExitPriceUsd.toFixed(6)} (<= Entry $${pos.entry_price_usd.toFixed(6)}). Aborting sell to protect capital!`);
+        return;
+      }
 
       const creditedSol = simResult.netSol;
       updatePaperBalance(creditedSol);
@@ -1030,6 +1040,12 @@ export async function evaluatePosition(
             currentLiquidityUsd || 20000,
             CONFIG.SLIPPAGE_PCT
           );
+
+          // REALITY GUARD:
+          if (simResult.effectiveExitPriceUsd <= pos.entry_price_usd) {
+            console.warn(`[TradeManager] 🛡️ PHANTOM PROFIT LOCK BLOCKED for ${pos.token_symbol}: on-chain quote $${simResult.effectiveExitPriceUsd.toFixed(6)} <= Entry $${pos.entry_price_usd.toFixed(6)}. Aborting sell!`);
+            return;
+          }
 
           const creditedSol = simResult.netSol;
           updatePaperBalance(creditedSol);

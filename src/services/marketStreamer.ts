@@ -4,7 +4,6 @@ import { getDedicatedConnection } from './solanaConnection';
 import { getBondingCurveAddress, decodeBondingCurveBuffer } from './bondingCurve';
 import { getSolPriceUsd, getTokenMarketData, getMultiTokenMarketData } from './dexscreener';
 import { getOpenPositionByToken, getOpenPositions, getLastClosedPosition } from '../db/index';
-import { executeBuyToken, getDynamicAlgoBuyAmount } from './tradeManager';
 import { entryEngine } from '../execution';
 import { adaptiveLearningEngine } from '../strategies/adaptiveLearningEngine';
 import { getOrganicTrendingTokens } from './algoScanner';
@@ -439,56 +438,10 @@ async function evaluateWatchlistCandidateOnTick(item: WatchedCandidate, curveSta
   const minScore = adaptiveLearningEngine.getMinEntryScore();
 
   if (decision.shouldEnter && decision.compositeScore >= minScore) {
-    // Smart Decision Re-Entry Guard for Live Stream
-    const lastClosed = getLastClosedPosition(item.tokenMint);
-    if (lastClosed && lastClosed.closed_at) {
-      const msSinceClose = now - new Date(lastClosed.closed_at).getTime();
-      const minsSinceClose = msSinceClose / 60000;
-      if (lastClosed.pnl_pct <= 0) {
-        if (minsSinceClose < 60) {
-          console.log(`[MarketStreamer] 🛑 RE-ENTRY REJECTED for ${item.symbol}: Closed at loss ${minsSinceClose.toFixed(0)}m ago < 60m`);
-          return;
-        }
-      } else {
-        if (minsSinceClose < 10) return;
-        const prevPeak = lastClosed.peak_price_usd || lastClosed.entry_price_usd;
-        if (realMarketData.priceUsd < prevPeak * 0.98) {
-          console.log(`[MarketStreamer] 🛑 RE-ENTRY REJECTED for ${item.symbol}: Price $${realMarketData.priceUsd.toFixed(6)} < Prev Peak $${prevPeak.toFixed(6)}`);
-          return;
-        }
-      }
-    }
-
-    const isBreakout = decision.reason.includes('PARABOLIC_BREAKOUT') || (vector.volumeAcceleration >= 1.8 && vector.buySellRatio >= 1.75);
-
-    const dynamicSizing = getDynamicAlgoBuyAmount();
-    const allocatedSol = dynamicSizing.allocatedSol;
-
-    console.log(`[MarketStreamer] 💰 Dynamic Equity Sizing: ${allocatedSol} SOL (${dynamicSizing.rationale})`);
-
-    await executeBuyToken(
-      item.tokenMint,
-      allocatedSol,
-      `LIVE_WS_STREAM`,
-      undefined,
-      undefined,
-      undefined,
-      {
-        setupType: isBreakout ? 'PARABOLIC_BREAKOUT' : 'PULLBACK_ABSORPTION',
-        score: decision.compositeScore,
-        minScore,
-        explanation: decision.reason,
-        rvol: rvol5m,
-        priceChange5m: priceChangePct,
-        buySellRatio: vector.buySellRatio,
-        flowImbalance: vector.flowImbalance,
-        volume5mUsd: vector.volume5mUsd,
-        whaleNetFlowSol: vector.whaleNetFlowSol,
-        drawdownFromPeakPct: vector.drawdownFromPeakPct,
-        upperWickRatio: vector.upperWickRatio,
-        reboundTickPct: vector.return1m
-      }
-    );
+    // INSTITUTIONAL RISK RULE: MarketStreamer is strictly for real-time telemetry, position monitoring & watchlist streaming.
+    // Raw WebSocket ticks must NEVER execute blind buys (prevents "Beli di Pucuk" / exhaustion entries which caused 85% loss rate).
+    // Qualified breakout candidates are instead queued to Watchlist for AlgoScanner's rigorous multi-factor confirmation.
+    console.log(`[MarketStreamer] 📡 High momentum tick detected for ${item.symbol} (Score: ${decision.compositeScore}/${minScore}). Filtered from blind WS entry; promoted to Watchlist for AlgoScanner multi-factor confirmation.`);
   }
 }
 
