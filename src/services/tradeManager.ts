@@ -10,6 +10,7 @@ import {
   closePosition, 
   getPositionById,
   halfClosePosition,
+  getLastClosedPosition,
   recordWhaleTrade,
   isCircuitBreakerActive,
   tripCircuitBreaker,
@@ -169,7 +170,20 @@ export async function executeBuyToken(
     return { success: false, message: `Posisi untuk token ${existing.token_symbol} sudah aktif dibuka.` };
   }
 
-  // 0.5. Re-entry Loss Cooldown Guard: Prevent buying a token that just suffered a dump / stop loss
+  // 0.5. Re-entry Loss Cooldown Guard: Persistent 24-Hour Quarantine from SQLite DB
+  const lastClosed = getLastClosedPosition(tokenMint);
+  if (lastClosed && lastClosed.closed_at) {
+    const msSinceClose = Date.now() - new Date(lastClosed.closed_at).getTime();
+    const minsSinceClose = msSinceClose / 60000;
+    if (lastClosed.pnl_pct <= 0 || (lastClosed.close_reason && (lastClosed.close_reason.includes('SL') || lastClosed.close_reason.includes('DUMP')))) {
+      if (minsSinceClose < 1440) { // 24 hours quarantine
+        const remainingHours = ((1440 - minsSinceClose) / 60).toFixed(1);
+        console.log(`[AutoTrade] 🛡️ Re-entry Guard: Token ${lastClosed.token_symbol} (${tokenMint}) ditutup minus (${lastClosed.pnl_pct.toFixed(1)}%) ${minsSinceClose.toFixed(0)}m lalu. Karantina 24 jam aktif (${remainingHours} jam tersisa).`);
+        return { success: false, message: `Token sedang dalam karantina 24 jam pasca-SL (${remainingHours} jam tersisa)` };
+      }
+    }
+  }
+
   const cooldownExpiry = tokenLossCooldownMap.get(tokenMint);
   if (cooldownExpiry && Date.now() < cooldownExpiry) {
     const remainingMins = Math.ceil((cooldownExpiry - Date.now()) / 60000);
@@ -857,8 +871,8 @@ export async function evaluatePosition(
 
     // Fallback to DexScreener if not a bonding curve token or graduated to Raydium
     if (currentPrice === pos.current_price_usd || currentLiquidityUsd === 0) {
-      const isProfitable = (pos.peak_price_usd > pos.entry_price_usd);
-      const marketData = await getTokenMarketData(pos.token_address, isProfitable);
+      // Always fetch fresh quotes for open active positions (never rely on 12-second stale cache during dump)
+      const marketData = await getTokenMarketData(pos.token_address, true);
       if (marketData) {
         currentPrice = marketData.priceUsd;
         currentLiquidityUsd = marketData.liquidityUsd;
@@ -925,7 +939,7 @@ export async function evaluatePosition(
 
       const creditedSol = simResult.netSol;
       updatePaperBalance(creditedSol);
-      halfClosePosition(pos.id, simResult.effectiveExitPriceUsd, creditedSol, `STAGE_1_TP (+${pnlPct.toFixed(1)}%)`);
+      halfClosePosition(pos.id, simResult.effectiveExitPriceUsd, creditedSol, `STAGE_1_TP (+${pnlPct.toFixed(1)}%)`, soldTokens);
 
       const remainingBalance = getPaperBalance();
       const halfTpAlert = `🎉 *STAGE 1 TAKE-PROFIT DIEKSEKUSI! (40% DIAMANKAN)*\n\n` +
@@ -1049,7 +1063,7 @@ export async function evaluatePosition(
 
           const creditedSol = simResult.netSol;
           updatePaperBalance(creditedSol);
-          halfClosePosition(pos.id, simResult.effectiveExitPriceUsd, creditedSol, `SL_PLUS_50_50_${tierLabel} (+${pnlPct.toFixed(1)}%)`);
+          halfClosePosition(pos.id, simResult.effectiveExitPriceUsd, creditedSol, `SL_PLUS_50_50_${tierLabel} (+${pnlPct.toFixed(1)}%)`, halfTokens);
 
           const remainingBalance = getPaperBalance();
           const halfAlert = `💰 *SL PLUS: 50% PROFIT LOCK & FREE-ROLL MOONBAG!* (Hedge Fund Mode)\n\n` +
@@ -1152,11 +1166,13 @@ async function checkPositions() {
         continue;
       }
 
-      // 2. Event-Driven Gate: If WebSocket stream is active, do NOT poll HTTP unless position is profitable!
-      const isProfitable = (pos.peak_price_usd > pos.entry_price_usd);
+      // 2. Active position evaluation: For Pump.fun, WS onAccountChange provides real-time quotes.
+      // For Raydium DEX tokens, ensure fallback polling runs at least every 6s so Stop-Loss is never delayed
       const lastWs = lastWsUpdateTimestamp.get(pos.id) || 0;
-      if (!isProfitable && (now - lastWs < WS_SILENCE_FALLBACK_MS)) {
-        continue; // Active WebSocket streaming handles position evaluation for calm positions
+      const isPump = pos.token_address.endsWith('pump');
+      const maxSilenceMs = isPump ? WS_SILENCE_FALLBACK_MS : 6_000;
+      if (now - lastWs < maxSilenceMs) {
+        continue;
       }
 
       // 3. Quiet Fallback: Direct RPC getAccountInfo for Pump.fun tokens (0 DexScreener HTTP)
