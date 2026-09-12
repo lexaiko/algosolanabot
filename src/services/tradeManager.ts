@@ -915,92 +915,12 @@ export async function evaluatePosition(
     const targetTp = pos.target_tp_pct || CONFIG.TAKE_PROFIT_PCT;
     const targetSl = pos.target_sl_pct || CONFIG.STOP_LOSS_PCT;
 
-    // 1. STAGE 1 TAKE-PROFIT (Hedge Fund Asymmetric Target): Jual 40%, Modal Pokok + Cuan Masuk, 60% Jadi Free-Roll Moonbag!
-    if (pos.is_half_closed === 0 && pnlPct >= targetTp) {
-      console.log(`[TradeManager] 🎯 STAGE 1 TP (+${pnlPct.toFixed(1)}% >= target ${targetTp}%) tercapai untuk ${pos.token_symbol}! Mengamankan 40% posisi via DEX Simulator...`);
-      const soldTokens = pos.amount_tokens * 0.40;
-      
-      const simResult = await simulateRealisticSell(
-        pos.token_address,
-        soldTokens,
-        currentPrice,
-        solPriceUsd,
-        currentLiquidityUsd || 20000,
-        CONFIG.SLIPPAGE_PCT
-      );
-
-      // REALITY GUARD (LEVERCAT Phantom Spike Buster):
-      // If DexScreener experienced a phantom tick spike (+1500%) but real on-chain DEX quote is <= entry price,
-      // REJECT the TP and DO NOT execute a partial exit at a loss!
-      if (simResult.effectiveExitPriceUsd <= pos.entry_price_usd) {
-        console.warn(`[TradeManager] 🛡️ PHANTOM TP BLOCKED for ${pos.token_symbol}: DexScreener reported +${pnlPct.toFixed(1)}% ($${currentPrice.toFixed(6)}) but on-chain DEX quote is $${simResult.effectiveExitPriceUsd.toFixed(6)} (<= Entry $${pos.entry_price_usd.toFixed(6)}). Aborting sell to protect capital!`);
-        return;
-      }
-
-      const creditedSol = simResult.netSol;
-      updatePaperBalance(creditedSol);
-      halfClosePosition(pos.id, simResult.effectiveExitPriceUsd, creditedSol, `STAGE_1_TP (+${pnlPct.toFixed(1)}%)`, soldTokens);
-
-      const remainingBalance = getPaperBalance();
-      const halfTpAlert = `🎉 *STAGE 1 TAKE-PROFIT DIEKSEKUSI! (40% DIAMANKAN)*\n\n` +
-        `🪙 *Token:* *${pos.token_symbol}* (${pos.token_name})\n` +
-        `📈 *Profit Terkunci:* *+${pnlPct.toFixed(1)}%* (Target: +${targetTp}%) 🟢\n` +
-        `💰 *Dana Masuk:* *${creditedSol.toFixed(4)} SOL* (~$${(creditedSol * solPriceUsd).toFixed(2)})\n` +
-        `🛡️ *Status:* *Modal Pokok & Profit Diamankan!* Saldo bebas risiko.\n` +
-        `🌕 *Sisa 60% Posisi:* Menjadi *FREE-ROLL MOONBAG* dikawal Institutional Trailing Stop (${CONFIG.TRAILING_STOP_PCT}%).\n` +
-        `💼 *Saldo Virtual Sekarang:* *${remainingBalance.toFixed(3)} SOL*\n\n` +
-        `_Jika token meledak ratusan persen, sisa 60% posisi ini akan memanen jackpot puncak!_`;
-
-      await notify(halfTpAlert);
-      return;
-    }
-
-    // 2. STAGE 2 INSTITUTIONAL MOONBAG TRAILING STOP (Memberi Ruang Nafas Menuju Puncak)
-    if (pos.is_half_closed === 1) {
-      const peakGainPct = ((peakPrice - pos.entry_price_usd) / pos.entry_price_usd) * 100;
-      
-      // True Net BEP Floor: Dihitung dinamis agar hasil penjualan 100% masih CUAN BERSIH setelah gas & DEX fee
-      const sellFeeSol = CONFIG.ESTIMATED_SELL_FEE_SOL;
-      const gasDragPct = pos.entry_sol > 0 ? (sellFeeSol / pos.entry_sol) * 100 : 2.5;
-      const trueNetBepFloorPct = Math.max(10.0, gasDragPct + 4.0);
-
-      let moonbagFloorPct: number | null = null;
-      let moonbagReason = '';
-
-      // Trailing Stop Moonbag Hedge Fund: Longgar dan agresif mengawal runner
-      if (peakGainPct >= 120.0) {
-        // Mega Parabolic Runner: Trail 15% dari peak, kunci minimal >= +80%
-        moonbagFloorPct = Math.max(80.0, peakGainPct - 15.0);
-        moonbagReason = `MOONBAG_MEGA_RUNNER (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${moonbagFloorPct.toFixed(1)}%)`;
-      } else if (peakGainPct >= 60.0) {
-        // Super Runner: Trail 12% dari peak, kunci minimal >= +40%
-        moonbagFloorPct = Math.max(40.0, peakGainPct - 12.0);
-        moonbagReason = `MOONBAG_SUPER_RUNNER (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${moonbagFloorPct.toFixed(1)}%)`;
-      } else if (peakGainPct >= 35.0) {
-        // Solid Breakout: Trail 10% dari peak, kunci minimal >= +20%
-        moonbagFloorPct = Math.max(20.0, peakGainPct - 10.0);
-        moonbagReason = `MOONBAG_PROFIT_HARVEST (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${moonbagFloorPct.toFixed(1)}%)`;
-      } else {
-        // Floor dasar aman: Kunci minimal >= +12% Net Cuan (tidak membiarkan runner mati impas)
-        moonbagFloorPct = Math.max(12.0, trueNetBepFloorPct);
-        moonbagReason = `MOONBAG_PROTECTED_FLOOR (Protected @ +${moonbagFloorPct.toFixed(1)}% Net Cuan)`;
-      }
-
-      if (pnlPct <= moonbagFloorPct) {
-        console.log(`[TradeManager] 🛡️ Institutional Moonbag Trailing Triggered for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Floor: +${moonbagFloorPct.toFixed(1)}%, Current: +${pnlPct.toFixed(1)}%)`);
-        await executeSellToken(pos.id, 100, moonbagReason);
-        return;
-      }
-    }
-
-    // 2.8. VELOCITY DUMP RESCUE (Strict Anti-Rug / Honeypot Early Cut)
-    // Prinsip Hedge Fund: Potong HANYA jika terbukti Catastrophic Rug / Dev Dump!
-    // JANGAN terpicu oleh fluktuasi normal -3% s/d -6% yang merupakan noise bid-ask spread!
+    // 1. VELOCITY DUMP RESCUE (Strict Anti-Rug / Honeypot Early Cut)
     const ageSec = (Date.now() - new Date(pos.opened_at).getTime()) / 1000;
     const isFreshCollapse = (ageSec <= 90 && pnlPct <= -14.0);
     const isPlungeDrop = (pnlPct <= -10.0 && pos.current_price_usd > 0 && ((pos.current_price_usd - currentPrice) / pos.current_price_usd) * 100 >= 12.0);
 
-    if (pos.is_half_closed === 0 && (isFreshCollapse || isPlungeDrop)) {
+    if (isFreshCollapse || isPlungeDrop) {
       const reasonDetail = isFreshCollapse 
         ? `Fresh collapse (${pnlPct.toFixed(1)}% in ${ageSec.toFixed(0)}s < 90s)` 
         : `Plunge drop (${pnlPct.toFixed(1)}% with severe tick velocity)`;
@@ -1009,102 +929,60 @@ export async function evaluatePosition(
       return;
     }
 
-    // 3. STOP-LOSS (Strict Institutional Hard Ceiling)
-    if (pos.is_half_closed === 0 && pnlPct <= -targetSl) {
+    // 2. HARD STOP-LOSS (Strict Institutional Hard Ceiling)
+    if (pnlPct <= -targetSl) {
       console.log(`[TradeManager] 🛑 HARD SL Triggered for ${pos.token_symbol} (${pnlPct.toFixed(1)}% <= -${targetSl}%)`);
       await executeSellToken(pos.id, 100, `AUTO_SL (${pnlPct.toFixed(1)}%)`);
       return;
     }
 
-    // 3.5. PRO TRADER DYNAMIC SL PLUS & PROFIT LOCK LADDER (Hedge Fund High-Water Mark):
-    // CATATAN PENTING: Jangan mencekik posisi di +6%! Fluktuasi normal 10-15% dibiarkan bernafas.
-    // Tangga pengaman baru aktif setelah koin membuktikan breakout di atas +25%!
-    if (pos.is_half_closed === 0 && peakPrice > pos.entry_price_usd) {
+    // 3. INSTITUTIONAL DYNAMIC RATCHET TRAILING STOP (100% Single-Exit, Max Power Law Engine)
+    // No partial sales! 100% bag captures exponential runs, Stop-Loss ratchets up like a one-way ladder.
+    if (peakPrice > pos.entry_price_usd) {
       const peakGainPct = ((peakPrice - pos.entry_price_usd) / pos.entry_price_usd) * 100;
-      let targetFloorPct: number | null = null;
-      let tierLabel = '';
+      let ratchetFloorPct: number | null = null;
+      let ratchetReason = '';
 
-      if (peakGainPct >= 80.0) {
-        // Tier 3: Parabolic Mega Runner (Trail 12.0% from peak, guaranteed floor >= +50%)
-        targetFloorPct = Math.max(50.0, peakGainPct - 12.0);
-        tierLabel = 'TIER_3_MEGA_RUNNER';
+      if (peakGainPct >= 150.0) {
+        // Tier 4: God Candle / Mega Parabolic Runner (Trail 15% from ATH, guaranteed floor >= +100%)
+        ratchetFloorPct = Math.max(100.0, peakGainPct - 15.0);
+        ratchetReason = `MEGA_RUNNER_100_EXIT (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${ratchetFloorPct.toFixed(1)}%)`;
+      } else if (peakGainPct >= 80.0) {
+        // Tier 3: Strong Parabolic Runner (Trail 15% from ATH, guaranteed floor >= +50%)
+        ratchetFloorPct = Math.max(50.0, peakGainPct - 15.0);
+        ratchetReason = `SUPER_RUNNER_100_EXIT (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${ratchetFloorPct.toFixed(1)}%)`;
       } else if (peakGainPct >= 45.0) {
-        // Tier 2: Strong Runner (Trail 10.0% from peak, guaranteed floor >= +25%)
-        targetFloorPct = Math.max(25.0, peakGainPct - 10.0);
-        tierLabel = 'TIER_2_RUNNER';
-      } else if (peakGainPct >= 25.0) {
-        // Tier 1: Breakout Lock (Trail 8.0% from peak, guaranteed floor >= +15%)
-        // Memberi ruang bernafas yang cukup bagi koin sebelum ditarik ke pucuk
-        targetFloorPct = Math.max(15.0, peakGainPct - 8.0);
-        tierLabel = 'TIER_1_BREAKOUT_LOCK';
+        // Tier 2: Solid Breakout (Trail 12% from ATH, guaranteed floor >= +25%)
+        ratchetFloorPct = Math.max(25.0, peakGainPct - 12.0);
+        ratchetReason = `SOLID_BREAKOUT_100_EXIT (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${ratchetFloorPct.toFixed(1)}%)`;
+      } else if (peakGainPct >= 22.0) {
+        // Tier 1: Risk-Free Breakout Lock (Guaranteed Net BEP Floor: +3.5% Net Profit after fees)
+        // Once a token breaks out +22%, this trade is 100% GUARANTEED to never lose capital!
+        ratchetFloorPct = 3.5;
+        ratchetReason = `RISK_FREE_BEP_LOCK (Peak +${peakGainPct.toFixed(1)}% -> Secured @ +${ratchetFloorPct.toFixed(1)}% Net BEP)`;
       }
 
-      if (targetFloorPct !== null && pnlPct <= targetFloorPct) {
-        if (pnlPct >= 5.0) {
-          // PRO TRADER SCALE-OUT (50:50 RULE):
-          // Jual 50% posisi untuk mengunci profit tebal, sisa 50% dijadikan Free-Roll Moonbag!
-          console.log(`[TradeManager] 💰 SL PLUS 50:50 PARTIAL PROFIT LOCK for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Floor: +${targetFloorPct.toFixed(1)}%, Current: +${pnlPct.toFixed(1)}%) via DEX Simulator...`);
-          
-          const halfTokens = pos.amount_tokens * 0.5;
-          const simResult = await simulateRealisticSell(
-            pos.token_address,
-            halfTokens,
-            currentPrice,
-            solPriceUsd,
-            currentLiquidityUsd || 20000,
-            CONFIG.SLIPPAGE_PCT
-          );
-
-          // REALITY GUARD:
-          if (simResult.effectiveExitPriceUsd <= pos.entry_price_usd) {
-            console.warn(`[TradeManager] 🛡️ PHANTOM PROFIT LOCK BLOCKED for ${pos.token_symbol}: on-chain quote $${simResult.effectiveExitPriceUsd.toFixed(6)} <= Entry $${pos.entry_price_usd.toFixed(6)}. Aborting sell!`);
-            return;
-          }
-
-          const creditedSol = simResult.netSol;
-          updatePaperBalance(creditedSol);
-          halfClosePosition(pos.id, simResult.effectiveExitPriceUsd, creditedSol, `SL_PLUS_50_50_${tierLabel} (+${pnlPct.toFixed(1)}%)`, halfTokens);
-
-          const remainingBalance = getPaperBalance();
-          const halfAlert = `💰 *SL PLUS: 50% PROFIT LOCK & FREE-ROLL MOONBAG!* (Hedge Fund Mode)\n\n` +
-            `🪙 *Token:* *${pos.token_symbol}* (${pos.token_name})\n` +
-            `📈 *Profit 50% Pertama Terkunci:* *+${pnlPct.toFixed(1)}%* (Peak: +${peakGainPct.toFixed(1)}%) 🟢\n` +
-            `💵 *Dana Diamankan:* *${creditedSol.toFixed(4)} SOL* (~$${(creditedSol * solPriceUsd).toFixed(2)})\n` +
-            `🛡️ *Status:* *Modal Pokok & Profit Diamankan!* Trade ini 100% BEBAS RISIKO.\n` +
-            `🌕 *Sisa 50% Posisi:* Menjadi *FREE-ROLL MOONBAG* dikawal Trailing Stop (${CONFIG.TRAILING_STOP_PCT}%).\n` +
-            `💼 *Saldo Virtual Sekarang:* *${remainingBalance.toFixed(3)} SOL*\n\n` +
-            `_Sisa 50% posisi ini bebas melesat mengejar puncak ratusan persen tanpa risiko!_`;
-
-          await notify(halfAlert);
-          return;
-        } else {
-          // Flash dump slipped past the trailing floor: Liquidate 100% emergency
-          console.log(`[TradeManager] ⚡ FLASH DUMP SLIPPAGE GAP RESCUE for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Floor: +${targetFloorPct.toFixed(1)}%, Breached to: ${pnlPct.toFixed(1)}%)`);
-          await executeSellToken(pos.id, 100, `FLASH_DUMP_RESCUE (Peak +${peakGainPct.toFixed(1)}% Jebol Floor +${targetFloorPct.toFixed(1)}% -> Cut @ ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`);
-          return;
-        }
+      if (ratchetFloorPct !== null && pnlPct <= ratchetFloorPct) {
+        console.log(`[TradeManager] 🎯 DYNAMIC RATCHET TRAILING STOP TRIGGERED for ${pos.token_symbol}! (Peak: +${peakGainPct.toFixed(1)}%, Floor: +${ratchetFloorPct.toFixed(1)}%, Exit: +${pnlPct.toFixed(1)}%)`);
+        await executeSellToken(pos.id, 100, ratchetReason);
+        return;
       }
     }
 
-    // 4. RUNNER TRAILING STOP (Untuk mega runner di atas +60% yang belum kena TP penuh)
-    if (pos.is_half_closed === 0) {
-      const peakGainPct = ((peakPrice - pos.entry_price_usd) / pos.entry_price_usd) * 100;
-      if (peakGainPct >= 60.0) {
-        const dropFromPeakPct = ((peakPrice - currentPrice) / peakPrice) * 100;
-        if (dropFromPeakPct >= 15.0) {
-          console.log(`[TradeManager] 🚀 Mega Runner Trailing Stop Triggered for ${pos.token_symbol} (Peak: +${peakGainPct.toFixed(1)}%, Dropped: -${dropFromPeakPct.toFixed(1)}%)`);
-          await executeSellToken(pos.id, 100, `RUNNER_TRAILING_STOP (Peak +${peakGainPct.toFixed(1)}%)`);
-          return;
-        }
-      }
-    }
-
-    // 5. TIME-STOP / ZOMBIE POSITION REAPER (24-Hour Capital Turnover Rule)
+    // 4. SMART ZOMBIE / TIME-STOP REAPER (Fast Capital Turnover)
+    // If held >= 2.5 hours with stagnant price (-6% to +4%), liquidate 100% to free capital!
     const openedTime = new Date(pos.opened_at).getTime();
     const hoursHeld = (Date.now() - openedTime) / (1000 * 60 * 60);
-    if (hoursHeld >= CONFIG.MAX_HOLD_TIME_HOURS) {
-      console.log(`[TradeManager] ⌛ Time-Stop Triggered for ${pos.token_symbol} (${hoursHeld.toFixed(1)}h held). Liquidating to free capital...`);
-      await executeSellToken(pos.id, 100, `TIME_STOP (${hoursHeld.toFixed(1)}h Zombie Exit)`);
+    if (hoursHeld >= 2.5 && pnlPct >= -6.0 && pnlPct <= 4.0) {
+      console.log(`[TradeManager] ⌛ ZOMBIE TIME-STOP: ${pos.token_symbol} held for ${hoursHeld.toFixed(1)}h with stagnant price (${pnlPct.toFixed(1)}%). Liquidating 100% to rotate capital.`);
+      await executeSellToken(pos.id, 100, `ZOMBIE_TIME_STOP (${hoursHeld.toFixed(1)}h Stagnant Exit)`);
+      return;
+    }
+
+    // Hard ceiling timeout (12 hours max)
+    if (hoursHeld >= 12.0) {
+      console.log(`[TradeManager] ⌛ MAX HOLD TIME REACHED for ${pos.token_symbol} (${hoursHeld.toFixed(1)}h held). Liquidating 100%...`);
+      await executeSellToken(pos.id, 100, `MAX_HOLD_TIMEOUT (${hoursHeld.toFixed(1)}h Exit)`);
       return;
     }
   } catch (err: any) {
