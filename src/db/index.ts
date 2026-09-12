@@ -710,17 +710,23 @@ export function halfClosePosition(
   id: number,
   exitPriceUsd: number,
   soldSol: number,
-  reason: string
+  reason: string,
+  soldTokensCount?: number
 ): Position | undefined {
   const pos = getPositionById(id);
   if (!pos || pos.status !== 'OPEN' || pos.is_half_closed === 1) return undefined;
 
   const now = new Date().toISOString();
-  const halfTokens = pos.amount_tokens / 2;
-  const remainingTokens = pos.amount_tokens - halfTokens;
+  // Exact mathematical accounting: derive the exact fraction of position closed
+  const actualSoldTokens = (soldTokensCount && soldTokensCount > 0 && soldTokensCount < pos.amount_tokens) 
+    ? soldTokensCount 
+    : (pos.amount_tokens / 2);
+  const fractionClosed = actualSoldTokens / pos.amount_tokens;
+  const remainingTokens = Math.max(0, pos.amount_tokens - actualSoldTokens);
   const pnlPct = ((exitPriceUsd - pos.entry_price_usd) / pos.entry_price_usd) * 100;
-  const halfEntrySol = pos.entry_sol / 2;
-  const pnlSol = soldSol - halfEntrySol;
+  const closedEntrySol = pos.entry_sol * fractionClosed;
+  const remainingEntrySol = Math.max(0, pos.entry_sol - closedEntrySol);
+  const pnlSol = soldSol - closedEntrySol;
 
   const sellFee = CONFIG.ESTIMATED_SELL_FEE_SOL;
   const netPnlSol = pnlSol - sellFee;
@@ -729,9 +735,9 @@ export function halfClosePosition(
     UPDATE positions 
     SET amount_tokens = ?, entry_sol = ?, is_half_closed = 1, current_price_usd = ?
     WHERE id = ?
-  `).run(remainingTokens, halfEntrySol, exitPriceUsd, id);
+  `).run(remainingTokens, remainingEntrySol, exitPriceUsd, id);
 
-  // Record 50% partial exit to trade_history with net fee tracking
+  // Record exact partial exit to trade_history with net fee tracking
   db.prepare(`
     INSERT INTO trade_history (
       position_id, token_address, token_symbol, action,
@@ -741,7 +747,7 @@ export function halfClosePosition(
     id,
     pos.token_address,
     pos.token_symbol,
-    halfTokens,
+    actualSoldTokens,
     exitPriceUsd,
     soldSol,
     pnlSol,
