@@ -39,16 +39,21 @@ export async function checkTokenSafety(tokenAddress: string): Promise<RugCheckRe
         top10HoldersPct,
         risks: []
       };
-    } catch {
-      // If RPC transient error, return safe default for pump.fun curve
+    } catch (err: any) {
+      // FAIL-CLOSED: if the on-chain RPC safety verification is unavailable
+      // (timeout, rate-limit, dead endpoint), we CANNOT claim the token is
+      // safe. Previously this returned isSafe:true, letting unverifiable
+      // tokens through the entry gate — the exact opposite of the documented
+      // fail-closed design. Now entry is blocked until data is available.
+      console.warn(`[AntiRug] 🚫 Pump.fun on-chain safety check FAILED for ${tokenAddress}: ${err?.message || err}. Blocking entry (fail-closed).`);
       return {
-        score: 90,
-        isSafe: true,
-        mintAuthorityRevoked: true,
-        freezeAuthorityRevoked: true,
-        lpBurnedOrLocked: true,
-        top10HoldersPct: 22.0,
-        risks: []
+        score: 0,
+        isSafe: false,
+        mintAuthorityRevoked: false,
+        freezeAuthorityRevoked: false,
+        lpBurnedOrLocked: false,
+        top10HoldersPct: 100,
+        risks: ['SAFETY CHECK UNAVAILABLE — entry blocked (RPC failure)']
       };
     }
   }
@@ -122,9 +127,38 @@ export async function checkTokenSafety(tokenAddress: string): Promise<RugCheckRe
         if (!mintRevoked) score -= 40;
         if (!freezeRevoked) score -= 40;
         calculatedScore = score;
+      } else {
+        // FAIL-CLOSED: RugCheck is down AND the on-chain account is not a
+        // parseable SPL Mint (nonexistent / wrong account type). No safety
+        // data is available, so this token must not enter the portfolio.
+        console.warn(`[AntiRug] 🚫 No parseable on-chain mint data for ${tokenAddress} while RugCheck is unavailable. Blocking entry (fail-closed).`);
+        risks.push('SAFETY CHECK UNAVAILABLE — entry blocked (no on-chain mint data)');
+        return {
+          score: 0,
+          isSafe: false,
+          mintAuthorityRevoked: false,
+          freezeAuthorityRevoked: false,
+          lpBurnedOrLocked: false,
+          top10HoldersPct: 100,
+          risks
+        };
       }
     } catch (rpcErr: any) {
-      risks.push('RPC safety fallback error: ' + rpcErr.message);
+      // FAIL-CLOSED: both RugCheck API AND the direct Solana RPC fallback failed.
+      // We have zero verifiable safety data on this token, so it must not pass
+      // the entry gate. Previously this fell through to a default `isSafe:true`
+      // (score ~85) — an unverifiable token was traded as if fully audited.
+      console.warn(`[AntiRug] 🚫 Safety data unavailable for ${tokenAddress}: RugCheck down + RPC fallback failed (${rpcErr?.message || rpcErr}). Blocking entry (fail-closed).`);
+      risks.push('SAFETY CHECK UNAVAILABLE — entry blocked (RPC failure)');
+      return {
+        score: 0,
+        isSafe: false,
+        mintAuthorityRevoked: false,
+        freezeAuthorityRevoked: false,
+        lpBurnedOrLocked: false,
+        top10HoldersPct: 100,
+        risks
+      };
     }
   }
 

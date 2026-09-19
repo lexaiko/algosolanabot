@@ -1071,8 +1071,12 @@ export function startPositionManager() {
 
   refreshPositionWebSocketSubscriptions();
   checkPositions();
-  // 3-second rapid heartbeat for active position evaluations
-  monitorInterval = setInterval(checkPositions, 3000);
+  // Heartbeat cadence is configurable via POSITION_CHECK_INTERVAL_SEC.
+  // NOTE: the .env/CONFIG key exists (default 2s) but was previously ignored —
+  // the interval was hardcoded to 3000ms. It is now honored, clamped to
+  // [1.5s, 30s] so a misconfigured env cannot starve the event loop.
+  const intervalMs = Math.min(30_000, Math.max(1_500, (CONFIG.POSITION_CHECK_INTERVAL_SEC || 3) * 1_000));
+  monitorInterval = setInterval(checkPositions, intervalMs);
 }
 
 export function stopPositionManager() {
@@ -1093,9 +1097,92 @@ export function stopPositionManager() {
 }
 
 /**
+ * Evaluates a single open position for the heartbeat loop.
+ * Extracted from checkPositions so positions can be evaluated CONCURRENTLY:
+ * a sequential `for` loop meant one hung RPC (getOnChainBondingCurve /
+ * getSolPriceUsd / evaluatePosition) stalled evaluation of every other
+ * position in the 3s heartbeat, and the interval itself piled up.
+ *
+ * Every failure path is guarded with try/catch + Promise.allSettled at the call
+ * site so a single rejected promise can never abort the whole sweep.
+ */
+async function evaluatePositionForHeartbeat(pos: Position, now: number, wsSilenceFallbackMs: number): Promise<void> {
+  // 1. Time-Stop / Zombie Position Reaper (24-Hour Turnover)
+  const openedTime = new Date(pos.opened_at).getTime();
+  const hoursHeld = (now - openedTime) / (1000 * 60 * 60);
+  if (hoursHeld >= CONFIG.MAX_HOLD_TIME_HOURS) {
+    console.log(`[TradeManager] ⌛ Time-Stop Triggered for ${pos.token_symbol} (${hoursHeld.toFixed(1)}h held). Liquidating to free capital...`);
+    await executeSellToken(pos.id, 100, `TIME_STOP (${hoursHeld.toFixed(1)}h Zombie Exit)`);
+    return;
+  }
+
+  // 2. Active position evaluation: For Pump.fun, WS onAccountChange provides real-time quotes.
+  // For Raydium DEX tokens, ensure fallback polling runs at least every 6s so Stop-Loss is never delayed
+  const lastWs = lastWsUpdateTimestamp.get(pos.id) || 0;
+  const isPump = pos.token_address.endsWith('pump');
+  const maxSilenceMs = isPump ? wsSilenceFallbackMs : 6_000;
+  if (now - lastWs < maxSilenceMs) {
+    return;
+  }
+
+  // 3. Quiet Fallback: Direct RPC getAccountInfo for Pump.fun tokens (0 DexScreener HTTP)
+  if (isPump) {
+    const curve = await getOnChainBondingCurve(pos.token_address);
+    if (curve && !curve.complete && curve.spotPriceSol > 0) {
+      const solPrice = await getSolPriceUsd();
+      lastWsUpdateTimestamp.set(pos.id, now);
+      await evaluatePosition(pos.id, curve.spotPriceSol * solPrice, curve.liquiditySol * solPrice);
+      return;
+    }
+  }
+
+  // Raydium / DEX quiet fallback
+  lastWsUpdateTimestamp.set(pos.id, now);
+  await evaluatePosition(pos.id);
+}
+
+/**
+ * Runs at most `maxConcurrency` tasks in flight at once (sliding window).
+ * Bounded (not unbounded Promise.all) so a large open-position set cannot
+ * fire dozens of simultaneous RPC calls and trip the Helius rate limiter.
+ * Each task is catch-wrapped so one rejected/hung RPC never aborts the sweep.
+ */
+async function runWithBoundedConcurrency<T>(items: T[], maxConcurrency: number, worker: (item: T) => Promise<void>): Promise<void> {
+  const queue: T[] = [...items];
+  const inFlight = new Set<Promise<void>>();
+
+  const launchNext = (): void => {
+    while (queue.length > 0 && inFlight.size < maxConcurrency) {
+      const item = queue.shift()!;
+      const task = worker(item)
+        .catch(() => {
+          // Per-position isolation: a rejected or hung RPC for one position
+          // must never abort evaluation of the others (previously the whole
+          // `for` loop's try/catch swallowed per-iteration errors; this keeps
+          // that resilience while removing the sequential stall).
+        })
+        .finally(() => {
+          inFlight.delete(task);
+        });
+      inFlight.add(task);
+    }
+  };
+
+  launchNext();
+  while (inFlight.size > 0) {
+    // Safe to race: every task above is catch-wrapped, so none can reject.
+    await Promise.race([...inFlight]);
+    launchNext();
+  }
+}
+
+/**
  * Event-Driven Position Fallback Check:
  * Only triggers quiet RPC queries if a position has received ZERO WebSocket ticks for >35 seconds,
  * UNLESS the position is already in profit (peak > entry), in which case it is evaluated actively!
+ *
+ * Positions are evaluated CONCURRENTLY (bounded to 5 in flight) so a single
+ * hung/slow RPC cannot stall the heartbeat loop for every other position.
  */
 async function checkPositions() {
   const openPositions = getOpenPositions();
@@ -1106,44 +1193,10 @@ async function checkPositions() {
   const now = Date.now();
   const WS_SILENCE_FALLBACK_MS = 35_000; // 35 seconds
 
-  for (const pos of openPositions) {
-    try {
-      // 1. Time-Stop / Zombie Position Reaper (24-Hour Turnover)
-      const openedTime = new Date(pos.opened_at).getTime();
-      const hoursHeld = (now - openedTime) / (1000 * 60 * 60);
-      if (hoursHeld >= CONFIG.MAX_HOLD_TIME_HOURS) {
-        console.log(`[TradeManager] ⌛ Time-Stop Triggered for ${pos.token_symbol} (${hoursHeld.toFixed(1)}h held). Liquidating to free capital...`);
-        await executeSellToken(pos.id, 100, `TIME_STOP (${hoursHeld.toFixed(1)}h Zombie Exit)`);
-        continue;
-      }
-
-      // 2. Active position evaluation: For Pump.fun, WS onAccountChange provides real-time quotes.
-      // For Raydium DEX tokens, ensure fallback polling runs at least every 6s so Stop-Loss is never delayed
-      const lastWs = lastWsUpdateTimestamp.get(pos.id) || 0;
-      const isPump = pos.token_address.endsWith('pump');
-      const maxSilenceMs = isPump ? WS_SILENCE_FALLBACK_MS : 6_000;
-      if (now - lastWs < maxSilenceMs) {
-        continue;
-      }
-
-      // 3. Quiet Fallback: Direct RPC getAccountInfo for Pump.fun tokens (0 DexScreener HTTP)
-      if (pos.token_address.endsWith('pump')) {
-        const curve = await getOnChainBondingCurve(pos.token_address);
-        if (curve && !curve.complete && curve.spotPriceSol > 0) {
-          const solPrice = await getSolPriceUsd();
-          lastWsUpdateTimestamp.set(pos.id, now);
-          await evaluatePosition(pos.id, curve.spotPriceSol * solPrice, curve.liquiditySol * solPrice);
-          continue;
-        }
-      }
-
-      // Raydium / DEX quiet fallback
-      lastWsUpdateTimestamp.set(pos.id, now);
-      await evaluatePosition(pos.id);
-    } catch {
-      // Ignore transient errors
-    }
-  }
+  // Bounded concurrency: max 5 simultaneous position evaluations.
+  await runWithBoundedConcurrency(openPositions, 5, (pos) =>
+    evaluatePositionForHeartbeat(pos, now, WS_SILENCE_FALLBACK_MS)
+  );
 }
 
 function formatNumber(num: number): string {

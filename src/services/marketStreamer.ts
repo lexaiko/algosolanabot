@@ -32,8 +32,27 @@ const MAX_WATCHLIST_SIZE = 50; // Institutional-Grade 50-token Watchlist
 const TICK_HISTORY_WINDOW_MS = 5 * 60 * 1000; // 5 minutes rolling window
 const INACTIVE_PURGE_MS = 8 * 60 * 1000; // Purge if no tick for 8 minutes
 
+/**
+ * Helius onAccountChange subscription liveness guard.
+ *
+ * The web3.js RpcWebSocketClient auto-reconnects the socket, but a dead or
+ * silently-dropped subscription (server-side expiry, key revocation, or a
+ * subscription that never made it onto the re-established socket) leaves the
+ * tracker in the watchlist with NO ticks and NO error — the watchlist just
+ * goes blind. This timer detects that and re-subscribes with backoff.
+ */
+const WS_HEALTH_CHECK_INTERVAL_MS = 30_000;
+/** Reconnect backoff: 2s -> 4s -> 8s -> 16s -> 30s (cap). */
+const WS_RECONNECT_MIN_BACKOFF_MS = 2_000;
+const WS_RECONNECT_MAX_BACKOFF_MS = 30_000;
+/** A subscription with no tick for this long is treated as dead. */
+const WS_DEAD_SUBSCRIPTION_MS = 90_000;
+
 const watchlist: Map<string, WatchedCandidate> = new Map();
 const wsConnection = getDedicatedConnection('POSITION_MANAGER');
+let wsHealthCheckTimer: NodeJS.Timeout | null = null;
+/** Per-mint reconnect state: [backoffMs, lastAttemptMs]. */
+const wsReconnectState: Map<string, { backoffMs: number; lastAttemptAt: number }> = new Map();
 
 let isStreamerRunning = false;
 let pumpportalWs: WebSocket | null = null;
@@ -101,6 +120,99 @@ function evictLowestPriorityToken() {
 }
 
 /**
+ * (Re)subscribes a watchlist candidate's Helius onAccountChange tracker.
+ * Extracted from addTokenToWatchlist so the health-check below can re-establish
+ * a dead subscription without touching watchlist bookkeeping.
+ *
+ * Returns the new subscription id, or `undefined` if the candidate has no
+ * subscribable on-chain account.
+ */
+function resubscribeCandidate(item: WatchedCandidate): number | undefined {
+  if (item.isPump) {
+    const pdaPubkey = getBondingCurveAddress(item.tokenMint);
+    item.bondingCurvePda = pdaPubkey.toBase58();
+    return wsConnection.onAccountChange(
+      pdaPubkey,
+      (accountInfo) => {
+        handleOnChainCurveUpdate(item.tokenMint, accountInfo.data);
+      },
+      'confirmed'
+    );
+  }
+
+  if (item.pairAddress && item.pairAddress.length >= 32) {
+    // Raydium / DEX AMM On-Chain Subscription
+    const poolPubkey = new PublicKey(item.pairAddress);
+    return wsConnection.onAccountChange(
+      poolPubkey,
+      (accountInfo) => {
+        handleRaydiumPoolUpdate(item.tokenMint, accountInfo.data);
+      },
+      'confirmed'
+    );
+  }
+
+  return undefined;
+}
+
+/**
+ * Detects and repairs dead Helius account-change subscriptions.
+ *
+ * A subscription that has produced no ticks for WS_DEAD_SUBSCRIPTION_MS while
+ * the watchlist item is still considered live is treated as silently dropped
+ * (the underlying socket may have reconnected without re-establishing it, or
+ * Helius expired it). We unsubscribe the stale id and re-subscribe, retrying
+ * with exponential backoff (2s -> 30s cap) so a persistently down endpoint is
+ * not hammered.
+ */
+function checkHeliusSubscriptionHealth(): void {
+  if (!isStreamerRunning) return;
+
+  const now = Date.now();
+  for (const [mint, item] of watchlist.entries()) {
+    if (item.subscriptionId === undefined) continue;
+
+    const silenceMs = now - item.lastTickAt;
+    if (silenceMs < WS_DEAD_SUBSCRIPTION_MS) {
+      // Healthy (or at least not provably dead) — reset its backoff.
+      wsReconnectState.delete(mint);
+      continue;
+    }
+
+    // Guard: don't retry faster than the exponential backoff allows.
+    const state = wsReconnectState.get(mint) ?? {
+      backoffMs: WS_RECONNECT_MIN_BACKOFF_MS,
+      lastAttemptAt: 0
+    };
+    if (now - state.lastAttemptAt < state.backoffMs) continue;
+
+    console.warn(`[MarketStreamer] 📡 Helius subscription for ${item.symbol} silent for ${Math.round(silenceMs / 1000)}s. Re-subscribing (backoff ${Math.round(state.backoffMs / 1000)}s)...`);
+    state.lastAttemptAt = now;
+    // Next retry waits twice as long, capped at 30s.
+    state.backoffMs = Math.min(WS_RECONNECT_MAX_BACKOFF_MS, state.backoffMs * 2);
+    wsReconnectState.set(mint, state);
+
+    try {
+      // removeAccountChangeListener is async; fire-and-forget the stale id.
+      wsConnection.removeAccountChangeListener(item.subscriptionId).catch(() => {});
+    } catch {}
+
+    try {
+      const newSubId = resubscribeCandidate(item);
+      if (newSubId !== undefined) {
+        item.subscriptionId = newSubId;
+        console.log(`[MarketStreamer] ♻️ Re-subscribed ${item.symbol} (new sub #${newSubId}).`);
+      } else {
+        // No subscribable account — leave it; the Raydium batch syncer covers it.
+        wsReconnectState.delete(mint);
+      }
+    } catch (err: any) {
+      console.warn(`[MarketStreamer] Re-subscribe failed for ${item.symbol}: ${err.message}`);
+    }
+  }
+}
+
+/**
  * Adds a candidate token to the real-time WebSocket watchlist.
  * Supports both Pump.fun bonding curves AND Raydium AMM pools.
  */
@@ -128,40 +240,17 @@ export async function addTokenToWatchlist(
 
   try {
     if (isPump) {
-      const pdaPubkey = getBondingCurveAddress(tokenMint);
-      bondingCurvePda = pdaPubkey.toBase58();
-
-      subId = wsConnection.onAccountChange(
-        pdaPubkey,
-        (accountInfo) => {
-          handleOnChainCurveUpdate(tokenMint, accountInfo.data);
-        },
-        'confirmed'
-      );
-    } else if (pairAddress && pairAddress.length >= 32) {
-      // Raydium / DEX AMM On-Chain Subscription
-      try {
-        const poolPubkey = new PublicKey(pairAddress);
-        subId = wsConnection.onAccountChange(
-          poolPubkey,
-          (accountInfo) => {
-            handleRaydiumPoolUpdate(tokenMint, accountInfo.data);
-          },
-          'confirmed'
-        );
-      } catch (err: any) {
-        // Pool pubkey parse failure, fallback to fast batch sync
-      }
+      bondingCurvePda = getBondingCurveAddress(tokenMint).toBase58();
     }
 
-    watchlist.set(tokenMint, {
+    const candidate: WatchedCandidate = {
       tokenMint,
       symbol,
       poolName: poolName || symbol,
       pairAddress,
       isPump,
       bondingCurvePda,
-      subscriptionId: subId,
+      subscriptionId: undefined,
       lastSpotPriceSol: 0,
       lastPriceUsd: 0,
       lastLiquidityUsd: 0,
@@ -170,7 +259,13 @@ export async function addTokenToWatchlist(
       lastTickAt: Date.now(),
       tickCount: 0,
       priceHistory: []
-    });
+    };
+
+    subId = resubscribeCandidate(candidate);
+    candidate.subscriptionId = subId;
+
+    watchlist.set(tokenMint, candidate);
+    wsReconnectState.delete(tokenMint);
 
     console.log(`[MarketStreamer] ⚡ Live WebSocket tracker aktif untuk: ${symbol} (${tokenMint.slice(0, 8)}...) [Watchlist: ${watchlist.size}/${MAX_WATCHLIST_SIZE}]`);
     return true;
@@ -194,6 +289,7 @@ export function removeTokenFromWatchlist(tokenMint: string) {
   }
   watchlist.delete(tokenMint);
   evaluateCooldown.delete(tokenMint);
+  wsReconnectState.delete(tokenMint);
   console.log(`[MarketStreamer] 🛑 Watchlist unsubscribed: ${item.symbol} (${tokenMint.slice(0, 8)}...)`);
 }
 
@@ -571,6 +667,21 @@ export async function startMarketStreamer() {
       await seedWatchlistWithVolatileRunners();
     }
   }, 60000);
+
+  // 5. Helius WS subscription liveness guard (reconnect-with-backoff).
+  // Detects silently dead onAccountChange trackers and re-subscribes them so
+  // a dropped socket cannot permanently blind the watchlist.
+  if (!wsHealthCheckTimer) {
+    wsHealthCheckTimer = setInterval(() => {
+      try {
+        checkHeliusSubscriptionHealth();
+      } catch (err: any) {
+        // A failure in the health check itself must not kill the streamer.
+        console.warn(`[MarketStreamer] WS health check error: ${err.message}`);
+      }
+    }, WS_HEALTH_CHECK_INTERVAL_MS);
+    console.log(`[MarketStreamer] 🩺 Helius WS subscription health check aktif (every ${WS_HEALTH_CHECK_INTERVAL_MS / 1000}s).`);
+  }
 }
 
 /**
@@ -578,6 +689,10 @@ export async function startMarketStreamer() {
  */
 export function stopMarketStreamer() {
   isStreamerRunning = false;
+  if (wsHealthCheckTimer) {
+    clearInterval(wsHealthCheckTimer);
+    wsHealthCheckTimer = null;
+  }
   if (maintenanceTimer) {
     clearInterval(maintenanceTimer);
     maintenanceTimer = null;

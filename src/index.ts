@@ -5,6 +5,40 @@ import { startPositionManager, stopPositionManager } from './services/tradeManag
 import { startAlgoScanner, stopAlgoScanner } from './services/algoScanner';
 import { startMarketStreamer, stopMarketStreamer } from './services/marketStreamer';
 
+/**
+ * REDACTED stack formatter:
+ * Scraps wallet keys / API keys / tokens from the stack trace before logging,
+ * so crash diagnostics never leak secrets to stdout or Telegram.
+ */
+function redactStack(stack: string | undefined): string {
+  if (!stack) return '<no stack>';
+  return stack
+    // Helius / RPC URLs with api-key=…
+    .replace(/api-key=[A-Za-z0-9_-]+/gi, 'api-key=<REDACTED>')
+    // Base58 Solana private keys / addresses (>=32 chars) embedded in frames
+    .replace(/\b[1-9A-HJ-NP-Za-km-z]{32,44}\b/g, (m) => `${m.slice(0, 4)}…<REDACTED>`)
+    // Telegram bot tokens (NNNNNN:AA…)
+    .replace(/\b\d{8,12}:[A-Za-z0-9_-]{30,}\b/g, '<REDACTED_TOKEN>');
+}
+
+// ---------------------------------------------------------------------------
+// Process-level safety nets (fail-LOUD, never silent):
+// Floating promises (e.g. inside WebSocket callbacks) and stray throws used to
+// crash the bot with no diagnostics. These handlers LOG the error clearly and
+// keep the process alive — they do NOT swallow: every event is surfaced with
+// a redacted stack so we can diagnose feed/WS deaths without leaking secrets.
+// ---------------------------------------------------------------------------
+process.on('unhandledRejection', (reason: any) => {
+  const err = reason instanceof Error ? reason : new Error(String(reason));
+  console.error('[Process] ⚠️ UNHANDLED REJECTION (process kept alive):', err.message);
+  console.error('[Process] Stack:', redactStack(err.stack));
+});
+
+process.on('uncaughtException', (err: Error) => {
+  console.error('[Process] 🚨 UNCAUGHT EXCEPTION (process kept alive):', err.message);
+  console.error('[Process] Stack:', redactStack(err.stack));
+});
+
 async function main() {
   console.log('====================================================');
   console.log(' 🚀 SOLANA QUANTITATIVE ALGORITHMIC TRADING BOT    ');
