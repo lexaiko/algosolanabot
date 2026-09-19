@@ -6,7 +6,9 @@
 # and automatically revives them once RAM recovers (> 400MB available).
 # ==============================================================================
 
-LOG_DIR="/home/semesta/tradingbot/logs"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+LOG_DIR="${PROJECT_ROOT}/logs"
 LOG_FILE="$LOG_DIR/kill_switch.log"
 FLAG_FILE="$LOG_DIR/.stopped_by_watchdog"
 mkdir -p "$LOG_DIR"
@@ -22,7 +24,7 @@ RECOVER_COUNT=0
 export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
 
 # Load Telegram credentials for emergency notifications
-ENV_FILE="/home/semesta/tradingbot/.env"
+ENV_FILE="${PROJECT_ROOT}/.env"
 TELEGRAM_BOT_TOKEN=""
 TELEGRAM_ADMIN_ID=""
 
