@@ -40,6 +40,8 @@ export const GAS_RESERVE_BUFFER_SOL = 0.015; // Mandatory untouched gas buffer t
 
 // In-Memory Concurrency Lock & Re-entry Loss Cooldown
 const activeOrderTokens = new Set<string>();
+// Per-position sell lock: mencegah double-close saat WS tick & heartbeat 3s berlomba (double-sell guard)
+const sellingPositionIds = new Set<number>();
 const tokenLossCooldownMap = new Map<string, number>();
 const LOSS_COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2 hours cooldown on tokens that suffered dump/SL
 
@@ -568,53 +570,109 @@ export async function executeSellToken(
   sellPct: number = 100,
   reason: string = 'MANUAL_SELL'
 ): Promise<{ success: boolean; message: string }> {
+  // D) Per-position concurrency lock: kunci di awal agar WS tick & heartbeat 3s tidak double-sell posisi yang sama
+  if (sellingPositionIds.has(positionId)) {
+    console.warn(`[TradeManager] ⛔ DOUBLE-SELL GUARD: Posisi #${positionId} sedang dalam proses penjualan (${reason}). Permintaan duplikat ditolak.`);
+    return { success: false, message: 'Posisi sedang diproses penjualan (concurrency lock aktif).' };
+  }
+
   const pos = getPositionById(positionId);
   if (!pos || pos.status !== 'OPEN') {
     return { success: false, message: 'Posisi tidak ditemukan atau sudah ditutup.' };
   }
 
-  // Fetch live market data for exit price
-  const marketData = await getTokenMarketData(pos.token_address);
-  const currentPriceUsd = marketData ? marketData.priceUsd : pos.current_price_usd;
-  const solPriceUsd = await getSolPriceUsd();
+  sellingPositionIds.add(pos.id);
+  try {
+    // Re-validate status di dalam lock (posisi bisa saja ditutup tepat sebelum lock didapat)
+    const lockedPos = getPositionById(positionId);
+    if (!lockedPos || lockedPos.status !== 'OPEN') {
+      return { success: false, message: 'Posisi tidak ditemukan atau sudah ditutup.' };
+    }
 
-  // 100% Real DEX Sell Execution (Jupiter live quote + Constant Product AMM depth cap)
-  const tokensToSell = pos.amount_tokens * (sellPct / 100);
-  const effLiquidity = marketData?.liquidityUsd || 20000;
-  
-  const simResult = await simulateRealisticSell(
-    pos.token_address,
-    tokensToSell,
-    currentPriceUsd,
-    solPriceUsd,
-    effLiquidity,
-    CONFIG.SLIPPAGE_PCT
-  );
+    // Fetch live market data for exit price
+    const marketData = await getTokenMarketData(pos.token_address);
+    const solPriceUsd = await getSolPriceUsd();
 
-  const effectiveExitPriceUsd = simResult.effectiveExitPriceUsd;
-  const actualCreditedSol = simResult.netSol;
-  const grossExitSol = simResult.grossSol;
-  const priceImpactPct = simResult.priceImpactPct;
+    // C) Anti stale/fake price: menolak jual pada harga stale ketika market data gagal,
+    // kecuali alasan emergency (FLASH_EXIT / VELOCITY_DUMP / AUTO_SL) yang tetap boleh cut darurat.
+    const isEmergencyExit = reason.includes('FLASH_EXIT') || reason.includes('VELOCITY_DUMP') || reason.includes('AUTO_SL');
+    const marketDataValid = !!(marketData && marketData.priceUsd > 0);
 
-  // When closing position 100%, Solana runtime reclaims the ATA rent deposit (0.00203928 SOL)
-  const isFullClose = sellPct >= 99.9;
-  const ataRefundSol = isFullClose ? ATA_RENT_EXEMPT_SOL : 0;
-  const totalCreditedSol = actualCreditedSol + ataRefundSol;
+    if (!marketDataValid && !isEmergencyExit) {
+      console.warn(`[TradeManager] 🛡️ STALE PRICE BLOCKED for ${pos.token_symbol}: market data DexScreener unavailable/invalid (reason: ${reason}). Jual dibatalkan untuk mencegah eksekusi pada harga palsu/stale.`);
+      return { success: false, message: 'Market data unavailable — sell dibatalkan untuk mencegah eksekusi pada harga palsu/stale' };
+    }
 
-  updatePaperBalance(totalCreditedSol);
+    // 100% Real DEX Sell Execution (Jupiter live quote + Constant Product AMM depth cap)
+    const tokensToSell = pos.amount_tokens * (sellPct / 100);
+    // C) Jangan pernah memalsukan depth pool $20000 — pakai likuiditas riil terakhir yang diketahui (fallback 0)
+    const lastKnownLiq = lastKnownLiquidity.get(pos.id) || 0;
+    let currentPriceUsd: number;
+    let effLiquidity: number;
+    if (marketDataValid) {
+      currentPriceUsd = marketData!.priceUsd;
+      effLiquidity = marketData!.liquidityUsd || lastKnownLiq;
+    } else {
+      // Emergency exit pada harga stale: izinkan, tapi tetap dengan depth riil terakhir (bukan angka karangan)
+      currentPriceUsd = pos.current_price_usd;
+      effLiquidity = lastKnownLiq;
+      console.warn(`[TradeManager] ⚠️ EMERGENCY STALE-PRICE EXIT for ${pos.token_symbol}: market data gagal, jual darurat (${reason}) pada harga terakhir $${currentPriceUsd.toFixed(8)} dengan likuiditas terakhir $${effLiquidity.toFixed(0)}.`);
+    }
 
-  if (simResult.warning) {
-    console.warn(`[TradeManager] ⚠️ ${simResult.warning}`);
-  }
+    const simResult = await simulateRealisticSell(
+      pos.token_address,
+      tokensToSell,
+      currentPriceUsd,
+      solPriceUsd,
+      effLiquidity,
+      CONFIG.SLIPPAGE_PCT
+    );
 
-  // Close position in DB with true proceeds
-  closePosition(pos.id, effectiveExitPriceUsd, actualCreditedSol, `${reason} (${sellPct}%)`);
-  refreshPositionWebSocketSubscriptions();
+    const effectiveExitPriceUsd = simResult.effectiveExitPriceUsd;
+    const actualCreditedSol = simResult.netSol;
+    const grossExitSol = simResult.grossSol;
+    const priceImpactPct = simResult.priceImpactPct;
 
-  const pnlPct = ((effectiveExitPriceUsd - pos.entry_price_usd) / pos.entry_price_usd) * 100;
-  const grossPnlSol = grossExitSol - (pos.entry_sol * (sellPct / 100));
-  const isProfit = pnlPct >= 0;
-  const newBalance = getPaperBalance();
+    // B) REALITY GUARD (anti phantom-exit, dipulihkan dari commit 28cac92):
+    // Jika reason adalah take-profit/ratchet/trailing (bukan emergency dump), harga efektif keluar
+    // WAJIB di atas entry. Jika tidak, ini phantom spike DexScreener -> tolak jualan, jangan eksekusi.
+    const isProfitTakingExit = !/SL|DUMP|FLASH|VELOCITY|ZOMBIE|MAX_HOLD/.test(reason);
+    if (isProfitTakingExit && effectiveExitPriceUsd <= pos.entry_price_usd) {
+      console.warn(`[TradeManager] 🛡️ PHANTOM EXIT BLOCKED for ${pos.token_symbol}: reason ${reason} mensyaratkan profit, tapi effective exit price $${effectiveExitPriceUsd.toFixed(8)} <= entry $${pos.entry_price_usd.toFixed(8)} (simulasi padam $${(currentPriceUsd * (1 - priceImpactPct / 100)).toFixed(8)}, impact ${priceImpactPct.toFixed(2)}%, likuiditas $${effLiquidity.toFixed(0)}). Aborting sell untuk lindungi modal!`);
+      return { success: false, message: 'Phantom exit blocked — effective exit price tidak di atas entry price.' };
+    }
+
+    // When closing position 100%, Solana runtime reclaims the ATA rent deposit (0.00203928 SOL)
+    const isFullClose = sellPct >= 99.9;
+    const ataRefundSol = isFullClose ? ATA_RENT_EXEMPT_SOL : 0;
+    const totalCreditedSol = actualCreditedSol + ataRefundSol;
+
+    if (simResult.warning) {
+      console.warn(`[TradeManager] ⚠️ ${simResult.warning}`);
+    }
+
+    // D) closePosition SEBELUM updatePaperBalance: jika DB write gagal lempar exception,
+    // saldo belum dikredit sehingga tidak terjadi double-close (balance credited + position still OPEN).
+    // Validasi terakhir bahwa posisi memang masih OPEN tepat sebelum tulis.
+    const stillOpenPos = getPositionById(pos.id);
+    if (!stillOpenPos || stillOpenPos.status !== 'OPEN') {
+      console.warn(`[TradeManager] ⛔ DOUBLE-SELL GUARD: Posisi ${pos.token_symbol} (#${pos.id}) sudah ditutup sebelum eksekusi. Penjualan duplikat dibatalkan.`);
+      return { success: false, message: 'Posisi sudah ditutup sebelum eksekusi.' };
+    }
+
+    const closed = closePosition(pos.id, effectiveExitPriceUsd, actualCreditedSol, `${reason} (${sellPct}%)`);
+    if (!closed) {
+      console.warn(`[TradeManager] ⛔ closePosition gagal (sudah CLOSED?) untuk ${pos.token_symbol} (#${pos.id}). Saldo tidak dikredit.`);
+      return { success: false, message: 'Posisi gagal ditutup; saldo tidak dikredit.' };
+    }
+
+    refreshPositionWebSocketSubscriptions();
+    updatePaperBalance(totalCreditedSol);
+    const newBalance = getPaperBalance();
+
+    const pnlPct = ((effectiveExitPriceUsd - pos.entry_price_usd) / pos.entry_price_usd) * 100;
+    const grossPnlSol = grossExitSol - (pos.entry_sol * (sellPct / 100));
+    const isProfit = pnlPct >= 0;
 
   // True Net Fee Accounting with Live Real Fees (Base + Priority + Jito tip + DEX protocol)
   const sellGasSol = simResult.networkFeeSol;
@@ -738,6 +796,15 @@ export async function executeSellToken(
   }
 
   return { success: true, message: `Posisi ${pos.token_symbol} berhasil ditutup.` };
+  } catch (err: any) {
+      // D) Safety net: exception di tengah eksekusi tidak boleh meninggalkan saldo terkredit
+      // dengan posisi masih OPEN (double-close) — hubungkan ke caller via failure result.
+      console.error(`[TradeManager] 💥 executeSellToken ERROR untuk posisi #${pos.id} (${pos.token_symbol}, reason ${reason}):`, err?.message || err);
+      return { success: false, message: `Eksekusi sell gagal: ${err?.message || 'unknown error'}. Saldo & status posisi konsisten (tidak ada double-close).` };
+    } finally {
+      // D) Lepas lock selalu, walau sukses, gagal, atau exception
+      sellingPositionIds.delete(pos.id);
+    }
 }
 
 // 2.5 EXECUTE WHALE SELL FOLLOW (DUMP SYNCHRONIZATION)
@@ -898,12 +965,18 @@ export async function evaluatePosition(
     }
 
     // Anti-Flash-Wick Glitch Filter (Reality Guard):
-    // If currentPrice represents a sudden anomalous > 200% jump over entry on an illiquid pool or a 4x sudden tick jump, reject the phantom tick
+    // If currentPrice represents a sudden anomalous > 200% jump over entry on an illiquid pool or a 4x sudden tick jump, reject the phantom tick.
+    // Likuiditas 0/unknown = pool TIDAK TERVERIFIKASI -> anggap TIDAK terpercaya (untrusted).
+    // Sebelumnya syarat `currentLiquidityUsd > 0` mematikan filter ini sepenuhnya saat DexScreener
+    // tidak melaporkan likuiditas, sehingga phantom tick +2000% lolos dan bisa memicu ratchet exit palsu.
     const theoreticalGainPct = ((currentPrice - pos.entry_price_usd) / pos.entry_price_usd) * 100;
     const currentPeak = pos.peak_price_usd || pos.entry_price_usd;
     const jumpFromPeak = currentPeak > 0 ? (currentPrice / currentPeak) : 1;
-    if ((theoreticalGainPct > 200.0 && currentLiquidityUsd > 0 && currentLiquidityUsd < 15000) || (jumpFromPeak > 4.0 && currentLiquidityUsd < 50000)) {
-      console.warn(`[TradeManager] 🛡️ FLASH-WICK GLITCH REJECTED for ${pos.token_symbol}: Price $${currentPrice} (+${theoreticalGainPct.toFixed(0)}%, ${jumpFromPeak.toFixed(1)}x jump) rejected on pool ($${currentLiquidityUsd.toFixed(0)})!`);
+    const liquidityUntrusted = !(currentLiquidityUsd > 0);
+    const lowLiquidityGain = liquidityUntrusted || currentLiquidityUsd < 15000;
+    const lowLiquidityJump = liquidityUntrusted || currentLiquidityUsd < 50000;
+    if ((theoreticalGainPct > 200.0 && lowLiquidityGain) || (jumpFromPeak > 4.0 && lowLiquidityJump)) {
+      console.warn(`[TradeManager] 🛡️ FLASH-WICK GLITCH REJECTED for ${pos.token_symbol}: Price $${currentPrice} (+${theoreticalGainPct.toFixed(0)}%, ${jumpFromPeak.toFixed(1)}x jump) rejected on pool ($${currentLiquidityUsd.toFixed(0)} liquidity, ${liquidityUntrusted ? 'UNKNOWN/UNVERIFIED' : 'verified'})!`);
       return;
     }
 
