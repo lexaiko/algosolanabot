@@ -13,8 +13,16 @@ let cachedRegularFee: RealFeeBreakdown | null = null;
 let cachedEmergencyFee: RealFeeBreakdown | null = null;
 const CACHE_TTL_MS = 30_000; // 30 seconds TTL
 
-const HELIUS_KEY = '7ea0d05e-8355-43d8-967e-b887f0d5b1b8';
-const HELIUS_RPC_URL = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`;
+// Helius key must NEVER be hardcoded — load from env (same convention as config.ts).
+// A missing key disables the live fee estimate and falls back to cached/floor fees,
+// which is safe (fail-closed), but we warn loudly so the operator fixes the env.
+const envHeliusKey = (process.env.HELIUS_API_KEY || '').split(',')[0].trim();
+const HELIUS_RPC_URL = envHeliusKey
+  ? `https://mainnet.helius-rpc.com/?api-key=${envHeliusKey}`
+  : '';
+if (!envHeliusKey) {
+  console.warn('[RealFeeEngine] ⚠️ HELIUS_API_KEY tidak ditemukan di .env — estimasi fee live Helius dinonaktifkan (fallback ke fee floor).');
+}
 const JITO_TIP_FLOOR_URL = 'https://bundles.jito.wtf/api/v1/bundles/tip_floor';
 
 export async function fetchLiveSolanaFees(): Promise<{ regular: RealFeeBreakdown; emergency: RealFeeBreakdown }> {

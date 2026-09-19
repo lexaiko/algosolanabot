@@ -1,6 +1,27 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
+/**
+ * Parse a numeric env var with a safe positive default.
+ * Risk parameters MUST be positive and finite — a negative or non-finite
+ * value is dangerous (e.g. negative STOP_LOSS_PCT triggers an instant
+ * stop-loss on every position, negative MIN_LIQUIDITY_USD inverts floors).
+ * Bad input is clamped to the safe default and logged, never trusted.
+ */
+function numPos(key: string, defaultValue: number): number {
+  const raw = process.env[key];
+  if (raw === undefined || raw === null || raw.trim() === '') return defaultValue;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    console.warn(
+      `[CONFIG] ⚠️ Invalid ${key}=${JSON.stringify(raw)} (must be a positive finite number). ` +
+      `Falling back to safe default ${defaultValue}.`
+    );
+    return defaultValue;
+  }
+  return parsed;
+}
+
 export const CONFIG = {
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
   TELEGRAM_ADMIN_ID: Number(process.env.TELEGRAM_ADMIN_ID) || 0,
@@ -18,23 +39,25 @@ export const CONFIG = {
   INITIAL_PAPER_BALANCE_SOL: Number(process.env.INITIAL_PAPER_BALANCE_SOL) || 1.0,
   DEFAULT_BUY_AMOUNT_SOL: Number(process.env.DEFAULT_BUY_AMOUNT_SOL) || 0.05,
   VIP_BUY_AMOUNT_SOL: Number(process.env.VIP_BUY_AMOUNT_SOL) || 0.075, // Tier-weighted sizing for VIP whales
-  SLIPPAGE_PCT: Number(process.env.SLIPPAGE_PCT) || 2.5,
+  SLIPPAGE_PCT: numPos('SLIPPAGE_PCT', 2.5),
 
   // Risk Management & Multi-Tier TP (Hedge Fund Quant Asymmetry: R:R >= 3.5:1)
-  TAKE_PROFIT_PCT: Number(process.env.TAKE_PROFIT_PCT) || 45.0, // Stage 1 TP: Target +45% (Harvest initial capital & strong profit)
-  STOP_LOSS_PCT: Number(process.env.STOP_LOSS_PCT) || 9.5, // Strict Institutional 9.5% hard drawdown ceiling (room for entry spread)
-  TRAILING_STOP_PCT: Number(process.env.TRAILING_STOP_PCT) || 12.0, // Moonbag breathing room protection (Pro Wide Trailing)
+  TAKE_PROFIT_PCT: numPos('TAKE_PROFIT_PCT', 45.0), // Stage 1 TP: Target +45% (Harvest initial capital & strong profit)
+  STOP_LOSS_PCT: numPos('STOP_LOSS_PCT', 9.5), // Strict Institutional 9.5% hard drawdown ceiling (room for entry spread)
+  TRAILING_STOP_PCT: numPos('TRAILING_STOP_PCT', 12.0), // Moonbag breathing room protection (Pro Wide Trailing)
 
   // Institutional Portfolio & Execution Controls
   COPY_SELL_ENABLED: process.env.COPY_SELL_ENABLED !== 'false', // Auto-dump when whale dumps
-  CIRCUIT_BREAKER_ENABLED: process.env.CIRCUIT_BREAKER_ENABLED === 'true', // Dinonaktifkan sementara per instruksi user (tanpa batasan jam cooldown)
-  CIRCUIT_BREAKER_MAX_DAILY_LOSSES: Number(process.env.CIRCUIT_BREAKER_MAX_DAILY_LOSSES) || 999, // Tanpa batasan limit stop-loss
-  CIRCUIT_BREAKER_COOLDOWN_HOURS: Number(process.env.CIRCUIT_BREAKER_COOLDOWN_HOURS) || 0, // 0 jam cooldown
-  MAX_PRICE_DRIFT_PCT: Number(process.env.MAX_PRICE_DRIFT_PCT) || 6.0, // Anti-Chase / Pucuk Guard: cancel if price moved > 6%
-  MIN_LIQUIDITY_USD: Number(process.env.MIN_LIQUIDITY_USD) || 30000.0, // Min $30k pool liquidity floor (Anti-Slippage)
-  MIN_VOLUME_24H_USD: Number(process.env.MIN_VOLUME_24H_USD) || 150000.0, // Min $150k 24h volume floor (Active Market)
-  MIN_MARKET_CAP_USD: Number(process.env.MIN_MARKET_CAP_USD) || 15000.0, // Min $15k market cap
-  MAX_OPEN_POSITIONS: Number(process.env.MAX_OPEN_POSITIONS) || 15, // Max concurrent active trades (allows up to 15 concurrent positions for backtesting & broad diversification)
+  // Circuit breaker is ON by default. Env must explicitly say 'false' to disable.
+  // Prevents the bot from repeatedly buying straight into a losing streak.
+  CIRCUIT_BREAKER_ENABLED: process.env.CIRCUIT_BREAKER_ENABLED !== 'false',
+  CIRCUIT_BREAKER_MAX_DAILY_LOSSES: numPos('CIRCUIT_BREAKER_MAX_DAILY_LOSSES', 3), // 3 SL in a day -> halt new buys
+  CIRCUIT_BREAKER_COOLDOWN_HOURS: numPos('CIRCUIT_BREAKER_COOLDOWN_HOURS', 1), // 1h cooldown
+  MAX_PRICE_DRIFT_PCT: numPos('MAX_PRICE_DRIFT_PCT', 6.0), // Anti-Chase / Pucuk Guard: cancel if price moved > 6%
+  MIN_LIQUIDITY_USD: numPos('MIN_LIQUIDITY_USD', 30000.0), // Min $30k pool liquidity floor (Anti-Slippage)
+  MIN_VOLUME_24H_USD: numPos('MIN_VOLUME_24H_USD', 150000.0), // Min $150k 24h volume floor (Active Market)
+  MIN_MARKET_CAP_USD: numPos('MIN_MARKET_CAP_USD', 15000.0), // Min $15k market cap
+  MAX_OPEN_POSITIONS: numPos('MAX_OPEN_POSITIONS', 15), // Max concurrent active trades
   MAX_HOLD_TIME_HOURS: Number(process.env.MAX_HOLD_TIME_HOURS) || 24, // 24h Time-Stop (Zombie Token Reaper)
   MAX_5M_PRICE_CHANGE_PCT: Number(process.env.MAX_5M_PRICE_CHANGE_PCT) || 50.0, // Anti-FOMO parabolic candle spike (allows up to +50% explosive momentum)
   NOTIFY_ON_REJECT: process.env.NOTIFY_ON_REJECT !== 'false', // Default to true: ALWAYS send warning/cancellation notifications!
