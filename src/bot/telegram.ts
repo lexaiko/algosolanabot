@@ -114,6 +114,26 @@ const ADMIN_COMMANDS = new Set([
   'buy', 'sell', 'settings', 'resetcb', 'scan', 'kick', 'drop', 'blacklist', 'unkick', 'unblacklist'
 ]);
 
+// Callback query prefixes that mutate state / execute trades and therefore
+// REQUIRE admin. Any callback_data NOT listed here is treated as read-only and
+// stays public (menu_positions, menu_report, menu_quant, menu_backtest,
+// menu_watchlist, watchlist_page_*, positions_page_*, token_detail_*,
+// backtest_*, action_watch / action_unwatch, trigger_scan, *_noop).
+// NOTE: 'trigger_buy' & 'trigger_sell' were dead entries (no such buttons exist)
+// and have been removed - they never protected the real buy/sell buttons below.
+const ADMIN_CALLBACK_PREFIXES = [
+  'buy_quick_',           // two-step buy confirmation (scan / token audit sniper)
+  'cbuy_',                // confirmed buy execution -> executeBuyToken()
+  'sell_100_',            // two-step sell confirmation
+  'confirm_sell_100_',    // confirmed sell execution -> executeSellToken()
+  'cancel_sell_',         // aborts a pending manual sell (mutates the flow)
+  'cancel_buy',           // aborts a pending manual buy (mutates the flow)
+  'reset_circuit_breaker',
+  'reset_paper_balance',
+  'menu_settings',
+  'ws_remove_'            // evicts a token from the live WebSocket watchlist
+];
+
 // Middleware: Role-Based Access Control (Admin vs Watcher)
 bot.use(async (ctx, next) => {
   const userId = ctx.from?.id;
@@ -128,13 +148,11 @@ bot.use(async (ctx, next) => {
     }
   }
 
-  // If callback query is triggered, check admin-only actions
+  // If callback query is triggered, check admin-only actions.
+  // Guard is a whitelist of state-mutating prefixes: only these require admin.
   const cbData = (ctx.callbackQuery as any)?.data;
-  if (cbData) {
-    const adminActions = [
-      'trigger_buy', 'trigger_sell', 'menu_settings', 'reset_paper_balance'
-    ];
-    if (adminActions.some(a => cbData.startsWith(a)) && !isAdmin) {
+  if (cbData && !isAdmin) {
+    if (ADMIN_CALLBACK_PREFIXES.some(a => cbData.startsWith(a))) {
       return ctx.answerCbQuery('⛔ Akses Ditolak: Hanya Administrator', { show_alert: true });
     }
   }
@@ -304,6 +322,18 @@ bot.command(['unblacklist', 'unkick'], async (ctx) => {
 
 // 2. SCAN COMMAND & MARKET SCANNER
 export async function handleScanCommand(ctx: any) {
+  // /scan (and the plain-text "scan"/"pindai" alias) is admin-only: the scan
+  // output exposes quick-buy buttons and drives the market scanner.
+  const userId = ctx.from?.id;
+  const isAdmin = CONFIG.TELEGRAM_ADMIN_ID && userId === CONFIG.TELEGRAM_ADMIN_ID;
+  if (!isAdmin) {
+    const isCb = !!ctx.callbackQuery;
+    if (isCb) {
+      return ctx.answerCbQuery('⛔ Akses Ditolak: Hanya Administrator', { show_alert: true });
+    }
+    return ctx.replyWithMarkdown('⛔ *Akses Ditolak*\nPerintah ini hanya dapat diakses oleh Administrator bot.');
+  }
+
   const isCb = !!ctx.callbackQuery;
   if (isCb) {
     await ctx.answerCbQuery('🔍 Menjalankan Scanner Hedge Fund...');
