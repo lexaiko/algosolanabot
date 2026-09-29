@@ -17,7 +17,7 @@
  *   observe() -> { confirmations: 3, confirmed: true }        (fire ONCE)
  *   markContinuationConsumed(mint)                            (after a fill)
  *   drawdown > 4% from tracked peak -> record deleted (thesis dead)
- *   45 min without progress -> record deleted (stale)
+ *   45 min since track start -> record deleted (stale)
  *
  * HONEST-DATA: every input (price, volumeAcceleration, flow) is measured.
  * Unknown volumeAcceleration or non-dominant flow simply does NOT count as a
