@@ -40,7 +40,7 @@ export interface WatchedCandidate {
   priceHistory: Array<{ timestamp: number; priceUsd: number; solLiquidity: number }>;
 }
 
-const MAX_WATCHLIST_SIZE = 50; // Institutional-Grade 50-token Watchlist
+const MAX_WATCHLIST_SIZE = 20; // Trimmed 2026-09-29: 50 WS subs burned Helius credits 24/7 with zero entries to show for it. Top-20 by score still covers every 75+ candidate + continuation tracking.
 const TICK_HISTORY_WINDOW_MS = 5 * 60 * 1000; // 5 minutes rolling window
 const INACTIVE_PURGE_MS = 8 * 60 * 1000; // Purge if no tick for 8 minutes
 
