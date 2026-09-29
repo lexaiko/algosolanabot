@@ -18,8 +18,10 @@ import { isAutonomousBuyEnabled, getAutonomyDisableReason } from '../core/autono
 
 /**
  * Multi-Stream Candidate Ingestion with Institutional Upstream Quality Filtering:
- * 1. Collects candidates from Raydium v3 Pools by 24h Volume and GeckoTerminal
- *    Solana Trending Pools (on-chain DEX activity).
+ * 1. Collects candidates from Raydium v3 Pools by 24h Volume, Raydium v3 Pools
+ *    by 24h APR (momentum-first: fresh volatility for a trading/scalping
+ *    pullback-absorption strategy; transfer-fee tokens excluded), and
+ *    GeckoTerminal Solana Trending Pools pages 1-4 (on-chain DEX activity).
  *    M8 (2026-09-29): the DexScreener token-BOOSTS feed was REMOVED — it is a
  *    PAID ads endpoint, and the old docstring's "NOT paid ads" claim was false.
  *    Feeding paid placements into the candidate pool is systematic adverse
@@ -70,7 +72,7 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
 
   const rawMints = new Set<string>();
 
-  // 1. Raydium Official v3 Pools by 24h Volume (Pure on-chain DEX AMM leaders, ZERO keywords!)
+  // 1a. Raydium Official v3 Pools by 24h Volume (Pure on-chain DEX AMM leaders, ZERO keywords!)
   try {
     const rayRes = await axios.get('https://api-v3.raydium.io/pools/info/list?poolType=all&poolSortField=volume24h&sortType=desc&pageSize=40&page=1', {
       timeout: 10000,
@@ -85,9 +87,40 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
     console.warn('[AlgoScanner] Raydium v3 pools unavailable:', err.message);
   }
 
+  // 1b (2026-09-29): Raydium v3 Pools by 24h APR — momentum-first discovery.
+  // The volume-sorted feed above yields liquid but "loyo" majors; a
+  // pullback-absorption (trading, not investing — scalping OK) strategy needs
+  // tokens that are moving NOW. High-APR pools are where fresh volatility
+  // lives. Pre-filtered loosely here (tvl >= $20k, 24h volume >= $10k,
+  // transfer-fee tokens excluded as honeypot hygiene); the strict upstream
+  // quality gate ($35k liq / $30k vol24h) still applies after DexScreener
+  // enrichment, so nothing weak reaches scoring.
+  try {
+    const aprRes = await axios.get('https://api-v3.raydium.io/pools/info/list?poolType=all&poolSortField=apr24h&sortType=desc&pageSize=40&page=1', {
+      timeout: 10000,
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    });
+    const pools = aprRes.data?.data?.data || [];
+    for (const p of pools) {
+      const tvl = p.tvl || 0;
+      const volQ = p.day?.volumeQuote || 0;
+      if (tvl < 20000 || volQ < 10000) continue;
+      for (const m of [p.mintA, p.mintB]) {
+        if (!m?.address || isExcluded(m.address)) continue;
+        const tags: string[] = m.tags || [];
+        if (tags.includes('hasTransferFee')) continue; // honeypot hygiene
+        rawMints.add(m.address);
+      }
+    }
+  } catch (err: any) {
+    console.warn('[AlgoScanner] Raydium v3 APR pools unavailable:', err.message);
+  }
+
   // 2. GeckoTerminal Multi-Page Trending Pools (Solana network-wide on-chain velocity across Raydium, Orca, Meteora)
   // NOTE: axios `timeout` alone proved unreliable through some egress proxies (observed a 51s hang
   // on a 4.5s timeout), so a hard abort via AbortController is enforced as well.
+  // (2026-09-29): 2 -> 4 pages. Trending is the most strategy-aligned source
+  // for pullback-absorption; deeper pages catch runners before they cool off.
   try {
     const geckoFetch = (page: number) => {
       const ctrl = new AbortController();
@@ -98,8 +131,8 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
         signal: ctrl.signal,
       }).finally(() => clearTimeout(timer)).catch(() => ({ data: { data: [] } }));
     };
-    const [p1, p2] = await Promise.all([geckoFetch(1), geckoFetch(2)]);
-    const geckoPools = [...(p1.data?.data || []), ...(p2.data?.data || [])];
+    const [p1, p2, p3, p4] = await Promise.all([geckoFetch(1), geckoFetch(2), geckoFetch(3), geckoFetch(4)]);
+    const geckoPools = [...(p1.data?.data || []), ...(p2.data?.data || []), ...(p3.data?.data || []), ...(p4.data?.data || [])];
     for (const pool of geckoPools) {
       const baseId = pool.relationships?.base_token?.data?.id?.replace('solana_', '');
       if (baseId && !isExcluded(baseId)) {
@@ -117,12 +150,17 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
   const allCandidateMints = Array.from(rawMints);
   if (allCandidateMints.length === 0) return [];
 
-  // Batch query DexScreener in 2 parallel chunks of 30 (up to 60 candidate tokens analyzed!)
-  const [batch1, batch2] = await Promise.all([
-    getMultiTokenMarketData(allCandidateMints.slice(0, 30)),
-    allCandidateMints.length > 30 ? getMultiTokenMarketData(allCandidateMints.slice(30, 60)) : Promise.resolve(new Map())
-  ]);
-  const marketMap = new Map([...batch1.entries(), ...batch2.entries()]);
+  // Batch query DexScreener in 3 parallel chunks of 30 (up to 90 candidate tokens analyzed!
+  // (2026-09-29): raised 60 -> 90 to cover the new APR-momentum source; 3 HTTP
+  // requests per 10-min cycle is far inside DexScreener's free rate limit.)
+  const chunks: string[][] = [];
+  for (let i = 0; i < allCandidateMints.length && chunks.length < 3; i += 30) {
+    chunks.push(allCandidateMints.slice(i, i + 30));
+  }
+  const batchResults = await Promise.all(
+    chunks.map(c => getMultiTokenMarketData(c))
+  );
+  const marketMap = new Map(batchResults.flatMap(m => [...m.entries()]));
 
   // Upstream Quality Gate: Discard micro-liquidity traps upfront!
   const validRunners: Array<{
