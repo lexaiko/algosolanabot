@@ -265,7 +265,7 @@ export function runBacktest(
     }
 
     // 2. ENTRY SIGNAL EVALUATION
-    // Simulated Smart Money buy signal on breakout candle
+    // Simulated buy-pressure signal on breakout candle
     if (!activePosition && currentBalance >= tradeSizeSol + CONFIG.ESTIMATED_BUY_FEE_SOL) {
       const prevBarChangePct = ((prevCandle.close - prevCandle.open) / prevCandle.open) * 100;
       const curBarChangePct = ((candle.open - prevCandle.close) / prevCandle.close) * 100;

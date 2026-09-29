@@ -1,9 +1,4 @@
-import { 
-  PublicKey, 
-  SystemProgram, 
-  TransactionInstruction, 
-  ComputeBudgetProgram 
-} from '@solana/web3.js';
+import { PublicKey, SystemProgram, TransactionInstruction, ComputeBudgetProgram } from '../utils/solanaWeb3';
 import axios from 'axios';
 import { CONFIG } from '../config';
 import { connection } from './solanaConnection';

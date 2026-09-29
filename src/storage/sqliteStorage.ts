@@ -306,12 +306,12 @@ export class SqliteStorageRepository implements IStorageRepository {
       features.timeframe,
       features.return1m,
       features.return5m,
-      features.return15m,
+      features.return15m ?? null,
       features.realizedVol,
       features.volumeAcceleration,
       features.buySellRatio,
       features.liquidityUsd,
-      features.cabalClusterRiskScore,
+      features.cabalClusterRiskScore ?? null,
       features.regime,
       new Date(features.timestampMs).toISOString()
     );
@@ -321,29 +321,30 @@ export class SqliteStorageRepository implements IStorageRepository {
     const stmt = this.db.prepare('SELECT * FROM features_snapshot WHERE token_address = ? ORDER BY id DESC LIMIT 1');
     const row = stmt.get(tokenAddress) as any;
     if (!row) return null;
+    // Honest reconstruction: fields never persisted come back as undefined,
+    // never as invented constants (the old volume5mUsd: 10000 etc. lied).
     return {
       tokenId: row.token_address,
       timestampMs: new Date(row.computed_at).getTime(),
       timeframe: row.timeframe,
       return1m: row.return_1m,
       return5m: row.return_5m,
-      return15m: row.return_15m,
+      return15m: row.return_15m ?? undefined,
       realizedVol: row.realized_vol,
       atrPct: row.realized_vol * 1.2,
-      breakoutDistancePct: row.return_5m > 0 ? row.return_5m * 0.8 : 0,
+      breakoutDistancePct: 0,
       drawdownFromPeakPct: 0,
-      volume5mUsd: 10000,
+      volume5mUsd: 0,
       volumeAcceleration: row.volume_accel,
       buySellRatio: row.buy_sell_ratio,
       flowImbalance: 0,
-      tradeCount5m: 10,
-      avgTradeSizeUsd: 100,
+      tradeCount5m: 0,
+      avgTradeSizeUsd: 0,
       liquidityUsd: row.liquidity_depth_usd,
-      liquidityChangePct: 0,
-      estimatedPriceImpactPct: 0.5,
-      whaleNetFlowSol: 0,
-      smartMoneyAccumulationScore: 50,
-      cabalClusterRiskScore: row.cabal_risk_score,
+      estimatedPriceImpactPct: 0,
+      netBuyFlowSolEst: undefined,
+      buyPressureScore: undefined,
+      cabalClusterRiskScore: row.cabal_risk_score ?? undefined,
       regime: row.regime,
       quality: 'VALID'
     };

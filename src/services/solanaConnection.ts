@@ -1,4 +1,4 @@
-import { Connection } from '@solana/web3.js';
+import { Connection } from '../utils/solanaWeb3';
 import { CONFIG } from '../config';
 
 export interface RpcEndpoint {

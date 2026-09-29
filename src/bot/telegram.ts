@@ -32,8 +32,13 @@ import {
   formatBacktestTelegramReport
 } from '../services/backtester';
 import { adaptiveLearningEngine } from '../strategies/adaptiveLearningEngine';
+import { getProxyAgent } from '../utils/netProxy';
 
-export const bot = new Telegraf(CONFIG.TELEGRAM_BOT_TOKEN);
+const telegramProxyAgent = getProxyAgent();
+export const bot = new Telegraf(
+  CONFIG.TELEGRAM_BOT_TOKEN,
+  telegramProxyAgent ? { telegram: { agent: telegramProxyAgent as any } } : undefined
+);
 
 // Global Error Handler: Prevents Telegram unhandled rejections from freezing bot polling
 bot.catch((err: any, ctx: any) => {

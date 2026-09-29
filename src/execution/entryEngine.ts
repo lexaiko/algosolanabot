@@ -10,6 +10,10 @@ export interface EntryDecisionResult {
   reason: string;
   explanation: string;
   invalidationReason?: string;
+  /** Which entry model fired. Single-model since 2026-09-29: PULLBACK_ABSORPTION
+   * (dip + rebound). PARABOLIC_BREAKOUT was deleted after 0/4 live paper trades —
+   * buying spike tops is structural exit-liquidity provision, not an edge. */
+  entryMode?: 'PULLBACK_ABSORPTION';
 }
 
 export class EntryEngine {
@@ -26,7 +30,14 @@ export class EntryEngine {
   public evaluateEntryTiming(features: FeatureVector, signals: StrategySignal[]): EntryDecisionResult {
     const scoreResult = this.scorer.scoreOpportunity(features, signals);
     const score = scoreResult.compositeScore;
-    const dynamicMinScore = adaptiveLearningEngine.getMinEntryScore();
+    // QUANT-05: Regime-aware hurdle — demand stronger setups when the tape is hostile.
+    // PANIC / HIGH_VOLATILITY regimes have fatter left tails; raising the bar avoids
+    // catching knives while letting quality setups through in healthy regimes.
+    let regimeHurdleBump = 0;
+    if (features.regime === 'PANIC') regimeHurdleBump = 8;
+    else if (features.regime === 'HIGH_VOLATILITY') regimeHurdleBump = 5;
+    else if (features.regime === 'TRENDING_DOWN') regimeHurdleBump = 3;
+    const dynamicMinScore = adaptiveLearningEngine.getMinEntryScore() + regimeHurdleBump;
     const watchingThreshold = Math.max(40, dynamicMinScore - 18);
 
     // STAGE 1: IMMEDIATE INVALIDATION GATES (Fail-Fast)
@@ -68,46 +79,43 @@ export class EntryEngine {
     }
 
     // Invalidation 3b: Upper Wick Rejection Guard (Pucuk Guard / Anti-Distribution)
-    // Rejects parabolic coins if the 5m candle has a long upper wick (> 40% of body)
-    // which signals dev/insider selling into strength / top-wick distribution!
-    const upperWickRatio = features.upperWickRatio !== undefined ? features.upperWickRatio : (
-      features.return5m > 0 && features.drawdownFromPeakPct > 0 
-        ? ((features.drawdownFromPeakPct / 100) / Math.max(0.01, 1 - features.drawdownFromPeakPct / 100)) / Math.max(0.01, features.return5m / (100 + features.return5m))
-        : (features.drawdownFromPeakPct > 3.0 ? 999.0 : 0)
-    );
-
-    if (upperWickRatio > 0.40) {
+    // Rejects entries when the candle shows a long upper wick (> 40% of body),
+    // which signals dev/insider selling into strength (distribution phase).
+    //
+    // HONEST-DATA RULE: when no wick measurement exists (upperWickRatio undefined),
+    // the guard is SKIPPED — never invented. The old fallback computed a fake
+    // ratio from drawdown that hard-rejected every pullback deeper than 3%,
+    // silently strangling the PULLBACK_ABSORPTION entry model.
+    if (features.upperWickRatio !== undefined && features.upperWickRatio > 0.40) {
       return {
         shouldEnter: false,
         state: 'INVALIDATED',
         compositeScore: score,
-        reason: `Jarum atas candle terlalu panjang (Upper Wick ${(upperWickRatio * 100).toFixed(0)}% > 40% dari body). Dev/insider terdeteksi jualan di pucuk (Distribution Phase)`,
+        reason: `Jarum atas candle terlalu panjang (Upper Wick ${(features.upperWickRatio * 100).toFixed(0)}% > 40% dari body). Dev/insider terdeteksi jualan di pucuk (Distribution Phase)`,
         explanation: scoreResult.explanation,
         invalidationReason: 'UPPER_WICK_DISTRIBUTION_REJECTION'
       };
     }
 
-    // Invalidation 4: Dual-Engine Entry - Parabolic Breakout vs Top-Tick Pucuk Trap
-    // If token is in a genuine Parabolic Breakout (Volume shock >= 1.8x, heavy buy dominance >= 1.75x, positive whale flow),
-    // it is ALLOWED to enter directly at the peak because momentum is violently expanding!
-    const isParabolicBreakout = (features.volumeAcceleration >= 1.8 || features.volume5mUsd >= 50000) &&
-      features.buySellRatio >= 1.75 &&
-      features.flowImbalance >= 0.20 &&
-      (features.whaleNetFlowSol >= 1.0 || features.smartMoneyAccumulationScore >= 70);
-
-    if (features.return5m > 8.0 && features.drawdownFromPeakPct < 1.5 && !isParabolicBreakout) {
+    // Invalidation 4: Top-Tick Pucuk Trap Guard
+    // Never buy a token clinging to the top of its 5m candle (+8% with < 1.5%
+    // drawdown). The old code exempted "genuine parabolic breakouts" from this
+    // guard — that exemption was deleted 2026-09-29 after 0/4 live paper trades
+    // proved it buys exit-liquidity tops. Now unconditional: wait for a healthy
+    // pullback (-2% to -6%) and let absorption confirm the rebound instead.
+    if (features.return5m > 8.0 && features.drawdownFromPeakPct < 1.5) {
       return {
         shouldEnter: false,
         state: 'SETUP_FORMING',
         compositeScore: score,
-        reason: `Harga menempel di puncak candle (+${features.return5m.toFixed(1)}%) tanpa konfirmasi volume shock. Menunggu pullback sehat (-2% s/d -6%) untuk konfirmasi absorpsi`,
+        reason: `Harga menempel di puncak candle (+${features.return5m.toFixed(1)}%). Menunggu pullback sehat (-2% s/d -6%) untuk konfirmasi absorpsi`,
         explanation: scoreResult.explanation,
         invalidationReason: 'TOP_TICK_FOMO_GUARD'
       };
     }
 
     // Invalidation 5: Absorption Rebound Verification - Never buy while 1m tick is dropping!
-    if (features.drawdownFromPeakPct >= 2.0 && features.return1m <= -0.5 && !isParabolicBreakout) {
+    if (features.drawdownFromPeakPct >= 2.0 && features.return1m <= -0.5) {
       return {
         shouldEnter: false,
         state: 'SETUP_FORMING',
@@ -152,14 +160,15 @@ export class EntryEngine {
       };
     }
 
-    // STAGE 4: CONFIRMED & ENTRY
-    const entryMode = isParabolicBreakout ? 'PARABOLIC_BREAKOUT' : 'PULLBACK_ABSORPTION';
+    // STAGE 4: CONFIRMED & ENTRY — single model: PULLBACK_ABSORPTION.
+    const entryMode = 'PULLBACK_ABSORPTION' as const;
     return {
       shouldEnter: true,
       state: 'ENTRY',
       compositeScore: score,
       reason: `Setup terkonfirmasi [${entryMode}]: skor ${score}/100 didukung ${signals.length} strategi (${signals.map(s => s.strategyName).join(', ')})`,
-      explanation: scoreResult.explanation
+      explanation: scoreResult.explanation,
+      entryMode
     };
   }
 }

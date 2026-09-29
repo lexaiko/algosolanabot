@@ -1,9 +1,13 @@
+// MUST be first: patches the `ws` module for egress-proxy environments before
+// @solana/web3.js or marketStreamer load it. No-op when no proxy is configured.
+import './utils/netProxy';
 import { CONFIG } from './config';
 import { initDatabase, getPaperBalance } from './db/index';
 import { bot } from './bot/telegram';
 import { startPositionManager, stopPositionManager } from './services/tradeManager';
 import { startAlgoScanner, stopAlgoScanner } from './services/algoScanner';
 import { startMarketStreamer, stopMarketStreamer } from './services/marketStreamer';
+import { startCounterfactualTracker, stopCounterfactualTracker } from './services/counterfactualTracker';
 
 /**
  * REDACTED stack formatter:
@@ -53,6 +57,7 @@ async function main() {
   startPositionManager();
   await startMarketStreamer();
   startAlgoScanner();
+  startCounterfactualTracker(); // Validasi "apakah penolakan/eksekusi scanner benar?"
 
   // 3. Start Telegram Bot with Resilient Auto-Retry Loop
   async function startTelegramWithRetry() {
@@ -92,6 +97,7 @@ async function main() {
     stopPositionManager();
     stopMarketStreamer();
     stopAlgoScanner();
+    stopCounterfactualTracker();
     try { bot.stop(); } catch {}
     process.exit(0);
   };

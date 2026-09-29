@@ -1,4 +1,4 @@
-import { PublicKey } from '@solana/web3.js';
+import { PublicKey } from '../utils/solanaWeb3';
 import { CONFIG } from '../config';
 import { connection } from './solanaConnection';
 

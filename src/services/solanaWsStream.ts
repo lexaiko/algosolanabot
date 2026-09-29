@@ -1,4 +1,4 @@
-import { PublicKey } from '@solana/web3.js';
+import { PublicKey } from '../utils/solanaWeb3';
 import { PUMP_FUN_PROGRAM_ID, getBondingCurveAddress, getOnChainBondingCurve } from './bondingCurve';
 import { getDedicatedConnection } from './solanaConnection';
 

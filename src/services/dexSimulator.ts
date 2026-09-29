@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { PublicKey } from '@solana/web3.js';
+import { PublicKey } from '../utils/solanaWeb3';
 import { CONFIG } from '../config';
 import { getLiveExecutionFeeSol, RealFeeBreakdown } from './realFeeEngine';
 import { getDedicatedConnection } from './solanaConnection';

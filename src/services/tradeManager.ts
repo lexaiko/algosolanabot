@@ -1,4 +1,4 @@
-import { Connection, PublicKey } from '@solana/web3.js';
+import { Connection, PublicKey } from '../utils/solanaWeb3';
 import { CONFIG } from '../config';
 import { 
   getPaperBalance, 
@@ -15,7 +15,9 @@ import {
   isCircuitBreakerActive,
   tripCircuitBreaker,
   getDailyStopLossCount,
-  getConsecutiveAlgoLosses
+  getConsecutiveAlgoLosses,
+  getEmpiricalKellyStats,
+  getDailyRealizedPnl
 } from '../db/index';
 import { getTokenMarketData, getSolPriceUsd, calculatePriceImpactPct } from './dexscreener';
 import { getOnChainBondingCurve, getBondingCurveAddress, decodeBondingCurveBuffer } from './bondingCurve';
@@ -78,23 +80,57 @@ export interface DynamicSizingResult {
 }
 
 /**
+ * QUANT-01: Estimates round-trip execution cost as % of position notional.
+ * Pump.fun DEX fee is 1.25% per side; plus Solana network fees (base + priority + Jito tip)
+ * expressed as % of the position. Used to evaluate ratchet floors on NET pnl so a
+ * "locked" level is genuinely profitable instead of being eaten by fees.
+ */
+export function estimateRoundTripFeePct(entrySol: number): number {
+  const dexFeePct = 2 * 1.25; // buy-side + sell-side protocol/creator fee
+  const networkFeeSol = (CONFIG.ESTIMATED_BUY_FEE_SOL || 0.00035) + (CONFIG.ESTIMATED_SELL_FEE_SOL || 0.00025);
+  const networkFeePct = entrySol > 0 ? (networkFeeSol / entrySol) * 100 : 2.0;
+  return dexFeePct + networkFeePct;
+}
+
+/**
  * Dynamic Equity Sizing with Consecutive Loss Scaling for Algo Bot
- * - Base sizing: 5% of current equity
- * - Losing streak penalty: drops by 0.75^losses (Anti-Martingale defense)
+ * QUANT-04: Base fraction is now Empirical Kelly (Bayesian blend with a conservative
+ * prior) instead of a fixed 5%. Uses realized win rate & payoff from closed positions;
+ * falls back to the prior when the sample is small. Bounded [2%, 8%] so noisy
+ * early estimates can never dictate reckless size. Anti-martingale loss-streak
+ * decay is preserved on top.
+ * - Empirical quarter-Kelly on (p=37.5%, b=10) ≈ 7.8% — fixed 5% was leaving edge on the table
  * - Floor: 0.030 SOL (preserves capital while maintaining viable on-chain trade)
  */
 export function getDynamicAlgoBuyAmount(): DynamicSizingResult {
   const balance = getPaperBalance();
   const consecutiveLosses = getConsecutiveAlgoLosses();
 
-  // 1. Base Target: 5.0% of current equity
-  const baseFraction = 0.05;
+  // 1. Base Target: Empirical Kelly fraction of current equity (QUANT-04)
+  let baseFraction = 0.05;
+  let kellyNote = 'prior 5.0%';
+  if (CONFIG.KELLY_SIZING_ENABLED !== false) {
+    try {
+      const stats = getEmpiricalKellyStats();
+      // Bayesian blend: prior (p=35%, b=3.0, weight 20 trades) vs empirical stats
+      const priorP = 0.35, priorB = 3.0, priorWeight = 20;
+      const w = stats.n / (stats.n + priorWeight);
+      const p = w * stats.winRate + (1 - w) * priorP;
+      const b = Math.max(0.5, w * stats.payoff + (1 - w) * priorB);
+      const kellyF = (p * b - (1 - p)) / b; // f* = (p*b - q) / b
+      if (kellyF > 0 && Number.isFinite(kellyF)) {
+        const quarterKelly = kellyF * (CONFIG.KELLY_FRACTION || 0.25);
+        baseFraction = Math.min(0.08, Math.max(0.02, quarterKelly));
+        kellyNote = `empKelly n=${stats.n} p=${p.toFixed(2)} b=${b.toFixed(1)} -> ${(baseFraction * 100).toFixed(1)}%`;
+      }
+    } catch { /* fall back to prior on DB error */ }
+  }
   const rawBaseSol = balance * baseFraction;
 
   // 2. Minimum Viable Solana Floor: 0.030 SOL (prevents excessive gas fee ratio)
   const MIN_FLOOR_SOL = 0.030;
-  // Maximum Cap: Max 0.050 SOL on 1 SOL scale, or up to 0.12 SOL on larger balances
-  const MAX_CAP_SOL = balance <= 1.5 ? 0.050 : Math.min(0.12, Math.max(0.050, balance * 0.08));
+  // Maximum Cap: up to 8% of balance (lets empirical Kelly breathe), hard ceiling 0.12 SOL
+  const MAX_CAP_SOL = Math.min(0.12, Math.max(0.050, balance * 0.08));
 
   // 3. Loss Streak Decay (Anti-Martingale Defensive Sizing):
   // 0 losses: 1.0x (full conviction)
@@ -120,7 +156,7 @@ export function getDynamicAlgoBuyAmount(): DynamicSizingResult {
     basePercentSol: Math.round(rawBaseSol * 1000) / 1000,
     streakDecay: Math.round(streakDecay * 100) / 100,
     consecutiveLosses,
-    rationale: `Balance: ${balance.toFixed(3)} SOL | 5% Base: ${rawBaseSol.toFixed(3)} SOL | Loss Streak: ${consecutiveLosses} (Decay: ${streakDecay.toFixed(2)}x) -> Final: ${allocatedSol} SOL`
+    rationale: `Balance: ${balance.toFixed(3)} SOL | Kelly Base: ${(baseFraction * 100).toFixed(1)}% (${kellyNote}) = ${rawBaseSol.toFixed(3)} SOL | Loss Streak: ${consecutiveLosses} (Decay: ${streakDecay.toFixed(2)}x) -> Final: ${allocatedSol} SOL`
   };
 }
 
@@ -225,6 +261,54 @@ export async function executeBuyToken(
     return { success: false, message: 'Maksimal posisi aktif portofolio tercapai' };
   }
 
+  // HEDGE-FUND RISK 2: Portfolio Heat Cap.
+  // 15 positions x 8% sizing = 120% of equity deployable into a book where every
+  // memecoin correlates ~0.7 in a selloff. Count-based limits are not enough:
+  // cap total deployed notional as % of equity (default 50%).
+  {
+    const balanceForHeat = getPaperBalance();
+    const deployedSol = openPositions.reduce((s, p) => s + (p.entry_sol || 0), 0);
+    const equitySol = balanceForHeat + deployedSol;
+    const heatCap = CONFIG.MAX_PORTFOLIO_HEAT_PCT || 0.50;
+    if (equitySol > 0 && deployedSol / equitySol >= heatCap) {
+      console.log(`[AutoTrade] 🛡️ Portfolio Heat Cap: deployed ${deployedSol.toFixed(3)} SOL = ${(deployedSol / equitySol * 100).toFixed(1)}% of equity >= ${(heatCap * 100).toFixed(0)}%. Menolak order baru.`);
+      if (shouldNotifyFilterSkip) {
+        await notify(
+          `⚠️ *ORDER DIBATALKAN: PORTFOLIO HEAT CAP*\n\n` +
+          `🔥 *Deployed:* *${deployedSol.toFixed(3)} SOL* (${(deployedSol / equitySol * 100).toFixed(1)}% dari equity, batas ${(heatCap * 100).toFixed(0)}%)\n\n` +
+          `_Bot menolak menambah eksposur agar satu selloff terkorelasi tidak menghantam seluruh book._`
+        );
+      }
+      return { success: false, message: 'Portfolio heat cap tercapai' };
+    }
+  }
+
+  // HEDGE-FUND RISK 3: Daily Equity Stop (kill switch).
+  // The 3-SL circuit breaker counts events; this counts MONEY. If realized net
+  // PnL over the last 24h is worse than -8% of equity, no new risk is taken —
+  // entries resume automatically tomorrow. Survive first.
+  {
+    const balanceForStop = getPaperBalance();
+    const deployedForStop = openPositions.reduce((s, p) => s + (p.entry_sol || 0), 0);
+    const equityForStop = balanceForStop + deployedForStop;
+    try {
+      const daily = getDailyRealizedPnl();
+      const maxDailyLoss = (CONFIG.DAILY_MAX_LOSS_PCT || 0.08) * equityForStop;
+      if (daily.netPnlSol <= -maxDailyLoss && equityForStop > 0) {
+        console.log(`[AutoTrade] 🛑 DAILY EQUITY STOP: net ${daily.netPnlSol.toFixed(3)} SOL <= -${maxDailyLoss.toFixed(3)} SOL (24h). Menghentikan entry baru hari ini.`);
+        if (shouldNotifyFilterSkip) {
+          await notify(
+            `🛑 *DAILY EQUITY STOP TERPICU*\n\n` +
+            `📉 *Net PnL 24 jam:* *${daily.netPnlSol.toFixed(3)} SOL* (batas harian -${maxDailyLoss.toFixed(3)} SOL)\n` +
+            `📊 *Win rate 24 jam:* ${daily.winRate} (${daily.winTrades}W/${daily.lossTrades}L dari ${daily.totalTrades} trade)\n\n` +
+            `_Bot menghentikan seluruh entry baru hingga 24 jam ke depan demi melindungi modal. Posisi terbuka tetap dikelola exit engine._`
+          );
+        }
+        return { success: false, message: 'Daily equity stop aktif' };
+      }
+    } catch {}
+  }
+
   // Check paper balance with ATA rent deposit and gas buffer
   const currentBalance = getPaperBalance();
   const minRequiredBalance = amountSol + CONFIG.ESTIMATED_BUY_FEE_SOL + ATA_RENT_EXEMPT_SOL + GAS_RESERVE_BUFFER_SOL;
@@ -275,8 +359,8 @@ export async function executeBuyToken(
     (whaleEntryPriceUsd && whaleEntryPriceUsd > 0 
       ? `🎯 *Harga Beli Paus:* *${formatPrice(whaleEntryPriceUsd)}*\n` 
       : '') +
-    (dataReason?.whaleNetFlowSol && dataReason.whaleNetFlowSol > 0 
-      ? `💵 *Net Flow Paus:* *+${dataReason.whaleNetFlowSol.toFixed(1)} SOL*\n` 
+    (dataReason?.netBuyFlowSolEst && dataReason.netBuyFlowSolEst > 0 
+      ? `💵 *Est. Net Buy Flow:* *+${dataReason.netBuyFlowSolEst.toFixed(1)} SOL*\n` 
       : '') +
     `\n`
   ) : (
@@ -458,7 +542,7 @@ export async function executeBuyToken(
   }
 
   // Setup Model Classification
-  const setup = dataReason?.setupType || (source === 'LIVE_WS_STREAM' ? 'PARABOLIC_BREAKOUT' : (source === 'ALGO_AUTONOMOUS' ? 'MOMENTUM_RUNNER' : (whale ? 'WHALE_COPY' : 'MANUAL_SNIPER')));
+  const setup = dataReason?.setupType || (source === 'LIVE_WS_STREAM' ? 'PULLBACK_ABSORPTION' : (source === 'ALGO_AUTONOMOUS' ? 'MOMENTUM_RUNNER' : (whale ? 'WHALE_COPY' : 'MANUAL_SNIPER')));
 
   let setupHeader = '🎯 Algorithmic Entry';
   if (setup === 'PARABOLIC_BREAKOUT') {
@@ -489,7 +573,11 @@ export async function executeBuyToken(
     whale_source: whale ? whale.label : source,
     target_tp_pct: targetTpPct,
     target_sl_pct: targetSlPct,
-    entry_reason: entryReasonStr
+    entry_reason: entryReasonStr,
+    // Hedge-fund provenance: what fired, how strong, in what regime.
+    setup_type: setup,
+    entry_score: dataReason?.score,
+    entry_regime: dataReason?.regime
   });
   refreshPositionWebSocketSubscriptions();
 
@@ -518,8 +606,8 @@ export async function executeBuyToken(
       : (marketData.txns5mBuys && marketData.txns5mSells ? ` (${marketData.txns5mBuys}B / ${marketData.txns5mSells}S)` : '');
     dataReasonSection += `• Order Flow: *${ratioVal.toFixed(1)}x* Dominasi Buyer${buySellCount}\n`;
   }
-  if (dataReason?.whaleNetFlowSol !== undefined && dataReason.whaleNetFlowSol > 0) {
-    dataReasonSection += `• Smart Money Flow: *+${dataReason.whaleNetFlowSol.toFixed(1)} SOL* Net Akumulasi\n`;
+  if (dataReason?.netBuyFlowSolEst !== undefined && dataReason.netBuyFlowSolEst > 0) {
+    dataReasonSection += `• Est. Net Buy Flow: *+${dataReason.netBuyFlowSolEst.toFixed(1)} SOL* (agregat count, bukan tracking wallet)\n`;
   }
   if (dataReason?.drawdownFromPeakPct !== undefined && dataReason.drawdownFromPeakPct > 0) {
     dataReasonSection += `• Retracement Dip: *-${dataReason.drawdownFromPeakPct.toFixed(1)}%* dari peak lokal\n`;
@@ -776,6 +864,9 @@ export async function executeSellToken(
     pnlPct,
     reason,
     strategySource: pos.whale_source,
+    setupType: pos.setup_type,
+    entryScore: pos.entry_score,
+    entryRegime: pos.entry_regime,
     holdingDurationSeconds: Math.floor((Date.now() - new Date(pos.opened_at).getTime()) / 1000)
   });
 
@@ -1011,43 +1102,61 @@ export async function evaluatePosition(
 
     // 3. INSTITUTIONAL DYNAMIC RATCHET TRAILING STOP (100% Single-Exit, Max Power Law Engine)
     // No partial sales! 100% bag captures exponential runs, Stop-Loss ratchets up like a one-way ladder.
+    //
+    // QUANT-01 (net-of-fees floors): round-trip execution cost (~2.5% DEX fee + network fees
+    // as % of position) is ADDED to every floor, so a "locked" level is genuinely profitable.
+    // The old +3.5% gross BEP lock netted ~+0.6% after fees — an illusion of safety.
+    //
+    // QUANT-02 (adaptive trailing): trail-back width scales with peak gain (volatility proxy).
+    // Parabolic runners get wider trails (harder to wick out on noise); small breakouts get
+    // tighter trails (less giveback). Width = 10% + 5% of peak gain, clamped [10%, 20%].
+    // Guaranteed minimum floors (+25/+50/+100) are unchanged.
     if (peakPrice > pos.entry_price_usd) {
       const peakGainPct = ((peakPrice - pos.entry_price_usd) / pos.entry_price_usd) * 100;
+      const feeBufferPct = estimateRoundTripFeePct(pos.entry_sol);
+      const adaptiveTrailPct = Math.min(20, Math.max(10, 10 + peakGainPct * 0.05));
       let ratchetFloorPct: number | null = null;
       let ratchetReason = '';
 
       if (peakGainPct >= 150.0) {
-        // Tier 4: God Candle / Mega Parabolic Runner (Trail 15% from ATH, guaranteed floor >= +100%)
-        ratchetFloorPct = Math.max(100.0, peakGainPct - 15.0);
-        ratchetReason = `MEGA_RUNNER_100_EXIT (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${ratchetFloorPct.toFixed(1)}%)`;
+        // Tier 4: God Candle / Mega Parabolic Runner (adaptive trail, guaranteed floor >= +100% net)
+        ratchetFloorPct = Math.max(100.0, peakGainPct - adaptiveTrailPct) + feeBufferPct;
+        ratchetReason = `MEGA_RUNNER_100_EXIT (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${ratchetFloorPct.toFixed(1)}% net)`;
       } else if (peakGainPct >= 80.0) {
-        // Tier 3: Strong Parabolic Runner (Trail 15% from ATH, guaranteed floor >= +50%)
-        ratchetFloorPct = Math.max(50.0, peakGainPct - 15.0);
-        ratchetReason = `SUPER_RUNNER_100_EXIT (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${ratchetFloorPct.toFixed(1)}%)`;
+        // Tier 3: Strong Parabolic Runner (adaptive trail, guaranteed floor >= +50% net)
+        ratchetFloorPct = Math.max(50.0, peakGainPct - adaptiveTrailPct) + feeBufferPct;
+        ratchetReason = `SUPER_RUNNER_100_EXIT (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${ratchetFloorPct.toFixed(1)}% net)`;
       } else if (peakGainPct >= 45.0) {
-        // Tier 2: Solid Breakout (Trail 12% from ATH, guaranteed floor >= +25%)
-        ratchetFloorPct = Math.max(25.0, peakGainPct - 12.0);
-        ratchetReason = `SOLID_BREAKOUT_100_EXIT (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${ratchetFloorPct.toFixed(1)}%)`;
+        // Tier 2: Solid Breakout (adaptive trail, guaranteed floor >= +25% net)
+        ratchetFloorPct = Math.max(25.0, peakGainPct - adaptiveTrailPct) + feeBufferPct;
+        ratchetReason = `SOLID_BREAKOUT_100_EXIT (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${ratchetFloorPct.toFixed(1)}% net)`;
       } else if (peakGainPct >= 22.0) {
-        // Tier 1: Risk-Free Breakout Lock (Guaranteed Net BEP Floor: +3.5% Net Profit after fees)
-        // Once a token breaks out +22%, this trade is 100% GUARANTEED to never lose capital!
-        ratchetFloorPct = 3.5;
-        ratchetReason = `RISK_FREE_BEP_LOCK (Peak +${peakGainPct.toFixed(1)}% -> Secured @ +${ratchetFloorPct.toFixed(1)}% Net BEP)`;
+        // Tier 1: Risk-Free Breakout Lock (net BEP floor: fees covered + real profit locked)
+        // Once a token breaks out +22%, this trade can NEVER lose capital net of fees.
+        ratchetFloorPct = 3.5 + feeBufferPct;
+        ratchetReason = `RISK_FREE_BEP_LOCK (Peak +${peakGainPct.toFixed(1)}% -> Secured @ +${ratchetFloorPct.toFixed(1)}% net BEP)`;
       }
 
       if (ratchetFloorPct !== null && pnlPct <= ratchetFloorPct) {
-        console.log(`[TradeManager] 🎯 DYNAMIC RATCHET TRAILING STOP TRIGGERED for ${pos.token_symbol}! (Peak: +${peakGainPct.toFixed(1)}%, Floor: +${ratchetFloorPct.toFixed(1)}%, Exit: +${pnlPct.toFixed(1)}%)`);
+        console.log(`[TradeManager] 🎯 DYNAMIC RATCHET TRAILING STOP TRIGGERED for ${pos.token_symbol}! (Peak: +${peakGainPct.toFixed(1)}%, Floor: +${ratchetFloorPct.toFixed(1)}% net, Exit: +${pnlPct.toFixed(1)}%)`);
         await executeSellToken(pos.id, 100, ratchetReason);
         return;
       }
     }
 
-    // 4. SMART ZOMBIE / TIME-STOP REAPER (Fast Capital Turnover)
-    // If held >= 2.5 hours with stagnant price (-6% to +4%), liquidate 100% to free capital!
+    // 4. SMART ZOMBIE / TIME-STOP REAPER v2 (Fast Capital Turnover)
+    // QUANT-03: the legacy [-6%, +4%] band missed "failed breakouts" — positions that peaked
+    // (+8%..+22%) but decayed without ever reaching a ratchet tier, then sat on dead capital
+    // until the 12h max-hold. Dead money has opportunity cost: recycle it.
+    // Threshold scales with peak achievement: min(12%, max(4%, peakGain * 0.5)).
     const openedTime = new Date(pos.opened_at).getTime();
     const hoursHeld = (Date.now() - openedTime) / (1000 * 60 * 60);
-    if (hoursHeld >= 2.5 && pnlPct >= -6.0 && pnlPct <= 4.0) {
-      console.log(`[TradeManager] ⌛ ZOMBIE TIME-STOP: ${pos.token_symbol} held for ${hoursHeld.toFixed(1)}h with stagnant price (${pnlPct.toFixed(1)}%). Liquidating 100% to rotate capital.`);
+    const peakGainPctZombie = peakPrice > pos.entry_price_usd
+      ? ((peakPrice - pos.entry_price_usd) / pos.entry_price_usd) * 100
+      : 0;
+    const zombieCeilPct = Math.min(12, Math.max(4, peakGainPctZombie * 0.5));
+    if (hoursHeld >= 2.5 && pnlPct >= -6.0 && pnlPct <= zombieCeilPct) {
+      console.log(`[TradeManager] ⌛ ZOMBIE TIME-STOP v2: ${pos.token_symbol} held for ${hoursHeld.toFixed(1)}h, peak +${peakGainPctZombie.toFixed(1)}% decayed to ${pnlPct.toFixed(1)}% (stagnant band ≤ +${zombieCeilPct.toFixed(1)}%). Liquidating 100% to rotate capital.`);
       await executeSellToken(pos.id, 100, `ZOMBIE_TIME_STOP (${hoursHeld.toFixed(1)}h Stagnant Exit)`);
       return;
     }

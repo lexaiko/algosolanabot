@@ -10,6 +10,9 @@ import { adaptiveLearningEngine } from '../strategies/adaptiveLearningEngine';
 import { addTokenToWatchlist } from './marketStreamer';
 import { FeatureVector, StrategySignal } from '../core/types';
 import { CONFIG } from '../config';
+import { tokenTape } from '../market/tokenTape';
+import { DecisionJournal } from '../journal/decisionJournal';
+import { getStorageRepository } from '../storage/index';
 
 /**
  * Multi-Stream Candidate Ingestion with Institutional Upstream Quality Filtering:
@@ -85,11 +88,19 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
   }
 
   // 2. GeckoTerminal Multi-Page Trending Pools (Solana network-wide on-chain velocity across Raydium, Orca, Meteora)
+  // NOTE: axios `timeout` alone proved unreliable through some egress proxies (observed a 51s hang
+  // on a 4.5s timeout), so a hard abort via AbortController is enforced as well.
   try {
-    const [p1, p2] = await Promise.all([
-      axios.get('https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?page=1', { headers: { 'Accept': 'application/json' }, timeout: 4500 }).catch(() => ({ data: { data: [] } })),
-      axios.get('https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?page=2', { headers: { 'Accept': 'application/json' }, timeout: 4500 }).catch(() => ({ data: { data: [] } }))
-    ]);
+    const geckoFetch = (page: number) => {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 4500);
+      return axios.get(`https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?page=${page}`, {
+        headers: { 'Accept': 'application/json' },
+        timeout: 4500,
+        signal: ctrl.signal,
+      }).finally(() => clearTimeout(timer)).catch(() => ({ data: { data: [] } }));
+    };
+    const [p1, p2] = await Promise.all([geckoFetch(1), geckoFetch(2)]);
     const geckoPools = [...(p1.data?.data || []), ...(p2.data?.data || [])];
     for (const pool of geckoPools) {
       const baseId = pool.relationships?.base_token?.data?.id?.replace('solana_', '');
@@ -206,6 +217,8 @@ export interface ScannedCandidate {
   buys5m: number;
   sells5m: number;
   volume5mUsd: number;
+  regime: string;
+  entryMode?: 'PULLBACK_ABSORPTION';
 }
 
 /**
@@ -256,6 +269,13 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
       }
 
       if (!market || market.priceUsd <= 0) continue;
+
+      // INSTITUTIONAL TAPE: record this observation, then prefer REAL rolling
+      // features over synthetic derivations. Fed by WS ticks (watchlist) and
+      // these 10-min snapshots (all scanned tokens).
+      tokenTape.record(item.tokenMint, market.priceUsd, market.volume24h || 0, market.liquidityUsd || 0);
+      const tape = tokenTape.getFeatures(item.tokenMint);
+      const tapeReady = tape.hasTape && tape.points >= 2;
 
       const safety = await checkTokenSafety(item.tokenMint);
 
@@ -325,7 +345,9 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
       const tradeCount5m = buys5m + sells5m;
       const buySellRatio = sells5m > 0 ? (buys5m / sells5m) : (buys5m > 0 ? 3.0 : 1.0);
       const flowImbalance = tradeCount5m > 0 ? (buys5m - sells5m) / tradeCount5m : 0;
-      const volume5mUsd = market.volume5m || ((market.volume24h || 0) / 288);
+      // True interval flow from the tape (delta of 24h volume between observations)
+      // beats DexScreener's 5m field; fall back to the field, then to a 24h slice.
+      const volume5mUsd = tape.intervalVolumeUsd ?? market.volume5m ?? ((market.volume24h || 0) / 288);
       const volume1hUsd = market.volume1h || ((market.volume24h || 0) / 24);
       
       // Pro Trader RVOL: 5m relative volume acceleration vs 1h baseline
@@ -333,18 +355,24 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
       const volumeAcceleration = rvol5m;
 
       const ret5m = market.priceChange5m || 0;
-      const realizedVol = Math.max(2.0, Math.abs(ret5m) * 1.25);
-      const atrPct = Math.max(3.0, Math.abs(ret5m) * 1.5);
+      // Realized vol from the tape when mature; otherwise a same-scale proxy.
+      const realizedVol = tape.realizedVolPct ?? Math.max(2.0, Math.abs(ret5m) * 1.25);
+      const atrPct = Math.max(3.0, realizedVol * 1.2);
 
-      // Institutional Whale / Smart Money Net Flow Estimation
+      // Buy-pressure ESTIMATION (honest labels — 2026-09-29).
+      // We do NOT track whale wallets. Both fields below are heuristics derived
+      // from aggregate buy/sell counts, documented as estimates, and left
+      // undefined when the trade sample is too thin to say anything.
       const solPriceVal = (market.priceNative && market.priceNative > 0) ? (market.priceUsd / market.priceNative) : 180;
       const avgTradeSizeUsd = tradeCount5m > 0 ? volume5mUsd / tradeCount5m : 80;
       const avgTradeSizeSol = solPriceVal > 0 ? (avgTradeSizeUsd / solPriceVal) : 0.5;
       const netTrades = Math.max(0, buys5m - sells5m);
-      const whaleNetFlowSol = (buySellRatio >= 1.5 && tradeCount5m >= 10) 
-        ? Math.round(netTrades * avgTradeSizeSol * 10) / 10 
-        : (buySellRatio >= 1.8 ? 8.0 : 0);
-      const smartMoneyAccumulationScore = buySellRatio >= 1.8 ? 90 : (buySellRatio >= 1.3 ? 75 : 45);
+      const netBuyFlowSolEst = (buySellRatio >= 1.5 && tradeCount5m >= 10)
+        ? Math.round(netTrades * avgTradeSizeSol * 10) / 10
+        : undefined;
+      const buyPressureScore = tradeCount5m >= 10
+        ? (buySellRatio >= 1.8 ? 90 : (buySellRatio >= 1.3 ? 75 : 45))
+        : undefined;
 
       // Construct Strategy Signals for Multi-Factor Consensus
       const tokenSym = market.symbol || item.poolName || 'UNKNOWN';
@@ -385,12 +413,12 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
           generatedAt: new Date().toISOString()
         });
       }
-      if (whaleNetFlowSol >= 2.0) {
+      if ((netBuyFlowSolEst ?? 0) >= 2.0) {
         signals.push({
-          signalId: `sig_${item.tokenMint.slice(0, 6)}_${Date.now()}_whale`,
+          signalId: `sig_${item.tokenMint.slice(0, 6)}_${Date.now()}_buypressure`,
           tokenId: item.tokenMint,
           tokenSymbol: tokenSym,
-          strategyName: 'WHALE_FLOW',
+          strategyName: 'BUY_PRESSURE',
           strategyVersion: '1.0',
           direction: 'BUY',
           confidence: 0.85,
@@ -404,34 +432,45 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
         });
       }
 
-      // Precision Pullback & Rebound calculation:
-      let drawdownFromPeakPct = 0;
-      let return1m = 0;
+      // Pullback & rebound state: REAL tape first, synthetic proxy only while the
+      // tape is too young. The old code derived all of these algebraically from
+      // ret5m alone (one input, five "features") — that is now the fallback.
+      // Note: ret1h is NOT fabricated from 24h anymore; unknown means unknown.
+      let drawdownFromPeakPct: number;
+      let return1m: number;
+      let upperWickRatio: number | undefined;
 
-      const ret1h = market.priceChange1h ?? ((market.priceChange24h || 0) * 0.08);
-
-      if (ret5m < 0) {
-        drawdownFromPeakPct = Math.abs(ret5m);
-        // If buyers are actively absorbing the dip (buySellRatio >= 1.35 and 5m drop is not a collapse):
-        if (buySellRatio >= 1.35 && ret5m >= -6.5) {
-          return1m = 0.5; // Green rebound tick confirmed during absorption!
-        } else {
-          return1m = ret5m * 0.2; // Still dipping / dumping
-        }
-      } else if (ret5m > 8.0) {
-        // Pumping hard at peak
-        drawdownFromPeakPct = 0.5; // Near peak (FOMO)
-        return1m = 1.0;
+      if (tapeReady) {
+        drawdownFromPeakPct = tape.drawdownFromPeakPct;
+        // Freshest real momentum on the tape (tick-resolution for WS tokens,
+        // 10-min resolution for scanner-only tokens).
+        return1m = tape.returnSinceLastPct ?? 0;
+        if (tape.upperWickRatio !== null) upperWickRatio = tape.upperWickRatio;
       } else {
-        // Mild consolidation (+0% to +8%)
-        drawdownFromPeakPct = Math.max(0, ret1h > ret5m ? (ret1h - ret5m) * 0.3 : 1.0);
-        return1m = ret5m * 0.15;
+        // Conservative fallback while the tape matures: no invented drawdown,
+        // no invented wicks. The wick guard is SKIPPED when unknown (see entryEngine).
+        if (ret5m < 0) {
+          drawdownFromPeakPct = Math.abs(ret5m);
+          return1m = (buySellRatio >= 1.35 && ret5m >= -6.5) ? 0.5 : ret5m * 0.2;
+        } else if (ret5m > 8.0) {
+          drawdownFromPeakPct = 0.5;
+          return1m = 1.0;
+        } else {
+          drawdownFromPeakPct = 0;
+          return1m = ret5m * 0.15;
+        }
+        upperWickRatio = undefined;
       }
 
-      // Precision Upper Wick Ratio for Pucuk Guard (Jarum Atas > 40% of body)
-      const upperWickRatio = (ret5m > 0 && drawdownFromPeakPct > 0)
-        ? ((drawdownFromPeakPct / 100) / Math.max(0.01, 1 - drawdownFromPeakPct / 100)) / Math.max(0.01, ret5m / (100 + ret5m))
-        : (drawdownFromPeakPct > 3.0 ? 999.0 : 0);
+      const ret1h = market.priceChange1h ?? 0;
+
+      // Real execution economics: price impact of OUR reference buy size on THIS
+      // pool (constant-product approximation). The old hardcoded 0.8 made the
+      // >3.5% invalidation gate meaningless.
+      const refBuyUsd = (CONFIG.DEFAULT_BUY_AMOUNT_SOL || 0.05) * solPriceVal;
+      const estimatedPriceImpactPct = market.liquidityUsd > 0
+        ? Math.min(10, (refBuyUsd / (market.liquidityUsd * 0.5)) * 100)
+        : 10;
 
       const vector: FeatureVector = {
         tokenId: item.tokenMint,
@@ -439,7 +478,9 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
         timeframe: '5m',
         return1m,
         return5m: ret5m,
-        return15m: (market.priceChange24h || 0) * 0.15,
+        // Honest 15m: tape-measured when mature, otherwise unknown (undefined).
+        // Never synthesized from shorter timeframes.
+        return15m: tape.return15mPct ?? undefined,
         realizedVol,
         atrPct,
         breakoutDistancePct: Math.max(0, ret5m - 2.0),
@@ -452,10 +493,11 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
         tradeCount5m: Math.max(1, tradeCount5m),
         avgTradeSizeUsd,
         liquidityUsd: market.liquidityUsd,
-        liquidityChangePct: 0,
-        estimatedPriceImpactPct: 0.8,
-        whaleNetFlowSol,
-        smartMoneyAccumulationScore,
+        estimatedPriceImpactPct,
+        netBuyFlowSolEst,
+        buyPressureScore,
+        // Coarse heuristic from the safety gate: 10 = passed, 60 = failed.
+        // Undefined is NOT used here because the gate always ran above.
         cabalClusterRiskScore: safety.isSafe ? 10 : 60,
         regime: realizedVol >= 10.0 ? 'HIGH_VOLATILITY' : (ret5m > 3.0 ? 'TRENDING_UP' : (ret5m < -5.0 ? 'PANIC' : 'RANGE')),
         quality: 'VALID'
@@ -467,7 +509,7 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
       // 1. Pucuk & Exhaustion Filter (Anti-Late Distribution & Anti-FOMO Spike)
       let isExhausted = false;
       let exhaustionReason = '';
-      if (upperWickRatio > 0.40) {
+      if (upperWickRatio !== undefined && upperWickRatio > 0.40) {
         isExhausted = true;
         exhaustionReason = `UPPER_WICK_REJECTION (Jarum atas ${(upperWickRatio * 100).toFixed(0)}% > 40% dari body - dev/insider distribusi)`;
       } else if (ret1h > 70.0 && ret5m < 0) {
@@ -516,7 +558,7 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
         }
       }
 
-      const dynamicMinScore = Math.max(75, adaptiveLearningEngine.getMinEntryScore());
+      const dynamicMinScore = adaptiveLearningEngine.getMinEntryScore();
       let isPassed = funnelEval.passed && entryDecision.shouldEnter && scoreResult.compositeScore >= dynamicMinScore;
       
       let rejectReason: string | undefined = undefined;
@@ -561,8 +603,28 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
         ret1h,
         buys5m,
         sells5m,
-        volume5mUsd
+        volume5mUsd,
+        regime: vector.regime,
+        entryMode: entryDecision.entryMode
       });
+
+      // INSTITUTIONAL DECISION LOG: every evaluated candidate is persisted with
+      // its real features, score, and the scanner's verdict. This table is the
+      // dataset that lets us fit scorer weights empirically instead of
+      // hand-tuning them — the missing link between "strategy" and "evidence".
+      try {
+        const journal = new DecisionJournal(getStorageRepository());
+        await journal.logCandidateDecision({
+          tokenId: item.tokenMint,
+          tokenSymbol: market.symbol || 'UNKNOWN',
+          decision: isPassed ? 'EXECUTED' : 'SKIPPED',
+          compositeScore: scoreResult.compositeScore,
+          rejectionReasons: isPassed ? ['SCANNER_DECISION_EXECUTE'] : [rejectReason || 'UNKNOWN'],
+          featuresSnapshot: vector,
+          regime: vector.regime,
+          strategyName: signals.map(s => s.strategyName).join('+') || 'NONE'
+        });
+      } catch {}
     } catch (err: any) {
       // Continue next token
     }
@@ -577,7 +639,7 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
 export async function runAlgoScanCycle() {
   try {
     console.log(`[AlgoScanner] 🔍 Menjalankan siklus scan pasar kuantitatif otonom...`);
-    const dynamicMinScore = Math.max(75, adaptiveLearningEngine.getMinEntryScore());
+    const dynamicMinScore = adaptiveLearningEngine.getMinEntryScore();
     const candidates = await scanMarketOnce(6);
 
     // Push volatile candidates directly into MarketStreamer live WebSocket watchlist
@@ -625,9 +687,10 @@ export async function runAlgoScanCycle() {
       undefined,
       undefined,
       {
-        setupType: best.category === 'BUY_READY' ? 'PARABOLIC_BREAKOUT' : 'MOMENTUM_RUNNER',
+        setupType: best.entryMode || (best.category === 'BUY_READY' ? 'PULLBACK_ABSORPTION' : 'MOMENTUM_RUNNER'),
         score: best.score,
         minScore: dynamicMinScore,
+        regime: best.regime,
         explanation: best.explanation,
         priceChange5m: best.ret5m,
         priceChange1h: best.ret1h,

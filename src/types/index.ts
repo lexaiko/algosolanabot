@@ -34,6 +34,9 @@ export interface Position {
   whale_source?: string;
   target_tp_pct?: number; // Volatility-adaptive take profit
   target_sl_pct?: number; // Volatility-adaptive stop loss
+  setup_type?: string; // Entry setup that fired (PARABOLIC_BREAKOUT, PULLBACK_ABSORPTION, ...)
+  entry_score?: number; // Composite quant score at entry (0-100)
+  entry_regime?: string; // Market regime at entry
   opened_at: string;
   closed_at?: string;
 }
@@ -104,6 +107,7 @@ export interface ExecutionDataReason {
   setupType?: 'PARABOLIC_BREAKOUT' | 'PULLBACK_ABSORPTION' | 'MOMENTUM_RUNNER' | 'WHALE_COPY' | 'MANUAL_SNIPER' | string;
   score?: number;
   minScore?: number;
+  regime?: string;
   explanation?: string;
   rvol?: number;
   priceChange5m?: number;
@@ -111,7 +115,7 @@ export interface ExecutionDataReason {
   buySellRatio?: number;
   flowImbalance?: number;
   volume5mUsd?: number;
-  whaleNetFlowSol?: number;
+  netBuyFlowSolEst?: number;
   drawdownFromPeakPct?: number;
   upperWickRatio?: number;
   reboundTickPct?: number;

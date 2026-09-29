@@ -1,5 +1,16 @@
-import WebSocket from 'ws';
-import { PublicKey } from '@solana/web3.js';
+import WS from 'ws';
+import { getProxyAgent } from '../utils/netProxy';
+
+// Proxy-aware WebSocket factory: in egress-proxy environments the raw `ws`
+// handshake dies with EPROTO, so tunnel through the proxy when configured.
+// (The Helius WS inside @solana/web3.js is covered separately by the
+// require.cache patch in utils/netProxy, which must be imported first in index.ts.)
+function createWebSocket(address: string, protocols?: any, options?: any): WS {
+  const agent = getProxyAgent();
+  return new WS(address, protocols, agent ? { agent, ...(options || {}) } : options);
+}
+type WebSocket = WS;
+import { PublicKey } from '../utils/solanaWeb3';
 import { getDedicatedConnection } from './solanaConnection';
 import { getBondingCurveAddress, decodeBondingCurveBuffer } from './bondingCurve';
 import { getSolPriceUsd, getTokenMarketData, getMultiTokenMarketData } from './dexscreener';
@@ -9,6 +20,7 @@ import { adaptiveLearningEngine } from '../strategies/adaptiveLearningEngine';
 import { getOrganicTrendingTokens } from './algoScanner';
 import { FeatureVector, StrategySignal } from '../core/types';
 import { CONFIG } from '../config';
+import { tokenTape } from '../market/tokenTape';
 
 export interface WatchedCandidate {
   tokenMint: string;
@@ -51,6 +63,9 @@ const WS_DEAD_SUBSCRIPTION_MS = 90_000;
 const watchlist: Map<string, WatchedCandidate> = new Map();
 const wsConnection = getDedicatedConnection('POSITION_MANAGER');
 let wsHealthCheckTimer: NodeJS.Timeout | null = null;
+// Cached SOL/USD, refreshed whenever the curve handler fetches a fresh quote.
+// Seed 180 is only a pre-first-fetch fallback, documented at use sites.
+let cachedSolPriceUsd = 180;
 /** Per-mint reconnect state: [backoffMs, lastAttemptMs]. */
 const wsReconnectState: Map<string, { backoffMs: number; lastAttemptAt: number }> = new Map();
 
@@ -310,6 +325,7 @@ async function handleOnChainCurveUpdate(tokenMint: string, data: Buffer) {
   if (!state || state.spotPriceSol <= 0) return;
 
   const solPriceUsd = await getSolPriceUsd();
+  if (solPriceUsd > 0) cachedSolPriceUsd = solPriceUsd;
   const currentPriceUsd = state.spotPriceSol * solPriceUsd;
   const currentLiquidityUsd = state.liquiditySol * solPriceUsd;
 
@@ -323,6 +339,11 @@ async function handleOnChainCurveUpdate(tokenMint: string, data: Buffer) {
     priceUsd: currentPriceUsd,
     solLiquidity: state.liquiditySol
   });
+
+  // Feed the shared institutional tape (tick-resolution price discovery;
+  // volume unknown on bonding-curve ticks — recorded as 0 and skipped by
+  // the tape's interval-volume computation).
+  tokenTape.record(tokenMint, currentPriceUsd, 0, currentLiquidityUsd);
 
   // Prune history older than 5 minutes
   const cutoff = now - TICK_HISTORY_WINDOW_MS;
@@ -416,13 +437,16 @@ async function evaluateWatchlistCandidateOnTick(item: WatchedCandidate, curveSta
   const drawdownFromPeakPct = peakPriceUsd > 0 ? Math.max(0, ((peakPriceUsd - latest.priceUsd) / peakPriceUsd) * 100) : 0;
 
   // Pucuk Guard: Upper Wick Rejection (> 40% of candle body)
+  // Honest version (2026-09-29): when the body is unmeasurable the ratio is
+  // unknown (undefined), never the old 999.0 sentinel that forced rejection
+  // on fabricated data. The guard skips when unknown.
   const openPrice = oldest.priceUsd;
   const currentPrice = latest.priceUsd;
   const candleBody = Math.max(0, currentPrice - openPrice);
   const upperWick = Math.max(0, peakPriceUsd - currentPrice);
-  const upperWickRatio = candleBody > 0 ? (upperWick / candleBody) : (upperWick > 0 ? 999.0 : 0);
+  const upperWickRatio = candleBody > 0 ? (upperWick / candleBody) : undefined;
 
-  if (upperWickRatio > 0.40) {
+  if (upperWickRatio !== undefined && upperWickRatio > 0.40) {
     console.log(`[MarketStreamer] 🛑 REJECTED: UPPER_WICK_REJECTION for ${item.symbol}: Jarum atas ${(upperWickRatio * 100).toFixed(0)}% > 40% dari body (Peak: $${peakPriceUsd.toFixed(6)} -> Current: $${currentPrice.toFixed(6)})`);
     return;
   }
@@ -481,6 +505,17 @@ async function evaluateWatchlistCandidateOnTick(item: WatchedCandidate, curveSta
   const effectiveRet5m = realMarketData.priceChange5m ?? priceChangePct;
   const realizedVol = Math.max(4.0, Math.abs(effectiveRet5m) * 1.3);
 
+  // Honest buy-pressure estimation (2026-09-29): derived from the real
+  // aggregate buy/sell counts in this 5m window. Not whale-wallet tracking.
+  const avgTradeSizeUsd = tradeCount5m > 0 ? realVol5mUsd / tradeCount5m : 80;
+  const wsNetBuyFlowSolEst = realBuySellRatio >= 1.5
+    ? Math.round(Math.max(0, buys5m - sells5m) * (avgTradeSizeUsd / cachedSolPriceUsd) * 10) / 10
+    : undefined;
+  const wsBuyPressureScore = tradeCount5m >= 8
+    ? (realBuySellRatio >= 1.8 ? 90 : (realBuySellRatio >= 1.3 ? 75 : 45))
+    : undefined;
+  const wsTape = tokenTape.getFeatures(item.tokenMint);
+
   // Build Feature Vector from REAL on-chain/AMM data
   const vector: FeatureVector = {
     tokenId: item.tokenMint,
@@ -488,7 +523,8 @@ async function evaluateWatchlistCandidateOnTick(item: WatchedCandidate, curveSta
     timeframe: '5m',
     return1m,
     return5m: effectiveRet5m,
-    return15m: effectiveRet5m * 1.2,
+    // Honest 15m: tape-measured when mature, else unknown. Never synthesized.
+    return15m: wsTape.return15mPct ?? undefined,
     realizedVol,
     atrPct: Math.max(3.5, realizedVol * 1.2),
     breakoutDistancePct: Math.max(0, effectiveRet5m - 2.0),
@@ -499,13 +535,14 @@ async function evaluateWatchlistCandidateOnTick(item: WatchedCandidate, curveSta
     buySellRatio: realBuySellRatio,
     flowImbalance: realFlowImbalance,
     tradeCount5m: tradeCount5m > 0 ? tradeCount5m : tickVelocity,
-    avgTradeSizeUsd: tradeCount5m > 0 ? realVol5mUsd / tradeCount5m : 80,
+    avgTradeSizeUsd,
     liquidityUsd: liquidityUsd,
-    liquidityChangePct: 0,
     estimatedPriceImpactPct: estImpactPct,
-    whaleNetFlowSol: (realBuySellRatio >= 1.7 && tradeCount5m >= 8) ? 3.5 : (realSol > 30 ? 2.0 : 0.5),
-    smartMoneyAccumulationScore: realBuySellRatio >= 1.75 ? 85 : 45,
-    cabalClusterRiskScore: 10,
+    netBuyFlowSolEst: wsNetBuyFlowSolEst,
+    buyPressureScore: wsBuyPressureScore,
+    // Cabal risk is NOT assessed on the WS hot path (left undefined);
+    // executeBuyToken runs the full safety gate downstream before any fill.
+    cabalClusterRiskScore: undefined,
     regime: realizedVol >= 10.0 ? 'HIGH_VOLATILITY' : 'TRENDING_UP',
     quality: 'VALID'
   };
@@ -549,7 +586,7 @@ function startPumpPortalMigrationStream() {
   if (pumpportalWs) return;
 
   try {
-    pumpportalWs = new WebSocket('wss://pumpportal.fun/api/data');
+    pumpportalWs = createWebSocket('wss://pumpportal.fun/api/data');
 
     pumpportalWs.on('open', () => {
       console.log('[MarketStreamer] 🌐 Terhubung ke PumpPortal WebSocket. Menyimak stream migrasi Raydium live...');
@@ -613,8 +650,11 @@ export async function startMarketStreamer() {
   // 1. Start PumpPortal Migration stream
   startPumpPortalMigrationStream();
 
-  // 2. Seed watchlist with initial volatile runners
-  await seedWatchlistWithVolatileRunners();
+  // 2. Seed watchlist with initial volatile runners (BACKGROUND: never block startup on
+  // third-party APIs — the 15s batch syncer, PumpPortal stream, and 10m scanner watchdog
+  // keep the watchlist fresh regardless).
+  seedWatchlistWithVolatileRunners().catch((err: any) =>
+    console.warn('[MarketStreamer] Background watchlist seed failed:', err?.message));
 
   // 3. Fast 15s batch price syncer for Raydium / AMM tokens (1 single HTTP request for all non-pump tokens)
   raydiumBatchTimer = setInterval(async () => {

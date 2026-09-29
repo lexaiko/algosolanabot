@@ -48,12 +48,14 @@ export class OpportunityScorer {
     const liquidityScore = Math.min(weights.liquidityWeight, Math.round(liqRatio * weights.liquidityWeight));
     positivePoints['Liquidity'] = liquidityScore;
 
-    // 5. Qualified Whale Signal Component (Adaptive Weight)
-    let whaleScore = 0;
-    if (features.smartMoneyAccumulationScore >= 60 && features.whaleNetFlowSol > 0) {
-      whaleScore = Math.min(weights.whaleWeight, Math.round(((features.smartMoneyAccumulationScore - 60) / 40) * weights.whaleWeight));
+    // 5. Buy-Pressure Component (Adaptive Weight)
+    // Estimates only (see FeatureVector docs); unknown values fail closed.
+    let buyPressurePts = 0;
+    const bpScore = features.buyPressureScore ?? 0;
+    if (bpScore >= 60 && (features.netBuyFlowSolEst ?? 0) > 0) {
+      buyPressurePts = Math.min(weights.buyPressureWeight, Math.round(((bpScore - 60) / 40) * weights.buyPressureWeight));
     }
-    positivePoints['Whale'] = whaleScore;
+    positivePoints['BuyPressure'] = buyPressurePts;
 
     // 6. Strategy Consensus Bonus (Adaptive Weight)
     if (signals.length >= 2) {
@@ -66,8 +68,9 @@ export class OpportunityScorer {
       penalties['SlippageImpact'] = Math.min(15, Math.round(features.estimatedPriceImpactPct * 3));
     }
 
-    // Cabal / Sybil Cluster penalty
-    if (features.cabalClusterRiskScore > 20) {
+    // Cabal / Sybil Cluster penalty (skipped when unassessed — unknown is not
+    // assumed safe, but the full safety gate in executeBuyToken covers it downstream)
+    if (features.cabalClusterRiskScore !== undefined && features.cabalClusterRiskScore > 20) {
       penalties['CabalRisk'] = Math.min(30, Math.round(features.cabalClusterRiskScore * 0.5));
     }
 

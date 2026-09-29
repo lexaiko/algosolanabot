@@ -126,6 +126,11 @@ export function initDatabase() {
   try { db.exec('ALTER TABLE trade_history ADD COLUMN net_pnl_sol REAL DEFAULT 0;'); } catch {}
   try { db.exec('ALTER TABLE positions ADD COLUMN target_tp_pct REAL DEFAULT 35.0;'); } catch {}
   try { db.exec('ALTER TABLE positions ADD COLUMN target_sl_pct REAL DEFAULT 20.0;'); } catch {}
+  // HEDGE-FUND PROVENANCE (2026-09-29): entry context stored on every position so
+  // closed-trade attribution can answer "which setups actually make money?".
+  try { db.exec('ALTER TABLE positions ADD COLUMN setup_type TEXT;'); } catch {}
+  try { db.exec('ALTER TABLE positions ADD COLUMN entry_score REAL;'); } catch {}
+  try { db.exec('ALTER TABLE positions ADD COLUMN entry_regime TEXT;'); } catch {}
   try { db.exec('CREATE TABLE IF NOT EXISTS whale_blacklist (address TEXT PRIMARY KEY, reason TEXT, blacklisted_at TEXT NOT NULL);'); } catch {}
   try { db.exec('CREATE TABLE IF NOT EXISTS watchers (user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, created_at TEXT NOT NULL);'); } catch {}
 
@@ -168,26 +173,11 @@ export function initDatabase() {
     );
   }
 
-  // Pre-seed real active smart money / whale wallets if none exist
-  const countWhales = db.prepare('SELECT COUNT(*) as count FROM whales').get() as { count: number };
-  if (countWhales.count === 0) {
-    const defaultWhales = [
-      { address: '7W7FNDxRS8HGufGxYb5zWEzFWUz4fEPfkD7UA5UktPwy', label: '🐋 Paus Sniper Alpha' },
-      { address: '736kh8iv2s3G2zE68NkyYNRaeKbaNHL6mWgHhY2fyu8D', label: '⚡ Solana Smart Momentum' },
-      { address: 'D9gTLC9vvVSp9whZspdyiAHQWR4c6apip45wb8uz6EaS', label: '🎯 Raydium Volume Hunter' },
-      { address: '8jzmWzQxC273HcZgE1KX4BjnKDUULp7evXRYRfBRFAvA', label: '💎 Pump.fun Gem Finder' },
-      { address: 'Fo93iW1TYAaPVoYE5MkgyZT1U8SHPZEs1KoDqpMjTjfn', label: '🔥 Meme Dex Whale' }
-    ];
-
-    const insertWhale = db.prepare(`
-      INSERT OR IGNORE INTO whales (address, label, is_active, auto_copy, copy_amount_sol, created_at)
-      VALUES (?, ?, 1, 1, ?, ?)
-    `);
-
-    for (const w of defaultWhales) {
-      insertWhale.run(w.address, w.label, CONFIG.DEFAULT_BUY_AMOUNT_SOL, new Date().toISOString());
-    }
-  }
+  // NOTE (2026-09-29): whale-follow pre-seed REMOVED. The old block hardcoded
+  // 5 unverified addresses as "real active smart money wallets" with auto_copy=1,
+  // but no live code ever watched or copied them (no whale watcher exists).
+  // This project does NOT do wallet-following; the whales table remains only as
+  // schema for manual research notes, never auto-populated.
 }
 
 // Wallet Functions
@@ -637,6 +627,9 @@ export function createPosition(pos: {
   target_tp_pct?: number;
   target_sl_pct?: number;
   entry_reason?: string;
+  setup_type?: string;
+  entry_score?: number;
+  entry_regime?: string;
 }): Position {
   const now = new Date().toISOString();
   const tpPct = pos.target_tp_pct || CONFIG.TAKE_PROFIT_PCT;
@@ -647,8 +640,9 @@ export function createPosition(pos: {
     INSERT INTO positions (
       token_address, token_symbol, token_name, amount_tokens,
       entry_price_usd, entry_sol, current_price_usd, peak_price_usd,
-      pnl_usd, pnl_pct, status, whale_source, target_tp_pct, target_sl_pct, opened_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 'OPEN', ?, ?, ?, ?)
+      pnl_usd, pnl_pct, status, whale_source, target_tp_pct, target_sl_pct,
+      setup_type, entry_score, entry_regime, opened_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 'OPEN', ?, ?, ?, ?, ?, ?, ?)
   `).run(
     pos.token_address,
     pos.token_symbol,
@@ -661,6 +655,9 @@ export function createPosition(pos: {
     pos.whale_source || 'MANUAL',
     tpPct,
     slPct,
+    pos.setup_type || null,
+    pos.entry_score ?? null,
+    pos.entry_regime || null,
     now
   );
 
@@ -828,6 +825,30 @@ export function getTradingStats() {
     totalPnlUsd: totalPnlUsd.toFixed(2),
     openPositionsCount: getOpenPositions().length,
   };
+}
+
+/**
+ * QUANT-04: Empirical Kelly statistics from closed positions.
+ * Returns sample count, win rate (0-1) and payoff ratio (avgWinPct / avgLossPct)
+ * used by the dynamic sizer for Bayesian empirical-Kelly position sizing.
+ */
+export function getEmpiricalKellyStats(): { n: number; winRate: number; payoff: number } {
+  try {
+    const rows = db.prepare(`
+      SELECT pnl_pct FROM positions WHERE status = 'CLOSED' AND pnl_pct IS NOT NULL
+    `).all() as Array<{ pnl_pct: number }>;
+    const n = rows.length;
+    if (n === 0) return { n: 0, winRate: 0, payoff: 0 };
+    const wins = rows.filter(r => r.pnl_pct > 0);
+    const losses = rows.filter(r => r.pnl_pct <= 0);
+    const winRate = wins.length / n;
+    const avgWin = wins.length ? wins.reduce((s, r) => s + r.pnl_pct, 0) / wins.length : 0;
+    const avgLoss = losses.length ? Math.abs(losses.reduce((s, r) => s + r.pnl_pct, 0) / losses.length) : 10;
+    const payoff = avgLoss > 0 ? avgWin / avgLoss : 0;
+    return { n, winRate, payoff };
+  } catch {
+    return { n: 0, winRate: 0, payoff: 0 };
+  }
 }
 
 // Circuit Breaker State

@@ -23,7 +23,7 @@ src/
 ├── services/
 │   ├── algoScanner.ts      # Engine pemindaian kuantitatif, scoring, dan filter Goldilocks (Score >= 75)
 │   ├── marketStreamer.ts   # Telemetri WebSocket real-time, tracker harga posisi aktif, & watchlist scanner
-│   ├── tradeManager.ts     # Manajemen posisi, Dynamic Ratchet Trailing, Reality Guard, & eksekusi buy/sell
+│   ├── tradeManager.ts     # Manajemen posisi, Dynamic Ratchet Trailing (net-of-fees, adaptive), Reality Guard, eksekusi buy/sell, & Empirical Kelly sizing
 │   ├── antirug.ts          # Validasi on-chain: Mint Authority, Freeze Authority, LP Burned, Dev Holding
 │   ├── dexSimulator.ts     # Simulasi biaya DEX riil (Pump.fun 1.25%, Raydium AMM, dynamic slippage & priority)
 │   ├── dexscreener.ts      # Fetching data pasar & multi-token batch query
@@ -62,14 +62,20 @@ graph TD
 ### 1. Tangga Dynamic Ratchet:
 - **Hard Stop-Loss ($-9.5\%$):** Batas toleransi kerugian keras terstruktur untuk memberi ruang volatilitas normal spread DEX tanpa membiarkan modal tergerus dalam.
 - **Velocity Dump Rescue:** Jika harga anjlok drastis dalam $<90$ detik sejak entry, posisi langsung dilikuidasi seketika tanpa menunggu Hard SL tersentuh (menyelamatkan modal dari dev dump mendadak).
-- **Tier 1 (Peak $\ge +22\%$ $\rightarrow$ Kunci $+3.5\%$ Net BEP):** Sekali token mencapai kenaikan $+22\%$, *ratchet floor* otomatis terkunci pada $+3.5\%$ Net. Trade tersebut **100% dijamin bebas risiko modal** (modal pokok + estimasi total swap fee sudah aman).
-- **Tier 2 (Peak $\ge +45\%$ $\rightarrow$ Lock $\ge +25\%$):** Trailing stop $12\%$ di bawah titik tertinggi (ATH), lantai minimal $+25\%$.
-- **Tier 3 (Peak $\ge +80\%$ $\rightarrow$ Lock $\ge +50\%$):** Trailing stop $15\%$ di bawah ATH, lantai minimal $+50\%$.
-- **Tier 4 (Peak $\ge +150\%$ God Candle $\rightarrow$ Lock $\ge +100\%$):** Trailing stop $15\%$ di bawah ATH, lantai minimal $+100\%$.
+- **Tier 1 (Peak $\ge +22\%$ $\rightarrow$ Kunci Net BEP):** Sekali token mencapai kenaikan $+22\%$, *ratchet floor* otomatis terkunci pada $+3.5\%$ **net** (gross $+3.5\%$ + buffer round-trip fee $\approx 3.7\%$). Trade tersebut **100% dijamin bebas risiko modal** — level yang terkunci benar-benar profit setelah fee, bukan ilusi gross.
+- **Tier 2 (Peak $\ge +45\%$ $\rightarrow$ Lock $\ge +25\%$ net):** Trailing stop adaptif di bawah titik tertinggi (ATH), lantai minimal $+25\%$ net.
+- **Tier 3 (Peak $\ge +80\%$ $\rightarrow$ Lock $\ge +50\%$ net):** Trailing stop adaptif di bawah ATH, lantai minimal $+50\%$ net.
+- **Tier 4 (Peak $\ge +150\%$ God Candle $\rightarrow$ Lock $\ge +100\%$ net):** Trailing stop adaptif di bawah ATH, lantai minimal $+100\%$ net.
+- **Adaptive trailing (QUANT-02):** lebar trail-back = $10\% + 5\% \times$ peak gain, di-clamp $[10\%, 20\%]$. Runner parabolik besar dapat trail lebih lebar (sulit ter-wick oleh noise), breakout kecil dapat trail lebih ketat (giveback minimal).
 
-### 2. Zombie Time-Stop Reaper:
-- Posisi yang bertahan $\ge 2.5$ jam namun bergerak menyamping/stagnan (PnL berada di antara $-6.0\%$ hingga $+4.0\%$) otomatis dilikuidasi (`ZOMBIE_REAPER_STAGNANT`).
-- Mengembalikan likuiditas SOL ke *pool modal* agar tidak tertahan pada koin mati.
+### 2. Zombie Time-Stop Reaper v2:
+- Posisi yang bertahan $\ge 2.5$ jam namun stagnan otomatis dilikuidasi. Band stagnan **berskala dengan peak**: $\le \min(12\%, \max(4\%, peak \times 0.5))$ — "failed breakout" (pump $+15\%$ lalu mati di $+5\%$) ikut di-recycle, sementara *slow grinder* yang sehat tidak tersentuh.
+- Mengembalikan likuiditas SOL ke *pool modal* agar tidak tertahan pada koin mati (opportunity cost modal).
+
+### 3. Empirical Kelly Sizing (QUANT-04):
+- Ukuran posisi bukan lagi flat 5%: fraksi dihitung dari **quarter-Kelly empiris** — win rate & payoff ratio dari posisi CLOSED di database, di-blend Bayesian dengan prior konservatif (p=35%, b=3.0, bobot 20 trade), di-clamp $[2\%, 8\%]$.
+- Dengan profil terukur (WR $\approx 37.5\%$, payoff $\approx 10$), full Kelly $\approx 31\%$ → quarter-Kelly $\approx 7.8\%$ — flat 5% sebelumnya meninggalkan edge di atas meja.
+- Anti-martingale loss-streak decay ($0.75^{losses}$) tetap dipertahankan di atasnya.
 
 ---
 

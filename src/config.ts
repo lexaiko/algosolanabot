@@ -110,6 +110,10 @@ export const CONFIG = {
   KELLY_SIZING_ENABLED: process.env.KELLY_SIZING_ENABLED !== 'false',
   KELLY_FRACTION: Number(process.env.KELLY_FRACTION) || 0.25, // Quarter-Kelly (mathematical optimum)
   MAX_LIQUIDITY_DEPTH_PCT: Number(process.env.MAX_LIQUIDITY_DEPTH_PCT) || 1.5, // Never exceed 1.5% of pool depth
+  // Hedge-fund portfolio risk (2026-09-29 overhaul): count limits are not enough
+  // for a book where memecoins correlate ~0.7 in selloffs.
+  MAX_PORTFOLIO_HEAT_PCT: Number(process.env.MAX_PORTFOLIO_HEAT_PCT) || 0.50, // Max 50% of equity deployed
+  DAILY_MAX_LOSS_PCT: Number(process.env.DAILY_MAX_LOSS_PCT) || 0.08, // Daily equity kill-switch at -8% realized
   FLASH_EXIT_ENABLED: process.env.FLASH_EXIT_ENABLED !== 'false',
   FLASH_EXIT_DROP_PCT: Number(process.env.FLASH_EXIT_DROP_PCT) || 30.0, // Emergency exit if pool drops > 30%
 

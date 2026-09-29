@@ -84,7 +84,9 @@ export interface FeatureVector {
   // Price Structure
   return1m: number;
   return5m: number;
-  return15m: number;
+  /** 15m return from real observations (token tape). Undefined when the tape
+   *  is too young — NEVER synthesized from shorter timeframes. */
+  return15m?: number;
   realizedVol: number; // Realized standard deviation
   atrPct: number; // Average True Range %
   breakoutDistancePct: number;
@@ -101,14 +103,23 @@ export interface FeatureVector {
 
   // Liquidity Microstructure
   liquidityUsd: number;
-  liquidityChangePct: number;
+  /** Undefined when not measured. Was hardcoded 0 in several producers. */
+  liquidityChangePct?: number;
   estimatedPriceImpactPct: number;
   bondingCurveProgressPct?: number;
 
-  // Wallet & Whale Behavior
-  whaleNetFlowSol: number;
-  smartMoneyAccumulationScore: number; // 0 - 100
-  cabalClusterRiskScore: number; // 0 - 100 (0 = clean, 100 = dangerous cluster)
+  // Buy-pressure estimation (HONEST LABELS — 2026-09-29).
+  // This project does NOT track whale wallets. These fields are estimates
+  // derived from aggregate buy/sell counts, not smart-money surveillance.
+  /** Estimated net buy-side flow in SOL = f(buy/sell ratio, avg trade size).
+   *  Heuristic, not wallet tracking. Undefined when trade-count data is thin. */
+  netBuyFlowSolEst?: number;
+  /** 0-100 bucketed buy-pressure score derived from buy/sell ratio only.
+   *  Heuristic estimate, NOT smart-wallet analysis despite the old name. */
+  buyPressureScore?: number;
+  /** 0-100 (0 = clean). Coarse heuristic from the safety gate where available.
+   *  Undefined when not assessed — gates must skip, not assume safe. */
+  cabalClusterRiskScore?: number;
 
   // Regime
   regime: MarketRegimeType;

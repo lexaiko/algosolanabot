@@ -1,0 +1,202 @@
+/**
+ * TokenTapeTracker — real rolling price/volume tape per token.
+ *
+ * Hedge-fund rule: never decide on a feature you fabricated. The old scanner
+ * derived return1m / return15m / drawdown / wicks algebraically from a single
+ * 5-minute DexScreener number — five "features", one degree of freedom.
+ *
+ * This tape records actual observations over time, fed from two sources:
+ *  - marketStreamer WS ticks (tick resolution, watchlist tokens)
+ *  - algoScanner snapshots (10-min resolution, every scanned token)
+ *
+ * Consumers read REAL rolling statistics: peak drawdown, multi-snapshot
+ * returns, and true interval volume (delta of 24h volume between snapshots).
+ * When the tape is too young, features report null and callers must fall back
+ * to conservative defaults — never to invented numbers.
+ */
+
+export interface TapePoint {
+  t: number; // epoch ms
+  priceUsd: number;
+  volume24hUsd: number;
+  liquidityUsd: number;
+}
+
+export interface TapeFeatures {
+  hasTape: boolean;
+  points: number;
+  spanMinutes: number;
+  peakPriceUsd: number;
+  /** Real drawdown vs rolling-window peak, % */
+  drawdownFromPeakPct: number;
+  /** Momentum vs previous observation, % (null when < 2 points) */
+  returnSinceLastPct: number | null;
+  /** Return vs observation closest to 15 min ago (null when tape < ~12 min) */
+  return15mPct: number | null;
+  /** Return vs observation closest to 30 min ago (null when tape < ~25 min) */
+  return30mPct: number | null;
+  /** True interval volume = delta of 24h volume since last observation (null when < 2 points) */
+  intervalVolumeUsd: number | null;
+  /** Real upper-wick ratio over the tape window: (peak - last) / (last - first). Null when no body. */
+  upperWickRatio: number | null;
+  /** Realized volatility: stdev of per-observation simple returns, in %. Null when < 4 points. */
+  realizedVolPct: number | null;
+}
+
+const MAX_AGE_MS = 90 * 60 * 1000; // 90-minute rolling window
+const MAX_POINTS = 400;
+
+export class TokenTapeTracker {
+  private tapes = new Map<string, TapePoint[]>();
+
+  public record(mint: string, priceUsd: number, volume24hUsd: number, liquidityUsd: number): void {
+    if (!mint || !(priceUsd > 0)) return;
+    let tape = this.tapes.get(mint);
+    if (!tape) {
+      tape = [];
+      this.tapes.set(mint, tape);
+    }
+    const now = Date.now();
+    const last = tape[tape.length - 1];
+    // De-dupe: skip if same timestamp ms as last point (WS burst protection)
+    if (last && last.t === now) return;
+    tape.push({ t: now, priceUsd, volume24hUsd: Math.max(0, volume24hUsd || 0), liquidityUsd: Math.max(0, liquidityUsd || 0) });
+    // Prune by age and cap length
+    const cutoff = now - MAX_AGE_MS;
+    while (tape.length > 0 && tape[0].t < cutoff) tape.shift();
+    while (tape.length > MAX_POINTS) tape.shift();
+    // Opportunistic map hygiene: drop empty tapes
+    if (tape.length === 0) this.tapes.delete(mint);
+  }
+
+  public pointCount(mint: string): number {
+    return this.tapes.get(mint)?.length || 0;
+  }
+
+  private closestBefore(tape: TapePoint[], targetT: number): TapePoint | null {
+    let best: TapePoint | null = null;
+    for (const p of tape) {
+      if (p.t <= targetT) best = p;
+      else break;
+    }
+    return best;
+  }
+
+  public getFeatures(mint: string): TapeFeatures {
+    const tape = this.tapes.get(mint);
+    const empty: TapeFeatures = {
+      hasTape: false, points: 0, spanMinutes: 0, peakPriceUsd: 0,
+      drawdownFromPeakPct: 0, returnSinceLastPct: null,
+      return15mPct: null, return30mPct: null, intervalVolumeUsd: null,
+      upperWickRatio: null, realizedVolPct: null
+    };
+    if (!tape || tape.length === 0) return empty;
+
+    const now = Date.now();
+    const last = tape[tape.length - 1];
+    let peak = 0;
+    for (const p of tape) if (p.priceUsd > peak) peak = p.priceUsd;
+    const drawdownFromPeakPct = peak > 0 ? Math.max(0, ((peak - last.priceUsd) / peak) * 100) : 0;
+
+    let returnSinceLastPct: number | null = null;
+    let intervalVolumeUsd: number | null = null;
+    if (tape.length >= 2) {
+      const prev = tape[tape.length - 2];
+      if (prev.priceUsd > 0) {
+        returnSinceLastPct = ((last.priceUsd - prev.priceUsd) / prev.priceUsd) * 100;
+      }
+    }
+    // True interval flow: delta of 24h volume between the two most recent
+    // observations that actually carried volume data. WS ticks don't report
+    // volume (volume24hUsd = 0) — they are skipped, never treated as zero flow.
+    // (DexScreener 24h volume is a rolling sum; its delta ≈ volume in the interval.)
+    {
+      let a: TapePoint | null = null;
+      for (let i = tape.length - 1; i >= 0 && !a; i--) {
+        if (tape[i].volume24hUsd > 0) a = tape[i];
+      }
+      if (a) {
+        let b: TapePoint | null = null;
+        for (let i = tape.indexOf(a) - 1; i >= 0 && !b; i--) {
+          if (tape[i].volume24hUsd > 0) b = tape[i];
+        }
+        if (b && a.t > b.t) intervalVolumeUsd = Math.max(0, a.volume24hUsd - b.volume24hUsd);
+      }
+    }
+
+    const spanMinutes = (now - tape[0].t) / 60000;
+    let return15mPct: number | null = null;
+    let return30mPct: number | null = null;
+    if (spanMinutes >= 12) {
+      const ref = this.closestBefore(tape, now - 15 * 60 * 1000);
+      if (ref && ref.priceUsd > 0 && ref !== last) {
+        return15mPct = ((last.priceUsd - ref.priceUsd) / ref.priceUsd) * 100;
+      }
+    }
+    if (spanMinutes >= 25) {
+      const ref = this.closestBefore(tape, now - 30 * 60 * 1000);
+      if (ref && ref.priceUsd > 0 && ref !== last) {
+        return30mPct = ((last.priceUsd - ref.priceUsd) / ref.priceUsd) * 100;
+      }
+    }
+
+    return {
+      hasTape: true,
+      points: tape.length,
+      spanMinutes: Math.round(spanMinutes * 10) / 10,
+      peakPriceUsd: peak,
+      drawdownFromPeakPct: Math.round(drawdownFromPeakPct * 100) / 100,
+      returnSinceLastPct: returnSinceLastPct !== null ? Math.round(returnSinceLastPct * 100) / 100 : null,
+      return15mPct: return15mPct !== null ? Math.round(return15mPct * 100) / 100 : null,
+      return30mPct: return30mPct !== null ? Math.round(return30mPct * 100) / 100 : null,
+      intervalVolumeUsd: intervalVolumeUsd !== null ? Math.round(intervalVolumeUsd) : null,
+      upperWickRatio: computeWickRatio(tape, peak, last.priceUsd),
+      realizedVolPct: computeRealizedVol(tape)
+    };
+  }
+
+  /** Drop a token's tape (e.g. after position close — frees memory). */
+  public drop(mint: string): void {
+    this.tapes.delete(mint);
+  }
+
+  public size(): number {
+    return this.tapes.size;
+  }
+}
+
+/**
+ * Real upper-wick ratio over the tape window: (windowPeak - lastClose) / (lastClose - windowOpen).
+ * > 0.40 with a positive body = distribution into strength (dev/insider selling the top).
+ * Returns null when there is no measurable body — callers must SKIP the wick
+ * guard in that case, never invent a rejection.
+ */
+function computeWickRatio(tape: TapePoint[], peak: number, lastPrice: number): number | null {
+  if (tape.length < 3 || peak <= 0) return null;
+  const open = tape[0].priceUsd;
+  if (!(open > 0)) return null;
+  const body = lastPrice - open;
+  if (body <= 0) return null; // red/flat window: no "upper wick" concept
+  const wick = Math.max(0, peak - lastPrice);
+  return Math.round((wick / body) * 100) / 100;
+}
+
+/**
+ * Realized volatility from the tape: sample stdev of per-observation simple
+ * returns, in percent. Needs >= 4 points to be meaningful.
+ */
+function computeRealizedVol(tape: TapePoint[]): number | null {
+  if (tape.length < 4) return null;
+  const rets: number[] = [];
+  for (let i = 1; i < tape.length; i++) {
+    const prev = tape[i - 1].priceUsd;
+    const cur = tape[i].priceUsd;
+    if (prev > 0 && cur > 0) rets.push((cur - prev) / prev);
+  }
+  if (rets.length < 3) return null;
+  const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
+  const variance = rets.reduce((s, r) => s + (r - mean) * (r - mean), 0) / (rets.length - 1);
+  return Math.round(Math.sqrt(variance) * 100 * 100) / 100;
+}
+
+export const tokenTape = new TokenTapeTracker();
