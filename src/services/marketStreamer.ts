@@ -87,6 +87,20 @@ interface WsReconnectState {
 const WS_MAX_CONSECUTIVE_RESUB_FAILS = 15;
 const wsReconnectState: Map<string, WsReconnectState> = new Map();
 
+/**
+ * DRIBBLE-RESILIENCE (2026-09-30): the consecutive-fail counter above resets
+ * on ANY tick, so a nearly-dead subscription dribbling one tick every few
+ * minutes churns forever (observed: one mint hit subscription #2291). This
+ * second layer caps TOTAL re-subscribe attempts per mint in a rolling 1-hour
+ * window, regardless of dribble ticks. Exhausted budget => WS cooldown 1 jam;
+ * the 15s Raydium batch syncer keeps price data flowing meanwhile.
+ */
+const WS_MAX_RESUB_PER_HOUR = 20;
+const WS_RESUB_WINDOW_MS = 3_600_000;
+const WS_RESUB_COOLDOWN_MS = 3_600_000;
+const wsResubBudget: Map<string, { count: number; windowStart: number }> = new Map();
+const wsCooldownUntil: Map<string, number> = new Map();
+
 let isStreamerRunning = false;
 let pumpportalWs: WebSocket | null = null;
 let maintenanceTimer: NodeJS.Timeout | null = null;
@@ -205,6 +219,16 @@ function checkHeliusSubscriptionHealth(): void {
   for (const [mint, item] of watchlist.entries()) {
     if (item.subscriptionId === undefined) continue;
 
+    // DRIBBLE-RESILIENCE: skip mints on WS cooldown (budget exhausted).
+    // Batch syncer covers price data meanwhile; cooldown expires => fresh budget.
+    const cooldownUntil = wsCooldownUntil.get(mint);
+    if (cooldownUntil !== undefined) {
+      if (now < cooldownUntil) continue;
+      wsCooldownUntil.delete(mint);
+      wsResubBudget.delete(mint);
+      wsReconnectState.delete(mint);
+    }
+
     const silenceMs = now - item.lastTickAt;
     if (silenceMs < WS_DEAD_SUBSCRIPTION_MS) {
       // Healthy (or at least not provably dead) — reset its backoff.
@@ -247,6 +271,29 @@ function checkHeliusSubscriptionHealth(): void {
     // Next retry waits twice as long, capped at 30s.
     state.backoffMs = Math.min(WS_RECONNECT_MAX_BACKOFF_MS, state.backoffMs * 2);
     wsReconnectState.set(mint, state);
+
+    // DRIBBLE-RESILIENCE: every attempt costs budget, even if a dribble tick
+    // arrived since the last one (the consecutive-fail counter can't see it).
+    let budget = wsResubBudget.get(mint);
+    if (!budget || now - budget.windowStart >= WS_RESUB_WINDOW_MS) {
+      budget = { count: 0, windowStart: now };
+    }
+    budget.count++;
+    wsResubBudget.set(mint, budget);
+    if (budget.count > WS_MAX_RESUB_PER_HOUR) {
+      wsCooldownUntil.set(mint, now + WS_RESUB_COOLDOWN_MS);
+      wsReconnectState.delete(mint);
+      // Free the Helius-side subscription so the dead id stops billing.
+      // item.subscriptionId is intentionally kept: after cooldown expires the
+      // health check picks this mint up again with a fresh budget.
+      try {
+        wsConnection.removeAccountChangeListener(item.subscriptionId).catch(() => {});
+      } catch {}
+      console.warn(
+        `[MarketStreamer] 🛑 ${item.symbol}: ${budget.count}x re-subscribe dalam 1 jam (dribble-tick churn) — WS cooldown 1 jam, batch syncer tetap cover.`
+      );
+      continue;
+    }
 
     try {
       // removeAccountChangeListener is async; fire-and-forget the stale id.
