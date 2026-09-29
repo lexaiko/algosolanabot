@@ -41,6 +41,12 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
   priceChange5m: number;
   priceChange1h: number;
   pairAddress?: string;
+  /** 2026-09-30 (supervisor): which discovery feed first surfaced this mint.
+   *  'raydium_vol' | 'raydium_apr' | 'gecko_trending' | 'unknown'.
+   *  First-seen wins when a mint appears in multiple feeds. Used for
+   *  discovery-source attribution in the decision journal (which feed's
+   *  pool is toxic vs productive). */
+  source: string;
 }>> {
   const isExcluded = (mint: string) => {
     if (!mint) return true;
@@ -71,7 +77,13 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
     return false;
   };
 
-  const rawMints = new Set<string>();
+  // 2026-09-30 (supervisor): mint -> first-seen discovery source, for
+  // attribution. First-seen wins; fetch order = raydium_vol, raydium_apr,
+  // gecko_trending (priority order).
+  const rawMints = new Map<string, string>();
+  const tagMint = (mint: string, source: string) => {
+    if (!rawMints.has(mint)) rawMints.set(mint, source);
+  };
 
   // 1a. Raydium Official v3 Pools by 24h Volume (Pure on-chain DEX AMM leaders, ZERO keywords!)
   try {
@@ -81,8 +93,8 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
     });
     const pools = rayRes.data?.data?.data || [];
     for (const p of pools) {
-      if (p.mintA?.address && !isExcluded(p.mintA.address)) rawMints.add(p.mintA.address);
-      if (p.mintB?.address && !isExcluded(p.mintB.address)) rawMints.add(p.mintB.address);
+      if (p.mintA?.address && !isExcluded(p.mintA.address)) tagMint(p.mintA.address, 'raydium_vol');
+      if (p.mintB?.address && !isExcluded(p.mintB.address)) tagMint(p.mintB.address, 'raydium_vol');
     }
   } catch (err: any) {
     console.warn('[AlgoScanner] Raydium v3 pools unavailable:', err.message);
@@ -110,7 +122,7 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
         if (!m?.address || isExcluded(m.address)) continue;
         const tags: string[] = m.tags || [];
         if (tags.includes('hasTransferFee')) continue; // honeypot hygiene
-        rawMints.add(m.address);
+        tagMint(m.address, 'raydium_apr');
       }
     }
   } catch (err: any) {
@@ -137,7 +149,7 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
     for (const pool of geckoPools) {
       const baseId = pool.relationships?.base_token?.data?.id?.replace('solana_', '');
       if (baseId && !isExcluded(baseId)) {
-        rawMints.add(baseId);
+        tagMint(baseId, 'gecko_trending');
       }
     }
   } catch (err: any) {
@@ -148,7 +160,7 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
   // not track whale wallets and does no whale-follow; ingesting the queue as
   // candidates was a dead concept kept alive by habit.
 
-  const allCandidateMints = Array.from(rawMints);
+  const allCandidateMints = Array.from(rawMints.keys());
   if (allCandidateMints.length === 0) return [];
 
   // Batch query DexScreener in 3 parallel chunks of 30 (up to 90 candidate tokens analyzed!
@@ -172,6 +184,7 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
     priceChange5m: number;
     priceChange1h: number;
     pairAddress?: string;
+    source: string;
   }> = [];
 
   for (const mint of allCandidateMints) {
@@ -193,7 +206,8 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
         volume5m: vol5m,
         priceChange5m: ret5m,
         priceChange1h: ret1h,
-        pairAddress: m.pairAddress
+        pairAddress: m.pairAddress,
+        source: rawMints.get(mint) || 'unknown'
       });
     }
   }
@@ -256,6 +270,9 @@ export interface ScannedCandidate {
   volume5mUsd?: number;
   regime: string;
   entryMode?: 'PULLBACK_ABSORPTION' | 'MOMENTUM_CONTINUATION';
+  /** 2026-09-30 (supervisor): first-seen discovery feed for this mint
+   *  ('raydium_vol' | 'raydium_apr' | 'gecko_trending' | 'unknown'). */
+  discoverySource?: string;
   /** M4: decision-journal id of the EVALUATED log, passed to executeBuyToken
    *  so the fill (or rejection) can mark it EXECUTED / FAILED. */
   decisionId?: string;
@@ -726,6 +743,7 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
         volume5mUsd,
         regime: vector.regime,
         entryMode: entryDecision.entryMode,
+        discoverySource: item.source,
         decisionId
       });
 
@@ -748,7 +766,8 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
           rejectionReasons: isPassed ? ['VERDICT_PASS_AWAITING_FILL'] : [rejectReason || 'UNKNOWN'],
           featuresSnapshot: vector,
           regime: vector.regime,
-          strategyName: signals.map(s => s.strategyName).join('+') || 'NONE'
+          strategyName: signals.map(s => s.strategyName).join('+') || 'NONE',
+          discoverySource: item.source
         });
         decisionId = rec.decisionId;
       } catch {}

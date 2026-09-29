@@ -118,6 +118,8 @@ export class SqliteStorageRepository implements IStorageRepository {
     if (!djColNames.has('verdict')) this.db.exec("ALTER TABLE decision_journal ADD COLUMN verdict TEXT;");
     if (!djColNames.has('position_id')) this.db.exec("ALTER TABLE decision_journal ADD COLUMN position_id INTEGER;");
     if (!djColNames.has('executed_at')) this.db.exec("ALTER TABLE decision_journal ADD COLUMN executed_at TEXT;");
+    // 2026-09-30 (supervisor): discovery-source attribution for the journal.
+    if (!djColNames.has('discovery_source')) this.db.exec("ALTER TABLE decision_journal ADD COLUMN discovery_source TEXT;");
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS orders (
@@ -368,8 +370,9 @@ export class SqliteStorageRepository implements IStorageRepository {
     const stmt = this.db.prepare(`
       INSERT INTO decision_journal (
         decision_id, token_address, token_symbol, decision, verdict, composite_score,
-        strategy_name, regime, allocated_sol, rejection_reasons, feature_vector, decided_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        strategy_name, regime, allocated_sol, rejection_reasons, feature_vector, decided_at,
+        discovery_source
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     stmt.run(
       entry.decisionId,
@@ -383,7 +386,8 @@ export class SqliteStorageRepository implements IStorageRepository {
       entry.allocatedSol,
       entry.rejectionReasons ? JSON.stringify(entry.rejectionReasons) : null,
       JSON.stringify(entry.featuresSnapshot),
-      entry.decidedAt
+      entry.decidedAt,
+      entry.discoverySource ?? null
     );
   }
 

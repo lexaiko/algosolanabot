@@ -280,6 +280,9 @@ export interface DecisionJournalRecord {
   strategyName: string;
   allocatedSol: number;
   decidedAt: string;
+  /** 2026-09-30 (supervisor): first-seen discovery feed
+   *  ('raydium_vol' | 'raydium_apr' | 'gecko_trending' | 'unknown'). */
+  discoverySource?: string;
   counterfactualReturn15m?: number;
   counterfactualReturn1h?: number;
   counterfactualReturn4h?: number;

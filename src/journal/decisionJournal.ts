@@ -23,6 +23,8 @@ export class DecisionJournal {
     regime: MarketRegimeType;
     strategyName: string;
     allocatedSol?: number;
+    /** 2026-09-30 (supervisor): first-seen discovery feed. */
+    discoverySource?: string;
   }): Promise<DecisionJournalRecord> {
     const record: DecisionJournalRecord = {
       decisionId: `DEC_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`,
@@ -36,7 +38,8 @@ export class DecisionJournal {
       regime: params.regime,
       strategyName: params.strategyName,
       allocatedSol: params.allocatedSol || 0,
-      decidedAt: new Date().toISOString()
+      decidedAt: new Date().toISOString(),
+      discoverySource: params.discoverySource
     };
 
     await this.storage.recordDecision(record);
