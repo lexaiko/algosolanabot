@@ -8,6 +8,17 @@ const dbPath = path.resolve(process.cwd(), 'tradingbot.db');
 export const db = new DatabaseSync(dbPath);
 
 export function initDatabase() {
+  // O-01 (2026-09-29): two watchdog-triggered instances could share this file.
+  // WAL + busy_timeout makes concurrent access degrade to waiting instead of
+  // SQLITE_BUSY crashes. (The singleton PID guard in index.ts and the atomic
+  // flock in the watchdog cron are the primary double-start defenses; this is
+  // the last-resort data-integrity layer.)
+  try { db.exec('PRAGMA journal_mode=WAL;'); } catch (e: any) {
+    console.error('[DB] Failed to enable WAL mode:', e?.message || e);
+  }
+  try { db.exec('PRAGMA busy_timeout=5000;'); } catch (e: any) {
+    console.error('[DB] Failed to set busy_timeout:', e?.message || e);
+  }
   db.exec(`
     CREATE TABLE IF NOT EXISTS paper_wallet (
       id INTEGER PRIMARY KEY,
@@ -110,6 +121,19 @@ export function initDatabase() {
       reason TEXT,
       blacklisted_at TEXT NOT NULL
     );
+
+    -- O-09 (2026-09-29): persistent outbox for critical alerts. sendAdminAlert
+    -- enqueues here when the direct Telegram send fails; a flusher retries
+    -- with backoff so circuit-breaker / emergency / fatal alerts are never
+    -- lost silently. Rows are marked sent (never deleted) for auditability.
+    CREATE TABLE IF NOT EXISTS alert_outbox (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      message TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      attempts INTEGER DEFAULT 0,
+      last_error TEXT,
+      sent_at TEXT
+    );
   `);
 
   // Migrations for existing DB instances
@@ -186,9 +210,32 @@ export function getPaperBalance(): number {
   return row ? row.balance_sol : CONFIG.INITIAL_PAPER_BALANCE_SOL;
 }
 
+// m-7/F-13 (2026-09-29): the old Math.max(0, ...) clamp hid accounting bugs
+// (double-debit etc.) by silently pinning the wallet at 0. A clamp now screams:
+// console.error + an optional alert handler (wired to Telegram by tradeManager).
+export interface BalanceClampInfo {
+  attempted: number;
+  clampedTo: number;
+  /** negative: the SOL that vanished into the clamp */
+  hiddenDelta: number;
+}
+let balanceClampHandler: ((info: BalanceClampInfo) => void) | null = null;
+export function setBalanceClampAlertHandler(fn: ((info: BalanceClampInfo) => void) | null) {
+  balanceClampHandler = fn;
+}
+
 export function updatePaperBalance(amountDelta: number): number {
   const current = getPaperBalance();
-  const newBalance = Math.max(0, current + amountDelta);
+  const raw = current + amountDelta;
+  const newBalance = Math.max(0, raw);
+  if (newBalance !== raw) {
+    const hiddenDelta = raw - newBalance;
+    console.error(
+      `[DB] 🚨 BALANCE CLAMP: ${current.toFixed(4)} + (${amountDelta.toFixed(4)}) = ${raw.toFixed(4)} < 0 -> clamped to 0. ` +
+      `Hidden delta ${hiddenDelta.toFixed(4)} SOL. Possible double-debit/accounting bug — reconcile vs trade_history.`
+    );
+    try { balanceClampHandler?.({ attempted: raw, clampedTo: newBalance, hiddenDelta }); } catch {}
+  }
   db.prepare('UPDATE paper_wallet SET balance_sol = ?, updated_at = ? WHERE id = 1').run(
     newBalance,
     new Date().toISOString()
@@ -601,13 +648,21 @@ export function getLastClosedPosition(tokenAddress: string): Position | undefine
 
 export function getConsecutiveAlgoLosses(): number {
   try {
-    const rows = db.prepare("SELECT pnl_pct FROM positions WHERE status = 'CLOSED' ORDER BY id DESC LIMIT 10").all() as { pnl_pct: number }[];
+    // M-5 (2026-09-29): NET unification. The old query read pnl_pct (gross
+    // price return) from positions — a +0.5% gross / -2.5% net trade counted as
+    // a WIN and reset the anti-martingale streak, leaving sizing at full
+    // conviction through a net-loss bleed. Streaks now count closed sells with
+    // net_pnl_sol <= 0 as losses. One definition of win/loss = NET, everywhere.
+    const rows = db.prepare(`
+      SELECT COALESCE(net_pnl_sol, pnl_sol) AS netPnl
+      FROM trade_history WHERE action = 'SELL' ORDER BY id DESC LIMIT 10
+    `).all() as { netPnl: number }[];
     let streak = 0;
     for (const r of rows) {
-      if (r.pnl_pct <= 0) {
+      if ((r.netPnl ?? 0) <= 0) {
         streak++;
       } else {
-        break; // Streak broken by a winning trade!
+        break; // Streak broken by a net-winning trade!
       }
     }
     return streak;
@@ -759,10 +814,11 @@ export function halfClosePosition(
 }
 
 export function closePosition(
-  id: number, 
-  exitPriceUsd: number, 
-  exitSol: number, 
-  reason: string
+  id: number,
+  exitPriceUsd: number,
+  exitSol: number,
+  reason: string,
+  sellNetworkFeeSol?: number
 ): Position | undefined {
   const pos = getPositionById(id);
   if (!pos || pos.status !== 'OPEN') return undefined;
@@ -770,8 +826,16 @@ export function closePosition(
   const now = new Date().toISOString();
   const pnlPct = ((exitPriceUsd - pos.entry_price_usd) / pos.entry_price_usd) * 100;
   const pnlSol = exitSol - pos.entry_sol;
-  const sellFee = CONFIG.ESTIMATED_SELL_FEE_SOL;
-  const netPnlSol = pnlSol - sellFee;
+  // F-07 (2026-09-29): ONE FEE BOOK. exitSol comes from the simulator's netSol,
+  // which is ALREADY net of sell-side DEX + network fees — the old code
+  // subtracted CONFIG.ESTIMATED_SELL_FEE_SOL a second time (~0.00025 SOL/trade,
+  // conservative direction). True round-trip net = pnlSol minus the buy-side
+  // fee (same CONFIG estimate the BUY history row recorded, so both legs agree).
+  // Paper-balance reconciliation: balance was debited the ACTUAL buy fee at
+  // entry; the residual vs this estimate is ~0.0001 SOL noise, documented.
+  const buyFee = CONFIG.ESTIMATED_BUY_FEE_SOL;
+  const sellFee = sellNetworkFeeSol ?? CONFIG.ESTIMATED_SELL_FEE_SOL;
+  const netPnlSol = pnlSol - buyFee;
   const pnlUsd = (pos.amount_tokens * exitPriceUsd) - (pos.amount_tokens * pos.entry_price_usd);
 
   db.prepare(`
@@ -831,19 +895,36 @@ export function getTradingStats() {
  * QUANT-04: Empirical Kelly statistics from closed positions.
  * Returns sample count, win rate (0-1) and payoff ratio (avgWinPct / avgLossPct)
  * used by the dynamic sizer for Bayesian empirical-Kelly position sizing.
+ *
+ * F-04 (2026-09-29): computed from trade_history.net_pnl_sol — TRUE NET of
+ * fees (sell-side net from the simulator, minus buy-side fee estimate). The
+ * old code read positions.pnl_pct, which is pure price return GROSS of the
+ * ~2.9-3.7% round-trip fee — feeding Kelly systematically optimistic stats
+ * and oversizing every position. Denominator is deployed capital (entry +
+ * buy fee); a trade that is +0.5% gross but -2.4% net is a LOSS here.
  */
 export function getEmpiricalKellyStats(): { n: number; winRate: number; payoff: number } {
   try {
     const rows = db.prepare(`
-      SELECT pnl_pct FROM positions WHERE status = 'CLOSED' AND pnl_pct IS NOT NULL
-    `).all() as Array<{ pnl_pct: number }>;
+      SELECT th.net_pnl_sol AS netPnlSol, th.pnl_sol AS pnlSol, p.entry_sol AS entrySol
+      FROM trade_history th
+      JOIN positions p ON p.id = th.position_id
+      WHERE th.action = 'SELL' AND p.status = 'CLOSED'
+    `).all() as Array<{ netPnlSol: number; pnlSol: number; entrySol: number }>;
     const n = rows.length;
     if (n === 0) return { n: 0, winRate: 0, payoff: 0 };
-    const wins = rows.filter(r => r.pnl_pct > 0);
-    const losses = rows.filter(r => r.pnl_pct <= 0);
+    const netPcts = rows.map(r => {
+      const netPnl = (r.netPnlSol !== undefined && r.netPnlSol !== null && r.netPnlSol !== 0)
+        ? r.netPnlSol
+        : (r.pnlSol || 0) - CONFIG.ESTIMATED_BUY_FEE_SOL;
+      const deployed = (r.entrySol || 0) + CONFIG.ESTIMATED_BUY_FEE_SOL;
+      return deployed > 0 ? (netPnl / deployed) * 100 : 0;
+    });
+    const wins = netPcts.filter(p => p > 0);
+    const losses = netPcts.filter(p => p <= 0);
     const winRate = wins.length / n;
-    const avgWin = wins.length ? wins.reduce((s, r) => s + r.pnl_pct, 0) / wins.length : 0;
-    const avgLoss = losses.length ? Math.abs(losses.reduce((s, r) => s + r.pnl_pct, 0) / losses.length) : 10;
+    const avgWin = wins.length ? wins.reduce((s, p) => s + p, 0) / wins.length : 0;
+    const avgLoss = losses.length ? Math.abs(losses.reduce((s, p) => s + p, 0) / losses.length) : 10;
     const payoff = avgLoss > 0 ? avgWin / avgLoss : 0;
     return { n, winRate, payoff };
   } catch {
@@ -879,10 +960,22 @@ export function resetCircuitBreaker() {
 export function getDailyStopLossCount(): number {
   try {
     const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    // F-03 (2026-09-29): the old query counted only reasons containing "SL",
+    // so a bloody day of VELOCITY_DUMP_RESCUE / FLASH_EXIT / ZOMBIE exits never
+    // tripped the 3-loss halt. Count LOSSES across the whole forced-exit
+    // family instead — a fast -14% dump rescue is a stop-loss whether or not
+    // the reason string contains the letters "SL".
+    // m-8 (2026-09-29): NET unification — count net_pnl_sol < 0, not gross
+    // pnl_sol. A trade that is +0.0001 gross but net-negative IS a loss for
+    // the daily kill-switch. One definition of win/loss = NET, everywhere.
     const row = db.prepare(`
-      SELECT COUNT(*) as count 
-      FROM trade_history 
-      WHERE action = 'SELL' AND (reason LIKE '%SL%' OR reason LIKE '%STOP_LOSS%') AND timestamp >= ?
+      SELECT COUNT(*) as count
+      FROM trade_history
+      WHERE action = 'SELL' AND net_pnl_sol < 0 AND timestamp >= ?
+        AND (reason LIKE '%SL%' OR reason LIKE '%STOP_LOSS%'
+             OR reason LIKE '%VELOCITY_DUMP%' OR reason LIKE '%FLASH_EXIT%'
+             OR reason LIKE '%ZOMBIE%' OR reason LIKE '%TIME_STOP%'
+             OR reason LIKE '%MAX_HOLD%')
     `).get(cutoff) as { count: number } | undefined;
     return row?.count || 0;
   } catch {
@@ -909,37 +1002,35 @@ export function getDailyRealizedPnl(): {
       ORDER BY pnl_sol DESC
     `).all(cutoff) as Array<{ token_symbol: string; pnl_sol: number; pnl_pct: number; fee_sol: number; net_pnl_sol: number }>;
 
-    // Also get all fees from BUYs in last 24h
-    const buyFeesRow = db.prepare(`
-      SELECT SUM(fee_sol) as total_buy_fees FROM trade_history
-      WHERE action = 'BUY' AND timestamp >= ?
-    `).get(cutoff) as { total_buy_fees: number } | undefined;
-
-    const totalBuyFees = buyFeesRow?.total_buy_fees || 0;
-    const totalSellFees = rows.reduce((acc, r) => acc + (r.fee_sol || CONFIG.ESTIMATED_SELL_FEE_SOL), 0);
-    const totalFeesSol = totalBuyFees + totalSellFees;
+    // F-07 (2026-09-29): ONE FEE BOOK. trade_history.net_pnl_sol is already the
+    // true round-trip net (sell-side net from the simulator, minus buy-side fee
+    // estimate) — the old code subtracted sell+buy fees AGAIN on top of pnl_sol
+    // that was already net of sell-side fees. Sum the column directly.
+    // Legacy rows recorded under the old formula (net of sell fee only) are
+    // used as-is; the residual is ~0.0001 SOL/trade — immaterial.
+    const netOf = (r: { pnl_sol: number; net_pnl_sol: number }) =>
+      (r.net_pnl_sol !== undefined && r.net_pnl_sol !== null && r.net_pnl_sol !== 0)
+        ? r.net_pnl_sol
+        : (r.pnl_sol || 0) - CONFIG.ESTIMATED_BUY_FEE_SOL;
 
     const totalTrades = rows.length;
-    const winTrades = rows.filter(r => (r.pnl_pct || 0) > 0).length;
-    const lossTrades = rows.filter(r => (r.pnl_pct || 0) <= 0).length;
+    const winTrades = rows.filter(r => netOf(r) > 0).length;
+    const lossTrades = rows.filter(r => netOf(r) <= 0).length;
     const grossPnlSol = rows.reduce((acc, r) => acc + (r.pnl_sol || 0), 0);
-    const netPnlSol = grossPnlSol - totalFeesSol;
+    const netPnlSol = rows.reduce((acc, r) => acc + netOf(r), 0);
+    const totalFeesSol = rows.reduce((acc, r) => acc + (r.fee_sol || CONFIG.ESTIMATED_SELL_FEE_SOL), 0) + CONFIG.ESTIMATED_BUY_FEE_SOL * totalTrades;
     const winRate = totalTrades > 0 ? ((winTrades / totalTrades) * 100).toFixed(1) : '0';
 
     const bestTrade = rows.length > 0 ? {
       symbol: rows[0].token_symbol,
       pnlPct: rows[0].pnl_pct,
-      netPnlSol: (rows[0].net_pnl_sol !== undefined && rows[0].net_pnl_sol !== null && rows[0].net_pnl_sol !== 0)
-        ? rows[0].net_pnl_sol
-        : (rows[0].pnl_sol - CONFIG.ESTIMATED_SELL_FEE_SOL)
+      netPnlSol: netOf(rows[0])
     } : undefined;
 
     const worstTrade = rows.length > 0 ? {
       symbol: rows[rows.length - 1].token_symbol,
       pnlPct: rows[rows.length - 1].pnl_pct,
-      netPnlSol: (rows[rows.length - 1].net_pnl_sol !== undefined && rows[rows.length - 1].net_pnl_sol !== null && rows[rows.length - 1].net_pnl_sol !== 0)
-        ? rows[rows.length - 1].net_pnl_sol
-        : (rows[rows.length - 1].pnl_sol - CONFIG.ESTIMATED_SELL_FEE_SOL)
+      netPnlSol: netOf(rows[rows.length - 1])
     } : undefined;
 
     return { totalTrades, winTrades, lossTrades, grossPnlSol, totalFeesSol, netPnlSol, winRate, bestTrade, worstTrade };

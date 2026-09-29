@@ -29,14 +29,26 @@ export interface TapeFeatures {
   peakPriceUsd: number;
   /** Real drawdown vs rolling-window peak, % */
   drawdownFromPeakPct: number;
-  /** Momentum vs previous observation, % (null when < 2 points) */
+  /** Momentum vs previous observation, % (null when < 2 points).
+   *  M2 (2026-09-29): this is the return over `minutesSincePrevPoint` minutes —
+   *  NOT a 1-minute return. Consumers MUST divide by minutesSincePrevPoint
+   *  (see tapeReturnPerMinutePct) before comparing against per-minute bars. */
   returnSinceLastPct: number | null;
+  /** Minutes between the last two tape points (null when < 2 points).
+   *  M2: the denominator that turns returnSinceLastPct into a per-minute rate. */
+  minutesSincePrevPoint: number | null;
   /** Return vs observation closest to 15 min ago (null when tape < ~12 min) */
   return15mPct: number | null;
   /** Return vs observation closest to 30 min ago (null when tape < ~25 min) */
   return30mPct: number | null;
-  /** True interval volume = delta of 24h volume since last observation (null when < 2 points) */
+  /** True interval volume = delta of 24h volume since last observation (null when < 2 points).
+   *  M1 (2026-09-29): this delta spans `minutesBetweenVolumePoints` minutes —
+   *  NOT 5 minutes. Consumers MUST normalize to a 5-minute equivalent
+   *  (see tapeVolume5mNormalized) before annualizing against an hourly baseline. */
   intervalVolumeUsd: number | null;
+  /** Minutes between the two volume-carrying observations behind
+   *  intervalVolumeUsd (null when unavailable). M1: the normalization denominator. */
+  minutesBetweenVolumePoints: number | null;
   /** Real upper-wick ratio over the tape window: (peak - last) / (last - first). Null when no body. */
   upperWickRatio: number | null;
   /** Realized volatility: stdev of per-observation simple returns, in %. Null when < 4 points. */
@@ -86,8 +98,9 @@ export class TokenTapeTracker {
     const tape = this.tapes.get(mint);
     const empty: TapeFeatures = {
       hasTape: false, points: 0, spanMinutes: 0, peakPriceUsd: 0,
-      drawdownFromPeakPct: 0, returnSinceLastPct: null,
+      drawdownFromPeakPct: 0, returnSinceLastPct: null, minutesSincePrevPoint: null,
       return15mPct: null, return30mPct: null, intervalVolumeUsd: null,
+      minutesBetweenVolumePoints: null,
       upperWickRatio: null, realizedVolPct: null
     };
     if (!tape || tape.length === 0) return empty;
@@ -99,12 +112,17 @@ export class TokenTapeTracker {
     const drawdownFromPeakPct = peak > 0 ? Math.max(0, ((peak - last.priceUsd) / peak) * 100) : 0;
 
     let returnSinceLastPct: number | null = null;
+    let minutesSincePrevPoint: number | null = null;
     let intervalVolumeUsd: number | null = null;
+    let minutesBetweenVolumePoints: number | null = null;
     if (tape.length >= 2) {
       const prev = tape[tape.length - 2];
       if (prev.priceUsd > 0) {
         returnSinceLastPct = ((last.priceUsd - prev.priceUsd) / prev.priceUsd) * 100;
       }
+      // M2: always record the elapsed time behind the return, even when the
+      // return itself is uncomputable — consumers fail closed on missing data.
+      if (last.t > prev.t) minutesSincePrevPoint = (last.t - prev.t) / 60000;
     }
     // True interval flow: delta of 24h volume between the two most recent
     // observations that actually carried volume data. WS ticks don't report
@@ -120,7 +138,13 @@ export class TokenTapeTracker {
         for (let i = tape.indexOf(a) - 1; i >= 0 && !b; i--) {
           if (tape[i].volume24hUsd > 0) b = tape[i];
         }
-        if (b && a.t > b.t) intervalVolumeUsd = Math.max(0, a.volume24hUsd - b.volume24hUsd);
+        if (b && a.t > b.t) {
+          intervalVolumeUsd = Math.max(0, a.volume24hUsd - b.volume24hUsd);
+          // M1: the elapsed minutes behind the delta — the 5-minute
+          // normalization denominator. Without it the delta was mislabeled
+          // as 5-minute volume and annualized x12 (2x inflated on 10m scans).
+          minutesBetweenVolumePoints = (a.t - b.t) / 60000;
+        }
       }
     }
 
@@ -147,9 +171,11 @@ export class TokenTapeTracker {
       peakPriceUsd: peak,
       drawdownFromPeakPct: Math.round(drawdownFromPeakPct * 100) / 100,
       returnSinceLastPct: returnSinceLastPct !== null ? Math.round(returnSinceLastPct * 100) / 100 : null,
+      minutesSincePrevPoint: minutesSincePrevPoint !== null ? Math.round(minutesSincePrevPoint * 100) / 100 : null,
       return15mPct: return15mPct !== null ? Math.round(return15mPct * 100) / 100 : null,
       return30mPct: return30mPct !== null ? Math.round(return30mPct * 100) / 100 : null,
       intervalVolumeUsd: intervalVolumeUsd !== null ? Math.round(intervalVolumeUsd) : null,
+      minutesBetweenVolumePoints: minutesBetweenVolumePoints !== null ? Math.round(minutesBetweenVolumePoints * 100) / 100 : null,
       upperWickRatio: computeWickRatio(tape, peak, last.priceUsd),
       realizedVolPct: computeRealizedVol(tape)
     };
@@ -158,6 +184,27 @@ export class TokenTapeTracker {
   /** Drop a token's tape (e.g. after position close — frees memory). */
   public drop(mint: string): void {
     this.tapes.delete(mint);
+  }
+
+  /**
+   * Price of the tape point closest to targetMs, or null when no point falls
+   * within toleranceMs. Used by the counterfactual tracker to recover honest
+   * decision-time and horizon prices from real observations — never invented.
+   */
+  public priceClosestTo(mint: string, targetMs: number, toleranceMs: number): number | null {
+    const tape = this.tapes.get(mint);
+    if (!tape || tape.length === 0) return null;
+    let best: TapePoint | null = null;
+    let bestDist = Infinity;
+    for (const p of tape) {
+      const dist = Math.abs(p.t - targetMs);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = p;
+      }
+    }
+    if (!best || bestDist > toleranceMs || !(best.priceUsd > 0)) return null;
+    return best.priceUsd;
   }
 
   public size(): number {
@@ -200,3 +247,36 @@ function computeRealizedVol(tape: TapePoint[]): number | null {
 }
 
 export const tokenTape = new TokenTapeTracker();
+
+/**
+ * M1 (2026-09-29): normalize the tape's interval volume to a 5-minute
+ * equivalent using the ACTUAL elapsed minutes between the two volume-carrying
+ * observations. Returns null when the tape cannot measure it — callers fail
+ * closed (C4), never annualize an un-normalized delta.
+ */
+export function tapeVolume5mNormalized(tape: TapeFeatures): number | null {
+  if (
+    tape.intervalVolumeUsd === null ||
+    tape.minutesBetweenVolumePoints === null ||
+    tape.minutesBetweenVolumePoints <= 0
+  ) {
+    return null;
+  }
+  return Math.round(tape.intervalVolumeUsd * (5 / tape.minutesBetweenVolumePoints));
+}
+
+/**
+ * M2 (2026-09-29): per-minute rebound rate (%/min) = returnSinceLastPct divided
+ * by the ACTUAL minutes since the previous tape point. Returns null when
+ * unmeasurable — R4 fails closed (reject) on null.
+ */
+export function tapeReturnPerMinutePct(tape: TapeFeatures): number | null {
+  if (
+    tape.returnSinceLastPct === null ||
+    tape.minutesSincePrevPoint === null ||
+    tape.minutesSincePrevPoint <= 0
+  ) {
+    return null;
+  }
+  return Math.round((tape.returnSinceLastPct / tape.minutesSincePrevPoint) * 100) / 100;
+}

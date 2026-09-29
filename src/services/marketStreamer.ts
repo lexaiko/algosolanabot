@@ -384,7 +384,9 @@ async function handleRaydiumPoolUpdate(tokenMint: string, data: Buffer) {
         item.priceHistory.push({
           timestamp: now,
           priceUsd: market.priceUsd,
-          solLiquidity: market.liquidityUsd / 180
+          // O-19: never divide by a hardcoded SOL price again — use the
+          // cached live price (falls back to 180 only if never observed).
+          solLiquidity: market.liquidityUsd / (cachedSolPriceUsd > 0 ? cachedSolPriceUsd : 180)
         });
 
         const cutoff = now - TICK_HISTORY_WINDOW_MS;
@@ -392,7 +394,10 @@ async function handleRaydiumPoolUpdate(tokenMint: string, data: Buffer) {
           item.priceHistory.shift();
         }
 
-        await evaluateWatchlistCandidateOnTick(item, { complete: true, realSolReserves: 85 * 1e9 });
+        // O-19: { complete: true } already skips curve-progress gating, so
+        // pass NO fabricated realSolReserves (the old 85*1e9 = "100% curve"
+        // was invented data that only looked measured).
+        await evaluateWatchlistCandidateOnTick(item, { complete: true });
       }
     } catch {}
   }
@@ -423,7 +428,10 @@ async function evaluateWatchlistCandidateOnTick(item: WatchedCandidate, curveSta
   if (priceChangePct < 2.0) return;
 
   // Check bonding curve progress (Sweet spot: 20% - 90%)
-  const realSol = Number(curveState.realSolReserves) / 1e9;
+  // O-19: realSolReserves may be absent for migrated (Raydium) pools — NaN
+  // fails every comparison below, so an unknown curve never rejects a token
+  // on fabricated data. complete=true pools skip this gate entirely.
+  const realSol = curveState.realSolReserves != null ? Number(curveState.realSolReserves) / 1e9 : NaN;
   const curveProgressPct = Math.min(100, Math.max(0, (realSol / 85.0) * 100));
   if (!curveState.complete && (curveProgressPct < 15.0 || curveProgressPct > 92.0)) {
     return;
@@ -469,10 +477,14 @@ async function evaluateWatchlistCandidateOnTick(item: WatchedCandidate, curveSta
 
   const liquidityUsd = realMarketData.liquidityUsd || item.lastLiquidityUsd || 0;
   const realVol5mUsd = realMarketData.volume5m || 0;
-  const vol1hUsd = realMarketData.volume1h || ((realMarketData.volume24h || 0) / 24);
+  // C4 FIX (2026-09-29): dropped the `volume24h/24` linear-extrapolation fabrication.
+  // When the 1h baseline is missing, rvol5m falls back to the REAL tick-velocity
+  // proxy below — never a synthesized baseline.
+  const vol1hUsd: number | undefined = realMarketData.volume1h;
   const volume24hUsd = realMarketData.volume24h || 0;
-  const buys5m = realMarketData.txns5mBuys || 0;
-  const sells5m = realMarketData.txns5mSells || 0;
+  const txnsUnknown = realMarketData.txns5mBuys === undefined || realMarketData.txns5mSells === undefined;
+  const buys5m = realMarketData.txns5mBuys ?? 0;
+  const sells5m = realMarketData.txns5mSells ?? 0;
   const tradeCount5m = buys5m + sells5m;
 
   // 1. INSTITUTIONAL LIQUIDITY FLOOR: Reject pools with < $25,000 liquidity (Prevents slippage death & micro-cap rugs)
@@ -486,33 +498,42 @@ async function evaluateWatchlistCandidateOnTick(item: WatchedCandidate, curveSta
     return;
   }
 
-  // 3. ORDER FLOW DOMINANCE: Must have genuine buy dominance with sufficient trade count
-  const realBuySellRatio = sells5m > 0 ? (buys5m / sells5m) : (buys5m >= 8 ? 2.5 : 1.0);
-  if (realBuySellRatio < 1.35) {
+  // 3. ORDER FLOW DOMINANCE: Must have genuine buy dominance with sufficient trade count.
+  // C3 FIX (2026-09-29): ONE honest rule — the old code invented 2.5 here when
+  // sells==0 (3.0 on the scanner path, 2.0 in the Telegram reason), tuned to PASS
+  // this gate. Now the ratio is UNDEFINED on zero-sell/unknown and the dominance
+  // question is answered by flowImbalance (honest) instead of an invented number.
+  const realBuySellRatio: number | undefined = (!txnsUnknown && sells5m > 0) ? (buys5m / sells5m) : undefined;
+  const realFlowImbalance = tradeCount5m > 0 ? (buys5m - sells5m) / tradeCount5m : 0;
+  if (realBuySellRatio === undefined ? realFlowImbalance < 0.5 : realBuySellRatio < 1.35) {
     return;
   }
 
-  // 4. REAL DYNAMIC PRICE IMPACT: Never enter if our order causes > 1.5% pool impact
-  const buyAmountUsd = (CONFIG.DEFAULT_BUY_AMOUNT_SOL || 0.05) * 180;
+  // 4. REAL DYNAMIC PRICE IMPACT: Never enter if our order causes > 1.5% pool impact.
+  // M2 FIX (2026-09-29): use the live cached SOL price, not a stale $180 literal.
+  const buyAmountUsd = (CONFIG.DEFAULT_BUY_AMOUNT_SOL || 0.05) * cachedSolPriceUsd;
   const estImpactPct = liquidityUsd > 0 ? (buyAmountUsd / (liquidityUsd * 0.5)) * 100 : 99;
   if (estImpactPct > 1.5) {
     return;
   }
 
   const tickVelocity = item.tickCount;
-  const realFlowImbalance = tradeCount5m > 0 ? (buys5m - sells5m) / tradeCount5m : 0;
-  const rvol5m = vol1hUsd > 0 ? Math.min(10.0, Math.max(1.0, (realVol5mUsd * 12) / vol1hUsd)) : Math.min(10.0, Math.max(1.0, tickVelocity / 4.0));
+  // (realFlowImbalance declared once above at gate 3 — C3 fix.)
+  const rvol5m = vol1hUsd !== undefined && vol1hUsd > 0 ? Math.min(10.0, Math.max(1.0, (realVol5mUsd * 12) / vol1hUsd)) : Math.min(10.0, Math.max(1.0, tickVelocity / 4.0));
   const effectiveRet5m = realMarketData.priceChange5m ?? priceChangePct;
   const realizedVol = Math.max(4.0, Math.abs(effectiveRet5m) * 1.3);
 
   // Honest buy-pressure estimation (2026-09-29): derived from the real
   // aggregate buy/sell counts in this 5m window. Not whale-wallet tracking.
   const avgTradeSizeUsd = tradeCount5m > 0 ? realVol5mUsd / tradeCount5m : 80;
-  const wsNetBuyFlowSolEst = realBuySellRatio >= 1.5
+  // C3: flow estimates from MEASURED dominance only — never an invented ratio.
+  const wsNetBuyFlowSolEst = (realBuySellRatio !== undefined && realBuySellRatio >= 1.5)
     ? Math.round(Math.max(0, buys5m - sells5m) * (avgTradeSizeUsd / cachedSolPriceUsd) * 10) / 10
     : undefined;
   const wsBuyPressureScore = tradeCount5m >= 8
-    ? (realBuySellRatio >= 1.8 ? 90 : (realBuySellRatio >= 1.3 ? 75 : 45))
+    ? (realBuySellRatio !== undefined
+        ? (realBuySellRatio >= 1.8 ? 90 : (realBuySellRatio >= 1.3 ? 75 : 45))
+        : (realFlowImbalance >= 0.6 ? 90 : (realFlowImbalance >= 0.3 ? 75 : 45)))
     : undefined;
   const wsTape = tokenTape.getFeatures(item.tokenMint);
 
@@ -521,6 +542,7 @@ async function evaluateWatchlistCandidateOnTick(item: WatchedCandidate, curveSta
     tokenId: item.tokenMint,
     timestampMs: now,
     timeframe: '5m',
+    priceUsd: currentPrice,
     return1m,
     return5m: effectiveRet5m,
     // Honest 15m: tape-measured when mature, else unknown. Never synthesized.
@@ -680,13 +702,15 @@ export async function startMarketStreamer() {
           item.priceHistory.push({
             timestamp: now,
             priceUsd: m.priceUsd,
-            solLiquidity: m.liquidityUsd / 180
+            // O-19: cached live SOL price, never a hardcoded 180.
+            solLiquidity: m.liquidityUsd / (cachedSolPriceUsd > 0 ? cachedSolPriceUsd : 180)
           });
           const cutoff = now - TICK_HISTORY_WINDOW_MS;
           while (item.priceHistory.length > 0 && item.priceHistory[0].timestamp < cutoff) {
             item.priceHistory.shift();
           }
-          await evaluateWatchlistCandidateOnTick(item, { complete: true, realSolReserves: 85 * 1e9 });
+          // O-19: no fabricated realSolReserves (see note above).
+          await evaluateWatchlistCandidateOnTick(item, { complete: true });
         }
       }
     } catch {}

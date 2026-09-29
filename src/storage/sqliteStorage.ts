@@ -108,7 +108,18 @@ export class SqliteStorageRepository implements IStorageRepository {
       );
       CREATE INDEX IF NOT EXISTS idx_dec_jnl_token ON decision_journal(token_address);
       CREATE INDEX IF NOT EXISTS idx_dec_jnl_decision ON decision_journal(decision);
+    `);
 
+    // M4 (2026-09-29): honest decision lifecycle — new columns only, existing
+    // columns untouched. verdict = scanner PASS/SKIP at EVALUATED time;
+    // position_id/executed_at set only on a real fill.
+    const djCols = this.db.prepare("PRAGMA table_info(decision_journal)").all() as any[];
+    const djColNames = new Set(djCols.map(c => c.name));
+    if (!djColNames.has('verdict')) this.db.exec("ALTER TABLE decision_journal ADD COLUMN verdict TEXT;");
+    if (!djColNames.has('position_id')) this.db.exec("ALTER TABLE decision_journal ADD COLUMN position_id INTEGER;");
+    if (!djColNames.has('executed_at')) this.db.exec("ALTER TABLE decision_journal ADD COLUMN executed_at TEXT;");
+
+    this.db.exec(`
       CREATE TABLE IF NOT EXISTS orders (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         order_id TEXT UNIQUE NOT NULL,
@@ -304,12 +315,14 @@ export class SqliteStorageRepository implements IStorageRepository {
     stmt.run(
       features.tokenId,
       features.timeframe,
-      features.return1m,
+      // return1m is number|undefined since M2 (per-minute rate, fail-closed) —
+      // NULL in DB when unmeasured.
+      features.return1m ?? null,
       features.return5m,
       features.return15m ?? null,
       features.realizedVol,
-      features.volumeAcceleration,
-      features.buySellRatio,
+      features.volumeAcceleration ?? null,
+      features.buySellRatio ?? null,
       features.liquidityUsd,
       features.cabalClusterRiskScore ?? null,
       features.regime,
@@ -354,15 +367,16 @@ export class SqliteStorageRepository implements IStorageRepository {
   async recordDecision(entry: DecisionJournalRecord): Promise<void> {
     const stmt = this.db.prepare(`
       INSERT INTO decision_journal (
-        decision_id, token_address, token_symbol, decision, composite_score,
+        decision_id, token_address, token_symbol, decision, verdict, composite_score,
         strategy_name, regime, allocated_sol, rejection_reasons, feature_vector, decided_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     stmt.run(
       entry.decisionId,
       entry.tokenId,
       entry.tokenSymbol,
       entry.decision,
+      entry.verdict ?? null,
       entry.compositeScore,
       entry.strategyName,
       entry.regime,
@@ -370,6 +384,51 @@ export class SqliteStorageRepository implements IStorageRepository {
       entry.rejectionReasons ? JSON.stringify(entry.rejectionReasons) : null,
       JSON.stringify(entry.featuresSnapshot),
       entry.decidedAt
+    );
+  }
+
+  /**
+   * M4 (2026-09-29): marks an EVALUATED decision with its real outcome.
+   * EXECUTED only after a real fill (position_id + executed_at set);
+   * FAILED when the buy is rejected or fails (reason appended to
+   * rejection_reasons). UPDATE only — never invents a decision row.
+   */
+  async markDecisionOutcome(
+    decisionId: string,
+    outcome: {
+      decision: 'EXECUTED' | 'FAILED';
+      verdict?: 'PASS' | 'SKIP';
+      positionId?: number;
+      executedAt?: string;
+      reason?: string;
+    }
+  ): Promise<void> {
+    const row = this.db.prepare(
+      'SELECT rejection_reasons FROM decision_journal WHERE decision_id = ?'
+    ).get(decisionId) as any;
+    if (!row) return; // Unknown decision id — never invent a row.
+    let reasons: string[] = [];
+    try {
+      const parsed = row.rejection_reasons ? JSON.parse(row.rejection_reasons) : [];
+      if (Array.isArray(parsed)) reasons = parsed;
+    } catch {}
+    if (outcome.reason) reasons.push(outcome.reason);
+    const stmt = this.db.prepare(`
+      UPDATE decision_journal
+      SET decision = ?,
+          verdict = COALESCE(?, verdict),
+          position_id = COALESCE(?, position_id),
+          executed_at = COALESCE(?, executed_at),
+          rejection_reasons = ?
+      WHERE decision_id = ?
+    `);
+    stmt.run(
+      outcome.decision,
+      outcome.verdict ?? null,
+      outcome.positionId ?? null,
+      outcome.executedAt ?? null,
+      JSON.stringify(reasons),
+      decisionId
     );
   }
 
@@ -381,6 +440,9 @@ export class SqliteStorageRepository implements IStorageRepository {
       tokenId: r.token_address,
       tokenSymbol: r.token_symbol,
       decision: r.decision,
+      verdict: r.verdict ?? undefined,
+      positionId: r.position_id ?? undefined,
+      executedAt: r.executed_at ?? undefined,
       compositeScore: r.composite_score,
       rejectionReasons: r.rejection_reasons ? JSON.parse(r.rejection_reasons) : undefined,
       featuresSnapshot: JSON.parse(r.feature_vector),

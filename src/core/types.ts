@@ -33,7 +33,24 @@ export type OrderLifecycleState =
 
 export type OrderSide = 'BUY' | 'SELL';
 
-export type DecisionType = 'EXECUTED' | 'SKIPPED' | 'VETOED_RISK' | 'VETOED_SAFETY';
+/**
+ * Exit classification — single source of truth for every sell decision.
+ * Added 2026-09-29 (exit-risk audit F-01/F-06): the old code classified exits
+ * with a case-sensitive regex over free-text `reason`, which silently
+ * misclassified MANUAL_* sells (blocked when underwater — user could not cut
+ * loss) and "TIME_STOP (... Zombie Exit)" (capital Z never matched /ZOMBIE/).
+ * Every exit path must now resolve to one of these classes; the phantom-exit
+ * guard, stale-price bypass, emergency slippage and breaker counting all key
+ * off the class, never off substring matching.
+ */
+export type ExitClass = 'PROFIT_TAKE' | 'STOP' | 'EMERGENCY' | 'MANUAL' | 'TIME_STOP';
+
+/** M4 (2026-09-29): honest decision lifecycle. The scanner logs EVALUATED (with
+ *  a PASS/SKIP verdict) at decision time. EXECUTED is written ONLY by
+ *  executeBuyToken after a real fill; FAILED when the buy is rejected/failed.
+ *  The old code wrote EXECUTED at verdict time, contaminating the dataset with
+ *  fills that never happened. */
+export type DecisionType = 'EVALUATED' | 'EXECUTED' | 'FAILED' | 'SKIPPED' | 'VETOED_RISK' | 'VETOED_SAFETY';
 
 export interface TokenEntity {
   id: string | number;
@@ -80,9 +97,18 @@ export interface FeatureVector {
   tokenId: string;
   timestampMs: number;
   timeframe: string; // '1m', '5m', '15m'
+  /** Observation-time price. Optional for backward compat with old snapshots.
+   *  The counterfactual tracker needs this — it was reading priceUsd from the
+   *  snapshot but producers never set it (0/446 counterfactuals filled). */
+  priceUsd?: number;
   
   // Price Structure
-  return1m: number;
+  /** Per-minute rebound rate (%/min) = returnSinceLastPct / minutes between tape
+   *  points. M2 (2026-09-29): the old code stuffed the RAW ~10-minute scanner
+   *  return here while the name and the R4 gate assumed a 1-minute tick — the
+   *  rebound gate was ~10x weaker than designed. Now normalized to %/min.
+   *  UNDEFINED when the tape cannot measure it — R4 fails closed (reject). */
+  return1m: number | undefined;
   return5m: number;
   /** 15m return from real observations (token tape). Undefined when the tape
    *  is too young — NEVER synthesized from shorter timeframes. */
@@ -94,12 +120,20 @@ export interface FeatureVector {
   upperWickRatio?: number; // (Peak - Close) / (Close - Open), > 0.40 = rejection / long upper shadow
 
   // Volume & Flow
-  volume5mUsd: number;
-  volumeAcceleration: number; // dV/dt relative to historical baseline
-  buySellRatio: number; // Buy volume / Sell volume
+  /** 5m volume in USD. UNDEFINED when unmeasured (C4/M7, 2026-09-29). */
+  volume5mUsd?: number;
+  /** RVOL vs 1h baseline. UNDEFINED when the baseline is missing (C4, 2026-09-29) —
+   *  never synthesized from 24h/24 or 24h/288. Consumers must fail closed. */
+  volumeAcceleration?: number; // dV/dt relative to historical baseline
+  /** Buy volume / Sell volume. UNDEFINED when sells5m == 0 or flow is unknown
+   *  (C3, 2026-09-29) — "no sells measured" is not infinite dominance.
+   *  Consumers must fail closed (use flowImbalance for the dominance question). */
+  buySellRatio?: number; // Buy volume / Sell volume
   flowImbalance: number; // (BuyVol - SellVol) / TotalVol (-1.0 to 1.0)
   tradeCount5m: number;
-  avgTradeSizeUsd: number;
+  /** m15 (2026-09-29): UNDEFINED when unmeasured. The old $80 fallback fed
+   *  netBuyFlowSolEst from a guessed trade size. */
+  avgTradeSizeUsd: number | undefined;
 
   // Liquidity Microstructure
   liquidityUsd: number;
@@ -141,6 +175,11 @@ export interface StrategySignal {
   suggestedHoldingPeriodMinutes: number;
   featureSnapshot: Partial<FeatureVector>;
   generatedAt: string;
+  /** M11 (2026-09-29): provenance tag of the data window behind this signal
+   *  (e.g. 'dexscreener-5m', 'tape-1m'). The consensus bonus is only paid in
+   *  full when signals come from INDEPENDENT sources — signals from the same
+   *  window wearing different hats are not consensus. */
+  sourceTag?: string;
 }
 
 export interface CandidateOpportunity {
@@ -228,6 +267,12 @@ export interface DecisionJournalRecord {
   tokenId: string;
   tokenSymbol: string;
   decision: DecisionType;
+  /** M4: scanner verdict at EVALUATED time (PASS = would buy, SKIP = rejected). */
+  verdict?: 'PASS' | 'SKIP';
+  /** M4: set only when decision becomes EXECUTED (real fill). */
+  positionId?: number;
+  /** M4: ISO timestamp of the real fill. */
+  executedAt?: string;
   compositeScore: number;
   rejectionReasons?: string[];
   featuresSnapshot: Partial<FeatureVector>;

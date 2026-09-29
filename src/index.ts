@@ -1,9 +1,12 @@
 // MUST be first: patches the `ws` module for egress-proxy environments before
 // @solana/web3.js or marketStreamer load it. No-op when no proxy is configured.
 import './utils/netProxy';
+import fs from 'node:fs';
+import path from 'node:path';
 import { CONFIG } from './config';
+import { setAutonomousBuyEnabled } from './core/autonomy';
 import { initDatabase, getPaperBalance } from './db/index';
-import { bot } from './bot/telegram';
+import { bot, sendAdminAlert, startAlertOutboxFlusher } from './bot/telegram';
 import { startPositionManager, stopPositionManager } from './services/tradeManager';
 import { startAlgoScanner, stopAlgoScanner } from './services/algoScanner';
 import { startMarketStreamer, stopMarketStreamer } from './services/marketStreamer';
@@ -26,21 +29,136 @@ function redactStack(stack: string | undefined): string {
 }
 
 // ---------------------------------------------------------------------------
-// Process-level safety nets (fail-LOUD, never silent):
-// Floating promises (e.g. inside WebSocket callbacks) and stray throws used to
-// crash the bot with no diagnostics. These handlers LOG the error clearly and
-// keep the process alive — they do NOT swallow: every event is surfaced with
-// a redacted stack so we can diagnose feed/WS deaths without leaking secrets.
+// O-01b: singleton PID guard. Two bot instances sharing one SQLite file means
+// SQLITE_BUSY crashes, double-buys and double-sells. The watchdog's atomic
+// flock is the first defense; this is the in-process second defense: a second
+// instance exits(1) loudly instead of running alongside the first.
 // ---------------------------------------------------------------------------
+const LOCK_PATH = path.resolve(process.cwd(), 'tradingbot.lock');
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function readLockPid(): number {
+  try {
+    return parseInt(fs.readFileSync(LOCK_PATH, 'utf8').trim(), 10) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+function isPidAlive(pid: number): boolean {
+  if (!(pid > 0)) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function acquireSingletonLock(): void {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const fd = fs.openSync(LOCK_PATH, 'wx'); // exclusive create — atomic at OS level
+      fs.writeFileSync(fd, String(process.pid));
+      fs.closeSync(fd);
+      console.log(`[System] 🔒 Singleton lock acquired (${LOCK_PATH}, pid ${process.pid}).`);
+      return;
+    } catch (err: any) {
+      if (err?.code !== 'EEXIST') throw err;
+    }
+    // Lock file exists: identify the owner. A concurrent starter may not have
+    // written its PID yet — wait briefly and re-read before concluding.
+    sleepSync(1500);
+    const ownerPid = readLockPid();
+    if (ownerPid > 0 && isPidAlive(ownerPid)) {
+      console.error(
+        `[System] 🛑 FATAL: another bot instance is already running (pid ${ownerPid}). ` +
+        `Refusing to double-start — two instances would corrupt tradingbot.db and double-trade. ` +
+        `If this is wrong, stop the other instance or delete ${LOCK_PATH}.`
+      );
+      process.exit(1);
+    }
+    if (ownerPid > 0) {
+      console.warn(`[System] ⚠️ Stale lock found (pid ${ownerPid} dead). Removing and re-acquiring.`);
+    } else {
+      console.warn('[System] ⚠️ Lock file exists but owner PID unreadable after wait. Removing stale lock.');
+    }
+    try { fs.unlinkSync(LOCK_PATH); } catch {}
+  }
+  console.error(
+    '[System] 🛑 FATAL: could not acquire singleton lock after 3 attempts. ' +
+    'Another instance may be starting concurrently — refusing to risk a double-start.'
+  );
+  process.exit(1);
+}
+
+function releaseSingletonLock(): void {
+  try {
+    if (readLockPid() === process.pid) fs.unlinkSync(LOCK_PATH);
+  } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// O-07: health file. The event loop writes a timestamp every 30s; the watchdog
+// treats a health file older than 3 minutes as DEAD even if the process still
+// shows up in pgrep (zombie with a wedged event loop / dead WS feeds).
+// ---------------------------------------------------------------------------
+const HEALTH_PATH = path.resolve(process.cwd(), 'bot.health');
+let heartbeatTimer: NodeJS.Timeout | null = null;
+
+function startHeartbeat(): void {
+  const beat = () => {
+    try {
+      fs.writeFileSync(HEALTH_PATH, JSON.stringify({
+        ts: Date.now(),
+        pid: process.pid,
+        uptimeSec: Math.round(process.uptime())
+      }));
+    } catch {}
+  };
+  beat();
+  heartbeatTimer = setInterval(beat, 30 * 1000);
+  console.log('[System] 💓 Health heartbeat aktif (bot.health tiap 30 dtk).');
+}
+
+/** Best-effort fatal alert, then die so the watchdog restarts a clean process. */
+function fatalShutdown(message: string): void {
+  console.error(message);
+  try {
+    // Queued to the outbox when the direct send fails — the replacement
+    // instance's flusher will deliver it.
+    sendAdminAlert(`🛑 *BOT FATAL:* ${message}`).catch(() => {});
+  } catch {}
+  setTimeout(() => process.exit(1), 2000);
+}
+
+// ---------------------------------------------------------------------------
+// Process-level safety nets (fail-LOUD, never silent):
+// O-07 (2026-09-29): the old handlers LOGGED and kept the process alive, so a
+// corrupted state (dead WS streamer, throwing heartbeat) became a zombie the
+// watchdog considered "healthy" forever. Now: uncaughtException dies loudly
+// (watchdog restarts us); unhandledRejection is tolerated up to 5x, then dies.
+// ---------------------------------------------------------------------------
+let unhandledRejectionCount = 0;
 process.on('unhandledRejection', (reason: any) => {
+  unhandledRejectionCount++;
   const err = reason instanceof Error ? reason : new Error(String(reason));
-  console.error('[Process] ⚠️ UNHANDLED REJECTION (process kept alive):', err.message);
+  console.error(`[Process] ⚠️ UNHANDLED REJECTION #${unhandledRejectionCount}:`, err.message);
   console.error('[Process] Stack:', redactStack(err.stack));
+  if (unhandledRejectionCount >= 5) {
+    fatalShutdown(
+      `[Process] 5 unhandled rejections — process state may be corrupt. Exiting for watchdog restart.`
+    );
+  }
 });
 
 process.on('uncaughtException', (err: Error) => {
-  console.error('[Process] 🚨 UNCAUGHT EXCEPTION (process kept alive):', err.message);
+  console.error('[Process] 🚨 UNCAUGHT EXCEPTION:', err.message);
   console.error('[Process] Stack:', redactStack(err.stack));
+  fatalShutdown(`[Process] Uncaught exception (${err.message}) — exiting for watchdog restart.`);
 });
 
 async function main() {
@@ -49,9 +167,26 @@ async function main() {
   console.log(' 🏛️ INSTITUTIONAL HEDGE FUND SURVIVAL ENGINE        ');
   console.log('====================================================');
 
+  // 0. Singleton guard — refuse to run as a second instance (O-01b).
+  acquireSingletonLock();
+
+  // O-10: no admin = zero oversight. Disable autonomous buying fail-closed.
+  // Manual Telegram trading (explicit user confirmation) keeps working.
+  if (!CONFIG.TELEGRAM_ADMIN_ID) {
+    console.error(
+      '[System] 🛑 FATAL (O-10): TELEGRAM_ADMIN_ID belum diisi/deteksi — ' +
+      'AUTONOMOUS BUY DINONAKTIFKAN (fail-closed). Trading manual via Telegram tetap jalan. ' +
+      'Isi ID admin numerik di .env lalu restart untuk mengaktifkan trading otonom.'
+    );
+    setAutonomousBuyEnabled(false, 'TELEGRAM_ADMIN_ID belum diisi — nol oversight');
+  }
+
   // 1. Initialize SQLite Database
   initDatabase();
   console.log(`[DB] Database initialized successfully. Paper Balance: ${getPaperBalance().toFixed(3)} SOL`);
+
+  startAlertOutboxFlusher();
+  startHeartbeat();
 
   // 2. Start Quantitative Execution Engines (Zero-Polling Event-Driven WebSocket First)
   startPositionManager();
@@ -78,6 +213,15 @@ async function main() {
 
         await bot.launch({ dropPendingUpdates: true });
         console.log(`[Telegram] 🚀 Polling aktif. Bot siap menerima sinyal & perintah di Telegram!`);
+
+        // O-09 self-test + O-12 restart notice: prove the Telegram path works
+        // AND tell the admin that updates sent during the restart were dropped
+        // (dropPendingUpdates) so a lost cut-loss command gets re-issued.
+        await sendAdminAlert(
+          `🤖 *Bot online* — ${CONFIG.PAPER_TRADING ? 'PAPER TRADING' : '⚠️ LIVE TRADING'} (self-test notifikasi ✅)\n\n` +
+          `🔄 Bot baru saja (re)start — perintah Telegram yang masuk tepat saat restart *dibuang otomatis* dan tidak tereksekusi. ` +
+          `_Silakan ulangi perintah terakhir (mis. konfirmasi jual) bila belum tereksekusi._`
+        ).catch(() => {});
         break;
       } catch (err: any) {
         console.error(`[Telegram] ⚠️ Koneksi Telegram gagal (Percobaan #${attempt}): ${err.message}. Mencoba lagi dalam ${Math.round(delayMs / 1000)}s...`);
@@ -91,19 +235,23 @@ async function main() {
     console.error('[Telegram] Launcher error:', err);
   });
 
-  // Graceful shutdown
-  const shutdown = () => {
+  // Graceful shutdown (O-22: await bot.stop so in-flight polling settles;
+  // release the singleton lock so the watchdog can start a fresh instance).
+  const shutdown = async () => {
     console.log('\n[System] Shutting down cleanly...');
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
     stopPositionManager();
     stopMarketStreamer();
-    stopAlgoScanner();
+    await stopAlgoScanner(); // O-20: async — waits for in-flight scan cycle so no buy fires mid-shutdown
     stopCounterfactualTracker();
-    try { bot.stop(); } catch {}
+    try { await bot.stop(); } catch {}
+    await new Promise(res => setTimeout(res, 500));
+    releaseSingletonLock();
     process.exit(0);
   };
 
-  process.once('SIGINT', shutdown);
-  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', () => { shutdown().catch(() => process.exit(1)); });
+  process.once('SIGTERM', () => { shutdown().catch(() => process.exit(1)); });
 }
 
 main().catch((err) => {

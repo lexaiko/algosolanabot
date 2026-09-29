@@ -1,6 +1,9 @@
 import { FeatureVector, StrategySignal, EntryLifecycleState } from '../core/types';
+import { TokenMarketData } from '../types/index';
 import { OpportunityScorer, opportunityScorer } from './opportunityScorer';
 import { adaptiveLearningEngine } from '../strategies/adaptiveLearningEngine';
+import { tokenTape, tapeVolume5mNormalized, tapeReturnPerMinutePct } from '../market/tokenTape';
+import { getSolPriceUsd } from '../services/dexscreener';
 import { CONFIG } from '../config';
 
 export interface EntryDecisionResult {
@@ -54,13 +57,20 @@ export class EntryEngine {
       };
     }
 
-    // Invalidation 2: Order Flow Dominance (OFD) Check - Sells dominant or balanced churn (AICAT trap prevention)
-    if (features.buySellRatio < 1.35 || features.flowImbalance < 0.15) {
+    // Invalidation 2: Order Flow Dominance (OFD) Check - Sells dominant or balanced churn (AICAT trap prevention).
+    // C3 (2026-09-29): buySellRatio is UNDEFINED on zero-sell/unknown flow — in
+    // that case dominance is judged by flowImbalance (honest), and unknown flow
+    // (imbalance 0) fails closed here.
+    const ratioDominant = features.buySellRatio === undefined
+      ? features.flowImbalance >= 0.15
+      : features.buySellRatio >= 1.35;
+    if (!ratioDominant || features.flowImbalance < 0.15) {
+      const ratioStr = features.buySellRatio === undefined ? 'unknown' : `${features.buySellRatio.toFixed(2)}x`;
       return {
         shouldEnter: false,
         state: 'WATCHING',
         compositeScore: score,
-        reason: `Order flow belum dominan buy (Buy/Sell: ${features.buySellRatio.toFixed(2)}x < 1.35x, Imbalance: ${(features.flowImbalance * 100).toFixed(0)}%). Aksi saling banting terdeteksi`,
+        reason: `Order flow belum dominan buy (Buy/Sell: ${ratioStr} < 1.35x, Imbalance: ${(features.flowImbalance * 100).toFixed(0)}%). Aksi saling banting terdeteksi`,
         explanation: scoreResult.explanation,
         invalidationReason: 'CHURN_FLOW_LACKS_BUY_DOMINANCE'
       };
@@ -114,13 +124,26 @@ export class EntryEngine {
       };
     }
 
-    // Invalidation 5: Absorption Rebound Verification - Never buy while 1m tick is dropping!
-    if (features.drawdownFromPeakPct >= 2.0 && features.return1m <= -0.5) {
+    // Invalidation 5: Absorption Rebound Verification - Never buy a weak rebound!
+    // R4 (2026-09-29): the old bar (return1m > -0.5) let FLAT ticks through —
+    // a flat tick is a pause, not a rebound confirmation. Now requires a
+    // genuinely green tick (return1m > +0.3%) with real participation
+    // (checked at STAGE 3.5 via volumeAcceleration).
+    //
+    // M2 (2026-09-29): return1m is now a PER-MINUTE rate (%/min), normalized by
+    // the actual minutes between tape points — the old code compared a raw
+    // ~10-minute scanner return against a per-minute bar, making R4 ~10x weaker
+    // than designed. M12: the drawdown bar moved 2.0% -> 1.5%, closing the
+    // [1.5%, 2%) gap that slipped past both this gate and the top-tick guard.
+    // HONEST-DATA: return1m UNDEFINED (tape unmeasurable) FAILS CLOSED here —
+    // an unconfirmed rebound is not a confirmed one.
+    if (features.drawdownFromPeakPct >= 1.5 && (features.return1m === undefined || features.return1m <= 0.3)) {
+      const tickStr = features.return1m === undefined ? 'unknown' : `${features.return1m.toFixed(2)}%/min`;
       return {
         shouldEnter: false,
         state: 'SETUP_FORMING',
         compositeScore: score,
-        reason: `Pullback sedang berlangsung (-${features.drawdownFromPeakPct.toFixed(1)}%), namun tick 1m masih merah. Dilarang menangkap pisau jatuh sebelum ada pantulan hijau`,
+        reason: `Pullback sedang berlangsung (-${features.drawdownFromPeakPct.toFixed(1)}%), namun rebound per-menit belum hijau kuat (${tickStr} <= +0.30%/min). Dilarang menangkap pisau jatuh sebelum ada pantulan terkonfirmasi`,
         explanation: scoreResult.explanation,
         invalidationReason: 'AWAITING_GREEN_REBOUND_TICK'
       };
@@ -160,6 +183,45 @@ export class EntryEngine {
       };
     }
 
+    // STAGE 3.5: ABSORPTION CONFIRMATION (R1+R4, 2026-09-29)
+    // A high score is not an entry. The rebound must show REAL absorption:
+    // buy-dominant flow (not just above the 1.35 churn line), strengthening
+    // imbalance, and real participation (not a dead tick). Failures wait here
+    // as SETUP_FORMING — the setup may confirm on a later tick.
+    //
+    // HONEST-DATA NOTE: two R1 sub-conditions are NOT verifiable from
+    // FeatureVector and are therefore NOT faked: delta-imbalance vs 5m ago
+    // (no per-tick buy/sell history exists) and no-new-low intra-minute
+    // (no sub-minute tape). volumeAcceleration >= 1.5 is the honest proxy
+    // for "rebound tick volume >= 1.5x average" — real measured pace vs
+    // baseline, consistent with the scanner's own strong-flow bar (1.4).
+    // C3/C4 (2026-09-29): buySellRatio / volumeAcceleration are UNDEFINED when the
+    // underlying flow or volume baseline is unmeasured — undefined fails closed.
+    // Zero-sell dominance is judged by flowImbalance (honest, no invented ratio).
+    let absorptionBlockReason: string | null = null;
+    const absorptionRatioOk = features.buySellRatio === undefined
+      ? features.flowImbalance >= 0.3
+      : features.buySellRatio >= 1.5;
+    if (!absorptionRatioOk) {
+      const ratioStr = features.buySellRatio === undefined ? 'unknown' : `${features.buySellRatio.toFixed(2)}x`;
+      absorptionBlockReason = `rasio buy/sell ${ratioStr} < 1.5x (absorpsi belum dominan)`;
+    } else if (features.flowImbalance < 0.3) {
+      absorptionBlockReason = `imbalance ${(features.flowImbalance * 100).toFixed(0)}% < 30% (agresi beli belum kuat)`;
+    } else if (features.volumeAcceleration === undefined || features.volumeAcceleration < 1.5) {
+      const volStr = features.volumeAcceleration === undefined ? 'unknown' : `${features.volumeAcceleration.toFixed(2)}x`;
+      absorptionBlockReason = `akselerasi volume ${volStr} < 1.5x (tick sepi / baseline tak terukur, bukan absorpsi)`;
+    }
+    if (absorptionBlockReason) {
+      return {
+        shouldEnter: false,
+        state: 'SETUP_FORMING',
+        compositeScore: score,
+        reason: `Skor lolos (${score}/100) tapi konfirmasi absorpsi belum terpenuhi: ${absorptionBlockReason}. Menunggu tick rebound yang valid`,
+        explanation: scoreResult.explanation,
+        invalidationReason: 'AWAITING_ABSORPTION_CONFIRMATION'
+      };
+    }
+
     // STAGE 4: CONFIRMED & ENTRY — single model: PULLBACK_ABSORPTION.
     const entryMode = 'PULLBACK_ABSORPTION' as const;
     return {
@@ -174,3 +236,151 @@ export class EntryEngine {
 }
 
 export const entryEngine = new EntryEngine();
+
+/**
+ * M3 (2026-09-29): DECISION-FILL DECOUPLING FIX.
+ *
+ * The scan verdict can be 30-60s stale by the time executeBuyToken fills — the
+ * verdict was computed on the scan-time snapshot, but the fill price is fresh.
+ * A token that passed absorption 30s ago may be bought after its rebound
+ * already failed. This rebuilds a COMPACT feature vector from the FRESH market
+ * snapshot + the in-memory tape and re-runs the full entry engine (score,
+ * gates, R1 absorption). executeBuyToken rejects when !shouldEnter.
+ *
+ * The signal rules below mirror scanMarketOnce's (same thresholds); they are
+ * intentionally compact rather than shared — the scanner's vector carries
+ * display-only fields this path doesn't need.
+ */
+export async function revalidateEntryOnFreshData(
+  market: TokenMarketData,
+  tokenMint: string
+): Promise<EntryDecisionResult> {
+  const tape = tokenTape.getFeatures(tokenMint);
+
+  // Tape belum matang -> REJECT (INVALIDATED), bukan vector dengan drawdown 0
+  // yang lolos. C1 deleted the scanner's synthetic-drawdown branch; this path
+  // must not reintroduce it through the back door.
+  if (!tape.hasTape || tape.points < 2) {
+    return {
+      shouldEnter: false,
+      state: 'INVALIDATED',
+      compositeScore: 0,
+      reason: 'Tape observasi belum matang (< 2 titik) — setup tidak bisa dikonfirmasi pada data fresh (observasi dulu)',
+      explanation: 'Re-validation membutuhkan tape nyata; tanpa itu tidak ada bukti rebound.',
+      invalidationReason: 'IMMATURE_TAPE'
+    };
+  }
+
+  const solPrice = await getSolPriceUsd().catch(() => 0);
+  // No $180 literal (m2): an unknown SOL price makes our buy's USD size and
+  // price impact unverifiable -> fail closed, not a guessed constant.
+  if (!(solPrice > 0)) {
+    return {
+      shouldEnter: false,
+      state: 'INVALIDATED',
+      compositeScore: 0,
+      reason: 'Harga SOL tak terukur — impact buy tak terverifikasi (tolak fail-closed)',
+      explanation: 'Tanpa harga SOL, ukuran buy USD dan estimasi slippage tidak bisa dihitung.',
+      invalidationReason: 'UNKNOWN_SOL_PRICE'
+    };
+  }
+
+  // M1/M2-normalized tape features (null -> undefined -> downstream fail-closed).
+  const returnPerMin = tapeReturnPerMinutePct(tape);
+  const vol5m = tapeVolume5mNormalized(tape) ?? market.volume5m;
+  const vol1h = market.volume1h;
+  const volumeAcceleration =
+    vol5m !== undefined && vol1h !== undefined && vol1h > 0
+      ? Math.min(10, (vol5m * 12) / vol1h)
+      : undefined;
+
+  const txnsUnknown = market.txns5mBuys === undefined || market.txns5mSells === undefined;
+  const buys = market.txns5mBuys ?? 0;
+  const sells = market.txns5mSells ?? 0;
+  const tradeCount = buys + sells;
+  const buySellRatio: number | undefined = !txnsUnknown && sells > 0 ? buys / sells : undefined;
+  const flowImbalance = tradeCount > 0 ? (buys - sells) / tradeCount : 0;
+
+  const ret5m = market.priceChange5m ?? 0;
+  const realizedVol = tape.realizedVolPct ?? Math.max(2.0, Math.abs(ret5m) * 1.25);
+
+  // m15: no $80 invented trade size — unknown stays unknown.
+  const avgTradeSizeUsd: number | undefined =
+    tradeCount > 0 && vol5m !== undefined ? vol5m / tradeCount : undefined;
+  const avgTradeSizeSol =
+    avgTradeSizeUsd !== undefined && solPrice > 0 ? avgTradeSizeUsd / solPrice : undefined;
+  const netBuyFlowSolEst =
+    buySellRatio !== undefined && buySellRatio >= 1.5 && tradeCount >= 10 && avgTradeSizeSol !== undefined
+      ? Math.round(Math.max(0, buys - sells) * avgTradeSizeSol * 10) / 10
+      : undefined;
+  const buyPressureScore =
+    tradeCount >= 10
+      ? buySellRatio !== undefined
+        ? buySellRatio >= 1.8 ? 90 : buySellRatio >= 1.3 ? 75 : 45
+        : flowImbalance >= 0.6 ? 90 : flowImbalance >= 0.3 ? 75 : 45
+      : undefined;
+
+  const signals: StrategySignal[] = [];
+  const tokenSym = market.symbol || 'UNKNOWN';
+  const nowIso = new Date().toISOString();
+  const mkSignal = (name: string, confidence: number): StrategySignal => ({
+    signalId: `fresh_${tokenMint.slice(0, 6)}_${Date.now()}_${name}`,
+    tokenId: tokenMint,
+    tokenSymbol: tokenSym,
+    strategyName: name,
+    strategyVersion: '1.0',
+    direction: 'BUY',
+    confidence,
+    regime: 'TRENDING_UP',
+    invalidationPriceUsd: market.priceUsd * 0.9,
+    targetTpPct: 25,
+    targetSlPct: 8,
+    suggestedHoldingPeriodMinutes: 15,
+    featureSnapshot: {},
+    generatedAt: nowIso,
+    sourceTag: 'dexscreener-5m',
+  });
+  if (volumeAcceleration !== undefined && volumeAcceleration >= 1.6 && ret5m >= 2.5) {
+    signals.push(mkSignal('MOMENTUM', Math.min(1.0, volumeAcceleration / 3.0)));
+  }
+  const flowSignalStrength = buySellRatio !== undefined ? buySellRatio : flowImbalance >= 0.6 ? 2.0 : 0;
+  if (flowSignalStrength >= 1.6 && tradeCount >= 8) {
+    signals.push(mkSignal('FLOW_IMBALANCE', Math.min(1.0, flowSignalStrength / 3.0)));
+  }
+  if ((netBuyFlowSolEst ?? 0) >= 2.0) {
+    signals.push(mkSignal('BUY_PRESSURE', 0.85));
+  }
+
+  const refBuyUsd = (CONFIG.DEFAULT_BUY_AMOUNT_SOL || 0.05) * solPrice;
+  const vector: FeatureVector = {
+    tokenId: tokenMint,
+    timestampMs: Date.now(),
+    timeframe: '5m',
+    priceUsd: market.priceUsd,
+    return1m: returnPerMin ?? undefined,
+    return5m: ret5m,
+    return15m: tape.return15mPct ?? undefined,
+    realizedVol,
+    atrPct: Math.max(3.0, realizedVol * 1.2),
+    breakoutDistancePct: Math.max(0, ret5m - 2.0),
+    drawdownFromPeakPct: tape.drawdownFromPeakPct,
+    upperWickRatio: tape.upperWickRatio ?? undefined,
+    volume5mUsd: vol5m,
+    volumeAcceleration,
+    buySellRatio,
+    flowImbalance,
+    tradeCount5m: Math.max(1, tradeCount),
+    avgTradeSizeUsd,
+    liquidityUsd: market.liquidityUsd,
+    estimatedPriceImpactPct: market.liquidityUsd > 0
+      ? Math.min(10, (refBuyUsd / (market.liquidityUsd * 0.5)) * 100)
+      : 10,
+    netBuyFlowSolEst,
+    buyPressureScore,
+    cabalClusterRiskScore: undefined,
+    regime: realizedVol >= 10.0 ? 'HIGH_VOLATILITY' : ret5m > 3.0 ? 'TRENDING_UP' : ret5m < -5.0 ? 'PANIC' : 'RANGE',
+    quality: 'VALID',
+  };
+
+  return entryEngine.evaluateEntryTiming(vector, signals);
+}

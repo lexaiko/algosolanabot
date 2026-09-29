@@ -91,6 +91,28 @@ export class InMemoryStorageRepository implements IStorageRepository {
     }
   }
 
+  /** M4 (2026-09-29): in-memory mirror of markDecisionOutcome. */
+  async markDecisionOutcome(
+    decisionId: string,
+    outcome: {
+      decision: 'EXECUTED' | 'FAILED';
+      verdict?: 'PASS' | 'SKIP';
+      positionId?: number;
+      executedAt?: string;
+      reason?: string;
+    }
+  ): Promise<void> {
+    const entry = this.decisions.find(d => d.decisionId === decisionId);
+    if (!entry) return;
+    entry.decision = outcome.decision;
+    if (outcome.verdict !== undefined) entry.verdict = outcome.verdict;
+    if (outcome.positionId !== undefined) entry.positionId = outcome.positionId;
+    if (outcome.executedAt !== undefined) entry.executedAt = outcome.executedAt;
+    if (outcome.reason) {
+      entry.rejectionReasons = [...(entry.rejectionReasons || []), outcome.reason];
+    }
+  }
+
   async saveOrder(order: OrderIntent): Promise<void> {
     this.orders.set(order.orderId, order);
   }

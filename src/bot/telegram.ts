@@ -1,6 +1,7 @@
 import { Telegraf, Markup } from 'telegraf';
 import { CONFIG } from '../config';
 import {
+  db,
   getPaperBalance,
   resetPaperBalance,
   getOpenPositions,
@@ -22,7 +23,7 @@ import {
 } from '../db/index';
 import { getSolPriceUsd, getTokenMarketData } from '../services/dexscreener';
 import { checkTokenSafety } from '../services/antirug';
-import { executeBuyToken, executeSellToken, setTelegramNotifier } from '../services/tradeManager';
+import { executeBuyToken, executeSellToken, setTelegramNotifier, classifyExitReason } from '../services/tradeManager';
 import { scanMarketOnce, setAlgoScannerNotifier } from '../services/algoScanner';
 import { setMarketStreamerNotifier, getWatchlistStatus, removeTokenFromWatchlist } from '../services/marketStreamer';
 import {
@@ -33,6 +34,7 @@ import {
 } from '../services/backtester';
 import { adaptiveLearningEngine } from '../strategies/adaptiveLearningEngine';
 import { getProxyAgent } from '../utils/netProxy';
+import { isAutonomousBuyEnabled, getAutonomyDisableReason } from '../core/autonomy';
 
 const telegramProxyAgent = getProxyAgent();
 export const bot = new Telegraf(
@@ -68,45 +70,119 @@ export async function safeReplyWithMarkdown(ctx: any, text: string, extra?: any)
   }
 }
 
-// Register Telegram notifiers (Admin + Active Watchers Broadcast)
-const sendAdminAlert = async (msg: string, extra?: any) => {
-  if (CONFIG.TELEGRAM_ADMIN_ID) {
+// ---------------------------------------------------------------------------
+// O-09 (2026-09-29): persistent alert outbox. A failed direct send is ENQUEUED
+// (never swallowed) and retried with quadratic backoff by flushAlertOutbox().
+// Startup sends a self-test message so a dead Telegram path is noticed
+// immediately instead of being discovered during a crisis.
+// ---------------------------------------------------------------------------
+function queueAlert(message: string): void {
+  try {
+    db.prepare(
+      'INSERT INTO alert_outbox (message, created_at, attempts) VALUES (?, ?, 0)'
+    ).run(message, new Date().toISOString());
+    console.error('[Telegram] 🚨 Alert gagal terkirim — masuk antrian outbox untuk retry.');
+  } catch (e: any) {
+    console.error('[Telegram] 🛑 FATAL: tidak bisa menulis alert_outbox:', e?.message || e);
+  }
+}
+
+/** Retry queued alerts with quadratic backoff (attempts^2 * 60s). Called every 60s. */
+export async function flushAlertOutbox(): Promise<void> {
+  let rows: any[];
+  try {
+    rows = db.prepare(`
+      SELECT id, message, attempts, created_at FROM alert_outbox
+      WHERE sent_at IS NULL
+        AND datetime(created_at, '+' || (attempts * attempts * 60) || ' seconds') <= datetime('now')
+      ORDER BY id ASC LIMIT 10
+    `).all() as any[];
+  } catch (e: any) {
+    console.error('[Telegram] flushAlertOutbox query gagal:', e?.message || e);
+    return;
+  }
+  for (const r of rows) {
+    if (r.attempts >= 25) {
+      console.error(`[Telegram] 🛑 Outbox #${r.id} menyerah setelah 25x percobaan (dibuat ${r.created_at}). Pesan tersimpan untuk audit manual.`);
+      continue;
+    }
     try {
-      await bot.telegram.sendMessage(CONFIG.TELEGRAM_ADMIN_ID, msg, {
-        parse_mode: 'Markdown',
-        ...extra
-      });
-    } catch (err: any) {
-      console.warn('[Telegram] Gagal kirim Markdown ke admin, fallback plain text:', err.message);
+      await bot.telegram.sendMessage(CONFIG.TELEGRAM_ADMIN_ID, r.message, { parse_mode: 'Markdown' });
       try {
-        const cleanText = msg.replace(/[*_`\[\]]/g, '');
-        await bot.telegram.sendMessage(CONFIG.TELEGRAM_ADMIN_ID, cleanText, extra);
-      } catch (fallbackErr: any) {
-        console.error('[Telegram] Gagal kirim pesan fallback ke admin:', fallbackErr.message);
-      }
+        const watchers = getWatchers();
+        await Promise.allSettled(
+          watchers
+            .filter(w => w.user_id !== CONFIG.TELEGRAM_ADMIN_ID)
+            .map(w => bot.telegram.sendMessage(w.user_id, r.message, { parse_mode: 'Markdown' }))
+        );
+      } catch {}
+      db.prepare('UPDATE alert_outbox SET sent_at = ?, attempts = attempts + 1 WHERE id = ?')
+        .run(new Date().toISOString(), r.id);
+      console.log(`[Telegram] ✅ Outbox #${r.id} terkirim setelah ${r.attempts + 1}x percobaan.`);
+    } catch (err: any) {
+      db.prepare('UPDATE alert_outbox SET attempts = attempts + 1, last_error = ? WHERE id = ?')
+        .run(String(err?.message || err).slice(0, 500), r.id);
     }
   }
+}
 
-  // Broadcast to all active Watchers
+let outboxFlusherStarted = false;
+export function startAlertOutboxFlusher(): void {
+  if (outboxFlusherStarted) return;
+  outboxFlusherStarted = true;
+  setInterval(() => { flushAlertOutbox().catch(() => {}); }, 60 * 1000);
+  console.log('[Telegram] 📬 Alert outbox flusher aktif (retry tiap 60 dtk).');
+}
+
+// Register Telegram notifiers (Admin + Active Watchers Broadcast)
+export const sendAdminAlert = async (msg: string, extra?: any) => {
+  if (!CONFIG.TELEGRAM_ADMIN_ID) {
+    // O-10: no admin configured — queue anyway (delivered once an admin
+    // exists) and log loudly. Never silently drop a critical alert.
+    console.error('[Telegram] 🚨 ALERT (tanpa admin — masuk outbox):', msg.slice(0, 200));
+    queueAlert(msg);
+    return;
+  }
+  let delivered = false;
+  try {
+    await bot.telegram.sendMessage(CONFIG.TELEGRAM_ADMIN_ID, msg, {
+      parse_mode: 'Markdown',
+      ...extra
+    });
+    delivered = true;
+  } catch (err: any) {
+    console.warn('[Telegram] Gagal kirim Markdown ke admin, fallback plain text:', err.message);
+    try {
+      const cleanText = msg.replace(/[*_`\[\]]/g, '');
+      await bot.telegram.sendMessage(CONFIG.TELEGRAM_ADMIN_ID, cleanText, extra);
+      delivered = true;
+    } catch (fallbackErr: any) {
+      console.error('[Telegram] Gagal kirim pesan fallback ke admin:', fallbackErr?.message || fallbackErr);
+    }
+  }
+  if (!delivered) queueAlert(msg);
+
+  // Broadcast to all active Watchers (best-effort; the admin path above is
+  // the guaranteed one — watcher failures are logged, not swallowed).
   try {
     const watchers = getWatchers();
-    for (const w of watchers) {
-      if (w.user_id !== CONFIG.TELEGRAM_ADMIN_ID) {
-        bot.telegram.sendMessage(w.user_id, msg, {
-          parse_mode: 'Markdown',
-          ...extra
-        }).catch(async (err: any) => {
-          if (err?.response?.error_code === 403) {
-            removeWatcher(w.user_id);
-          } else {
-            try {
+    const results = await Promise.allSettled(
+      watchers
+        .filter(w => w.user_id !== CONFIG.TELEGRAM_ADMIN_ID)
+        .map(w =>
+          bot.telegram.sendMessage(w.user_id, msg, { parse_mode: 'Markdown', ...extra })
+            .catch(async (err: any) => {
+              if (err?.response?.error_code === 403) {
+                removeWatcher(w.user_id);
+                return;
+              }
               const cleanText = msg.replace(/[*_`\[\]]/g, '');
               await bot.telegram.sendMessage(w.user_id, cleanText, extra);
-            } catch {}
-          }
-        });
-      }
-    }
+            })
+        )
+    );
+    const failed = results.filter(r => r.status === 'rejected').length;
+    if (failed > 0) console.warn(`[Telegram] ${failed} watcher broadcast gagal (best-effort).`);
   } catch {}
 };
 
@@ -173,12 +249,19 @@ bot.command(['start', 'status'], async (ctx) => {
   // Non-Admin Welcome Screen (Watcher Mode)
   if (!isAdmin) {
     const subscribed = isWatcher(userId || 0);
+    // O-10: when no admin is configured the whole bot runs without oversight —
+    // say so loudly instead of pretending everything is normal.
+    const noAdminBanner = !CONFIG.TELEGRAM_ADMIN_ID
+      ? `\n⚠️ *MODE TANPA ADMIN:* \`TELEGRAM_ADMIN_ID\` belum diisi — bot *TIDAK membeli otomatis* (fail-closed). Isi ID admin numerik di .env lalu restart untuk mengaktifkan trading otonom.\n`
+      : '';
     const text = `👋 *Halo, ${ctx.from?.first_name || 'Trader'}!*\n\n` +
       `Selamat datang di *Solana Quantitative Algorithmic Trading Bot*!\n` +
-      `Kamu saat ini berada dalam mode *Tamu (Watcher / Read-Only)*.\n\n` +
-      `Status Notifikasi: ${subscribed ? '🔔 *AKTIF (Menerima Alert Sinyal)*' : '🔕 *NON-AKTIF*'}\n\n` +
+      `Kamu saat ini berada dalam mode *Tamu (Watcher / Read-Only)*.\n` +
+      noAdminBanner +
+      `\nStatus Notifikasi: ${subscribed ? '🔔 *AKTIF (Menerima Alert Sinyal)*' : '🔕 *NON-AKTIF*'}\n\n` +
       `📋 *Menu yang bisa kamu akses:*\n` +
-      `• \`/scan\` - Pindai live pool Solana dengan filter survival phase\n` +
+      // O-11: /scan is admin-only (its output carries quick-buy buttons) —
+      // it must not be advertised in the watcher menu.
       `• \`/positions\` - Lihat koin yang sedang dipegang bot\n` +
       `• \`/report\` atau \`/pnl\` - Jurnal performa profit 24 jam\n` +
       `• \`/quant\` - Audit metrik kuantitatif (Sharpe, Sortino, Winrate)\n` +
@@ -194,7 +277,6 @@ bot.command(['start', 'status'], async (ctx) => {
           : Markup.button.callback('🔔 Aktifkan Alert Sinyal (/watch)', 'action_watch')
       ],
       [
-        Markup.button.callback('⚡ Pindai Pasar', 'trigger_scan'),
         Markup.button.callback('💼 Posisi Aktif', 'menu_positions')
       ],
       [
@@ -209,6 +291,12 @@ bot.command(['start', 'status'], async (ctx) => {
   const solPrice = await getSolPriceUsd();
   const stats = getTradingStats();
   const cb = isCircuitBreakerActive();
+  // O-04: true-net realized PnL (fees included) — never label gross as net.
+  const netPerf = getAllTimeRealizedNetPnlSol();
+  const netPnlUsd = netPerf.netSol * solPrice;
+  const autonomyText = isAutonomousBuyEnabled()
+    ? `🤖 *Mode Otonom:* ✅ Aktif`
+    : `🛑 *Mode Otonom:* *BELI OTOMATIS NONAKTIF* (${getAutonomyDisableReason()}) — trading manual via Telegram tetap jalan`;
 
   const cbStatusText = cb.active
     ? `🛑 *CIRCUIT BREAKER: AKTIF* (Cooldown: ${Math.ceil((cb.untilMs - Date.now()) / 60000)}m)`
@@ -216,21 +304,23 @@ bot.command(['start', 'status'], async (ctx) => {
 
   const text = `🤖 *SOLANA QUANTITATIVE ALGORITHMIC TRADING BOT*\n` +
     `🏛️ *INSTITUTIONAL HEDGE FUND SURVIVAL ENGINE*\n\n` +
-    `⚡ *Status Engine:* 🟢 Online (Scanner Siklus 60s Aktif)\n` +
+    `⚡ *Status Engine:* 🟢 Online (siklus scan 10 mnt; trading live via MarketStreamer WS)\n` +
+    `${autonomyText}\n` +
     `🎯 *Strategi:* ⚡ *MURNI ALGORITMA (Hedge Fund Survival Phase)*\n` +
     `🧪 *Mode Eksekusi:* ${CONFIG.PAPER_TRADING ? '*PAPER TRADING (Simulasi $0 Risiko)*' : '*LIVE TRADING (Real SOL)*'}\n` +
     `${cbStatusText}\n\n` +
     `💼 *Saldo Virtual:* *${balanceSol.toFixed(3)} SOL* (~$${(balanceSol * solPrice).toFixed(2)})\n` +
     `📈 *Posisi Terbuka:* *${stats.openPositionsCount}/${CONFIG.MAX_OPEN_POSITIONS}* token\n` +
-    `🏆 *Performa Portofolio:* ${stats.winTrades} Win / ${stats.lossTrades} Loss (Winrate: *${stats.winRate}%*)\n` +
-    `💵 *Total Realized Net PnL:* *$${stats.totalPnlUsd}*\n\n` +
+    `🏆 *Performa Portofolio (NET of fees):* ${netPerf.wins} Win / ${netPerf.losses} Loss (Winrate: *${netPerf.winRate}%*)\n` +
+    `💵 *Total Realized Net PnL:* *${netPerf.netSol >= 0 ? '+' : ''}${netPerf.netSol.toFixed(4)} SOL* (~*${netPnlUsd >= 0 ? '+' : ''}$${netPnlUsd.toFixed(2)}*)\n\n` +
     `💎 *Pilar Kuantitatif Hedge Fund:*\n` +
     `• *Survival Phase Funnel:* Anti-Detik-0 Suicide (Wajib usia $\\ge$ 3m, curve 25%-85%)\n` +
     `• *Sybil & Anti-Cabal Guard:* Dev holding $\\le$ 5%, minimal 45 unique buyers, LP locked\n` +
     `• *Quantitative Opportunity Scorer:* Algoritma multi-faktor (Bobot Momentum, Breakout & Order Flow)\n` +
     `• *Kelly Sizing:* Fractional Kelly Criterion (${CONFIG.KELLY_FRACTION * 100}% Kelly) & Liquidity Depth Cap\n` +
-    `• *Multi-Tier Exits:* Stage 1 TP (+42% kunci 50% modal) + Stage 2 Moonbag Trailing Stop (-18%)\n` +
-    `• *Flash-Exit Rug Buster:* Auto-dump jika likuiditas ditarik dev >${CONFIG.FLASH_EXIT_DROP_PCT}%\n` +
+    `• *Dynamic Ratchet Exit (100%):* Tier +22/+45/+80/+150 — floor kontinu NET-of-fees, trailing adaptif 10-20%\n` +
+    `• *Hard Stop-Loss:* *-${CONFIG.STOP_LOSS_PCT}%* | *Zombie Reaper:* time-stop posisi stagnan\n` +
+    `• *Flash-Exit Rug Buster:* Auto-dump 100% jika likuiditas drop ≥50% & di bawah $12k\n` +
     `• *Jito MEV Shield:* ${CONFIG.JITO_MEV_ENABLED ? '✅ Kebal Sandwich Attack (Private Mempool)' : '❌ Nonaktif'}\n\n` +
     `💡 *Tips:* _Ketik /scan untuk memindai pasar live, /positions untuk cek open trade, atau /quant untuk audit Sharpe Ratio!_`;
 
@@ -249,7 +339,7 @@ bot.command(['start', 'status'], async (ctx) => {
     ],
     [
       Markup.button.callback('⚙️ Settings & Risk', 'menu_settings'),
-      Markup.button.callback('🔄 Reset Saldo 10 SOL', 'reset_paper_balance')
+      Markup.button.callback(`🔄 Reset Saldo ${CONFIG.INITIAL_PAPER_BALANCE_SOL} SOL`, 'reset_paper_balance')
     ]
   ]));
 });
@@ -291,8 +381,11 @@ bot.command(['kick', 'drop', 'blacklist'], async (ctx) => {
   const openPos = getOpenPositionByToken(tokenMint);
   let soldMsg = '';
   if (openPos) {
-    await executeSellToken(openPos.id, 100, `MANUAL_KICK_EXIT (${reason})`);
-    soldMsg = `\n💰 *Posisi Aktif Ditemukan:* Posisi #${openPos.id} (${openPos.token_symbol}) langsung dilikuidasi 100% demi mengamankan modal!`;
+    // F-01b (2026-09-29): never claim a liquidation that did not happen.
+    const kickRes = await executeSellToken(openPos.id, 100, `MANUAL_KICK_EXIT (${reason})`, 'MANUAL');
+    soldMsg = kickRes.success
+      ? `\n💰 *Posisi Aktif Ditemukan:* Posisi #${openPos.id} (${openPos.token_symbol}) langsung dilikuidasi 100% demi mengamankan modal!`
+      : `\n⚠️ *Posisi Aktif Ditemukan:* likuidasi manual Posisi #${openPos.id} GAGAL: ${kickRes.message}`;
   }
 
   // 3. Masukkan ke Token Blacklist di Database
@@ -688,7 +781,7 @@ async function renderPositions(ctx: any, page: number = 1) {
     const emptyText = `💼 *POSISI TRADE AKTIF (0/${CONFIG.MAX_OPEN_POSITIONS})*\n\n` +
       `💰 *Kas Tersedia:* *${cashBalanceSol.toFixed(3)} SOL* (~$${(cashBalanceSol * solPrice).toFixed(2)})\n` +
       `📊 *Status:* Tidak ada posisi terbuka saat ini (100% modal aman dalam kas).\n\n` +
-      `_Bot akan membuka posisi otomatis saat scanner menemukan token lolos scoring quant ≥ 70, atau kamu bisa ketik /scan untuk audit manual._`;
+      `_Bot akan membuka posisi otomatis saat scanner menemukan token lolos scoring quant ≥ 75._`;
 
     const emptyKeyboard = Markup.inlineKeyboard([
       [
@@ -743,22 +836,28 @@ async function renderPositions(ctx: any, page: number = 1) {
 
   for (const p of displayPositions) {
     const isProfit = p.pnl_pct >= 0;
-    const tpPct = p.target_tp_pct || CONFIG.TAKE_PROFIT_PCT;
-    const slPct = p.target_sl_pct || CONFIG.STOP_LOSS_PCT;
+    const slPct = CONFIG.STOP_LOSS_PCT;
 
-    const tpPrice = p.entry_price_usd * (1 + tpPct / 100);
     const slPrice = p.entry_price_usd * (1 - slPct / 100);
-    const distToTp = tpPct - p.pnl_pct;
     const distToSl = p.pnl_pct - (-slPct);
 
-    const estFeeSol = 0.002;
+    // O-14: fee estimate from CONFIG — the old hardcoded 0.002 was 8x the
+    // real CONFIG.ESTIMATED_SELL_FEE_SOL (0.00025).
+    const estFeeSol = CONFIG.ESTIMATED_SELL_FEE_SOL;
     const estFeeUsd = estFeeSol * solPrice;
     const netPnlUsd = p.pnl_usd - estFeeUsd;
     const netProfit = netPnlUsd >= 0;
 
-    const statusBadge = p.is_half_closed === 1
-      ? '🌕 *STAGE 2 MOONBAG* (Modal 50% TP Aman)'
-      : '🟢 *POSISI PENUH* (Menuju TP1)';
+    // O-03: honest ratchet badge computed from PEAK gain — the engine locks
+    // floors on peak, never on current pnl. No more MOONBAG/TP1 fiction, no
+    // decorative target_tp_pct (F-14: never read by the exit engine).
+    const peakGainPct = p.peak_price_usd > 0 && p.entry_price_usd > 0
+      ? ((p.peak_price_usd / p.entry_price_usd) - 1) * 100 : 0;
+    const statusBadge = peakGainPct >= 150 ? '🚀 *RATCHET MEGA* (floor ≥+100% net)'
+      : peakGainPct >= 80 ? '🔥 *RATCHET SUPER* (floor ≥+50% net)'
+      : peakGainPct >= 45 ? '💪 *RATCHET SOLID* (floor ≥+25% net)'
+      : peakGainPct >= 22 ? '🛡️ *BEP LOCK* (floor +3.5% net — trade ini tak bisa rugi)'
+      : '⏳ *MENDAKI* (butuh peak +22% untuk kunci BEP)';
 
     text += `🪙 *#${p.id} ${p.token_symbol}* (${p.token_name})\n` +
       `• Status: ${statusBadge}\n` +
@@ -766,12 +865,10 @@ async function renderPositions(ctx: any, page: number = 1) {
       `• Modal: *${p.entry_sol.toFixed(3)} SOL* (~$${(p.entry_sol * solPrice).toFixed(2)})\n` +
       `• Gross PnL: *${isProfit ? '+' : ''}${p.pnl_pct.toFixed(2)}%* ${isProfit ? '🟢' : '🔴'} (*${p.pnl_usd >= 0 ? '+' : ''}$${p.pnl_usd.toFixed(2)}*)\n` +
       `• 💰 *Net Laba Bersih:* *${netProfit ? '+' : ''}$${netPnlUsd.toFixed(2)}* ${netProfit ? '🟢' : '🔴'}\n` +
-      `🎯 *Target TP (+${tpPct.toFixed(0)}%):* *${formatPrice(tpPrice)}* (Jarak: ${distToTp > 0 ? `+${distToTp.toFixed(1)}%` : 'Tercapai! 🚀'})\n` +
-      `🛑 *Stop-Loss (-${slPct.toFixed(0)}%):* *${formatPrice(slPrice)}* (Jarak aman: ${distToSl.toFixed(1)}%)\n`;
+      `🛑 *Hard SL (-${slPct.toFixed(1)}%):* *${formatPrice(slPrice)}* (Jarak: ${distToSl.toFixed(1)}%)\n`;
 
     if (p.peak_price_usd && p.peak_price_usd > p.entry_price_usd) {
-      const trailingTriggerPrice = p.peak_price_usd * (1 - CONFIG.TRAILING_STOP_PCT / 100);
-      text += `• Puncak ATH: *${formatPrice(p.peak_price_usd)}* | Trailing Trigger: *${formatPrice(trailingTriggerPrice)}*\n`;
+      text += `• Puncak ATH: *${formatPrice(p.peak_price_usd)}* (peak +${peakGainPct.toFixed(1)}%) | Exit: ratchet trailing adaptif 100%\n`;
     }
 
     text += `🏷️ Sinyal: _${p.whale_source || 'Quant Scanner'}_\n` +
@@ -876,7 +973,20 @@ async function renderReport(ctx: any) {
         const pnlText = h.action === 'SELL'
           ? ` (${h.pnl_pct >= 0 ? '+' : ''}${h.pnl_pct.toFixed(1)}% / ${h.pnl_sol >= 0 ? '+' : ''}${h.pnl_sol.toFixed(4)} SOL)`
           : '';
-        const actionBadge = h.action === 'BUY' ? '🟢 BELI' : (h.pnl_pct >= 0 ? '🟢 TP' : '🔴 SL');
+        // O-15: badge from the exit CLASS (reason), not the pnl sign — a
+        // manual cut-loss at -2% is MANUAL, not SL; a TIME_STOP that closed
+        // +1% is TIME_STOP, not TP.
+        const exitBadge = (reason: string): string => {
+          switch (classifyExitReason(reason || '')) {
+            case 'PROFIT_TAKE': return '🟢 TP';
+            case 'STOP': return '🔴 SL';
+            case 'EMERGENCY': return '🚨 DARURAT';
+            case 'MANUAL': return '👤 MANUAL';
+            case 'TIME_STOP': return '⏱️ TIME-STOP';
+            default: return '🔴 SL';
+          }
+        };
+        const actionBadge = h.action === 'BUY' ? '🟢 BELI' : exitBadge(h.reason);
         const cleanSymbol = (h.token_symbol || '').replace(/[*_`]/g, '');
         const cleanReason = (h.reason || '').replace(/[*_`]/g, ' ').trim();
         text += `• ${actionBadge} *${cleanSymbol}*: ${h.total_sol.toFixed(3)} SOL${pnlText} \`[${cleanReason}]\`\n`;
@@ -947,6 +1057,13 @@ async function renderQuantMetrics(ctx: any) {
       `• Gross PnL: *${metrics.grossPnlSol >= 0 ? '+' : ''}${metrics.grossPnlSol.toFixed(4)} SOL*\n` +
       `• Gas Drag & Jito Tips: *-${metrics.totalFeesSol.toFixed(4)} SOL*\n` +
       `• 💰 *Net Laba Bersih:* *${metrics.netPnlSol >= 0 ? '+' : ''}${metrics.netPnlSol.toFixed(4)} SOL* (~$${netPnlUsd.toFixed(2)})\n`;
+
+    // O-16: Sharpe/Sortino on a handful of trades are noise with a fancy
+    // label. Say so explicitly instead of letting "INSTITUTIONAL" imply
+    // statistical significance.
+    if (metrics.totalTrades < 30) {
+      text += `\n⚠️ *Sampel kecil (n=${metrics.totalTrades} < 30):* Sharpe / Sortino / Calmar di atas BELUM signifikan secara statistik. Jangan ambil keputusan dari angka-angka ini.\n`;
+    }
 
     await safeReplyWithMarkdown(ctx, text, Markup.inlineKeyboard([
       [
@@ -1090,11 +1207,12 @@ async function renderSettings(ctx: any) {
     `• Nominal Default Buy: *${CONFIG.DEFAULT_BUY_AMOUNT_SOL} SOL*\n` +
     `• Max Open Positions: *${CONFIG.MAX_OPEN_POSITIONS} token*\n` +
     `• Slippage Toleransi: *${CONFIG.SLIPPAGE_PCT}%*\n\n` +
-    `🎯 *Exit & Proteksi Profit:*\n` +
-    `• Stage 1 Take-Profit: *+${CONFIG.TAKE_PROFIT_PCT}%* (Jual 50% & Kunci Modal)\n` +
-    `• Stage 2 Moonbag Trailing Stop: *-${CONFIG.TRAILING_STOP_PCT}%* dari ATH\n` +
+    `🎯 *Exit & Proteksi Profit (100% single-exit, TANPA partial close):*\n` +
+    `• Dynamic Ratchet Tiers (dari peak gain): *+22% → floor +3.5% net (BEP lock)* | *+45% → floor +25%* | *+80% → floor +50%* | *+150% → floor +100%*\n` +
+    `• Floor kontinu NET-of-fees, trailing adaptif 10-20% dari peak\n` +
     `• Hard Stop-Loss: *-${CONFIG.STOP_LOSS_PCT}%*\n` +
-    `• Flash-Exit Rug Buster: Dump jika likuiditas hilang *>${CONFIG.FLASH_EXIT_DROP_PCT}%*\n\n` +
+    `• Zombie Reaper: time-stop posisi stagnan (daur ulang modal mati)\n` +
+    `• Flash-Exit Rug Buster: dump 100% jika likuiditas drop ≥50% & di bawah $12k\n\n` +
     `🛡️ *Survival Phase Funnel:*\n` +
     `• Anti-Detik-0 Usia Minimum: *${CONFIG.MIN_TOKEN_AGE_SEC} detik (3 menit)*\n` +
     `• Bonding Curve Sweet Spot: *${CONFIG.BONDING_CURVE_MIN_PCT}% - ${CONFIG.BONDING_CURVE_MAX_PCT}%*\n` +
@@ -1184,9 +1302,11 @@ bot.action(/confirm_sell_100_(\d+)/, async (ctx) => {
     await ctx.editMessageText(`⏳ *Mengeksekusi penjualan posisi #${posId} (${cleanSymbol})...*`, { parse_mode: 'Markdown' }).catch(() => {});
   } catch {}
 
-  const result = await executeSellToken(posId, 100, 'MANUAL_INLINE_BUTTON');
+  const result = await executeSellToken(posId, 100, 'MANUAL_INLINE_BUTTON', 'MANUAL');
   if (!result.success) {
     await safeReplyWithMarkdown(ctx, `❌ *Gagal mengeksekusi penjualan:* ${result.message}`);
+  } else {
+    await safeReplyWithMarkdown(ctx, `✅ *Penjualan manual dieksekusi:* ${result.message}`);
   }
 });
 
@@ -1287,8 +1407,31 @@ bot.action('action_unwatch', async (ctx) => {
   await ctx.replyWithMarkdown(`🔕 *Notifikasi Dimatikan.* Ketik \`/watch\` untuk menyalakan kembali.`);
 });
 
-function formatNumber(num: number): string {
-  if (!num) return '0';
+/**
+ * O-04: all-time realized PnL, TRUE NET of fees, from trade_history.net_pnl_sol
+ * (populated by the fee-unified close path). Win/loss counts are net-based too —
+ * a trade that is +0.5% gross but -2.4% net is a LOSS here, never a win.
+ */
+function getAllTimeRealizedNetPnlSol(): { netSol: number; wins: number; losses: number; winRate: string } {
+  try {
+    const rows = db.prepare(
+      "SELECT COALESCE(net_pnl_sol, pnl_sol, 0) AS net FROM trade_history WHERE action = 'SELL'"
+    ).all() as Array<{ net: number }>;
+    const wins = rows.filter(r => r.net > 0).length;
+    const losses = rows.filter(r => r.net <= 0).length;
+    const total = wins + losses;
+    return {
+      netSol: rows.reduce((a, r) => a + r.net, 0),
+      wins,
+      losses,
+      winRate: total > 0 ? ((wins / total) * 100).toFixed(1) : '0.0'
+    };
+  } catch {
+    return { netSol: 0, wins: 0, losses: 0, winRate: '0.0' };
+  }
+}
+
+function formatNumber(num: number): string {  if (!num) return '0';
   if (num >= 1_000_000_000) return (num / 1_000_000_000).toFixed(2) + 'B';
   if (num >= 1_000_000) return (num / 1_000_000).toFixed(2) + 'M';
   if (num >= 1_000) return (num / 1_000).toFixed(2) + 'K';

@@ -23,8 +23,6 @@ export interface FunnelCandidate {
   priceUsd: number;
   tokenAgeSeconds?: number;
   bondingCurveProgressPct?: number;
-  devHoldingPct?: number;
-  uniqueHoldersCount?: number;
   safetyReport?: RugCheckResult | null;
   isCabalSuspect?: boolean;
 }
@@ -35,8 +33,6 @@ export interface FunnelEvaluation {
     | 'BASIC_ELIGIBILITY' 
     | 'SURVIVAL_PHASE_AGE' 
     | 'BONDING_CURVE_GATE' 
-    | 'DEV_CONCENTRATION' 
-    | 'HOLDER_DISPERSION' 
     | 'LIQUIDITY_FILTER' 
     | 'ACTIVITY_FILTER' 
     | 'SAFETY_GATE';
@@ -63,8 +59,6 @@ export class DiscoveryFunnel {
       marketCapUsd, 
       tokenAgeSeconds,
       bondingCurveProgressPct,
-      devHoldingPct,
-      uniqueHoldersCount,
       safetyReport, 
       isCabalSuspect 
     } = candidate;
@@ -138,27 +132,18 @@ export class DiscoveryFunnel {
       }
     }
 
-    // STAGE 4: Dev Holding & Sybil Concentration Filter
-    const maxDevHolding = CONFIG.MAX_DEV_HOLDING_PCT || 8.0;
-    if (devHoldingPct !== undefined && devHoldingPct > maxDevHolding) {
-      return {
-        passed: false,
-        stageFailed: 'DEV_CONCENTRATION',
-        reason: `Dev wallet menguasai ${devHoldingPct.toFixed(1)}% supply (Batas maks: ${maxDevHolding}%). Risiko dump masif ke pasar.`,
-        riskScore: 90
-      };
-    }
+    // STAGE 4 (DELETED 2026-09-29, M5): Dev Holding & Sybil Concentration Filter.
+    // The old stage measured nothing: its input was `min(top10 * 0.08, 6.0)` —
+    // a FORMULA capped at 6.0 — checked against a threshold of 8.0, so the gate
+    // could NEVER fire, while the comment claimed "Real holder metrics from
+    // anti-rug audit". Theater, not protection. Dev concentration is NOT
+    // assessed by this funnel (stated honestly instead of faked).
 
-    // STAGE 5: Unique Buyer Dispersion
-    const minHolders = CONFIG.MIN_UNIQUE_HOLDERS || 45;
-    if (uniqueHoldersCount !== undefined && uniqueHoldersCount < minHolders) {
-      return {
-        passed: false,
-        stageFailed: 'HOLDER_DISPERSION',
-        reason: `Jumlah unique holders (${uniqueHoldersCount}) kurang dari batas minimum (${minHolders}). Distribusi wallet belum organik.`,
-        riskScore: 75
-      };
-    }
+    // STAGE 5 (DELETED 2026-09-29, M6): Unique Buyer Dispersion.
+    // The old stage computed `max(30, volume24h / 1500)` and called it a holder
+    // count — a volume gate in disguise that secretly raised the effective 24h
+    // volume bar to $67.5k while upstream advertised $30k. If a $67.5k bar is
+    // wanted, it now lives EXPLICITLY in CONFIG.MIN_VOLUME_24H_USD (STAGE 7).
 
     // STAGE 6: Minimum Liquidity Depth
     const minLiquidity = CONFIG.MIN_LIQUIDITY_USD || 6000;

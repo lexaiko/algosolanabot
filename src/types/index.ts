@@ -89,6 +89,11 @@ export interface TokenMarketData {
   txns5mBuys?: number;
   txns5mSells?: number;
   pairCreatedAt?: number;
+  /** M7 (2026-09-29): epoch ms when this snapshot was fetched from DexScreener.
+   *  Buy-side rejects data older than 60s. Travels with the cached object so a
+   *  429-backoff stale serve is detectable downstream. REQUIRED — every
+   *  producer must set it. */
+  fetchedAt: number;
 }
 
 export interface QueuedWhale {
@@ -121,5 +126,11 @@ export interface ExecutionDataReason {
   reboundTickPct?: number;
   buys5m?: number;
   sells5m?: number;
+  /** M4 (2026-09-29): decision-journal id from the scanner's EVALUATED log, so
+   *  executeBuyToken can mark it EXECUTED (on fill) or FAILED (on reject). */
+  decisionId?: string;
 }
 
+
+// Re-export ExitClass from core types (single source of truth, 2026-09-29 F-01).
+export type { ExitClass } from '../core/types';

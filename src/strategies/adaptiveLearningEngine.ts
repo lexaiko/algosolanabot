@@ -119,7 +119,7 @@ export class AdaptiveLearningEngine {
    * the stop-loss, because a stop that moves with 5 winning trades is not
    * risk management, it is overfitting.
    */
-  public getDynamicTpSl(_realizedVol: number = 0, _atrPct: number = 0): DynamicTpSlTargets {
+  public getDynamicTpSl(_realizedVol: number = 0): DynamicTpSlTargets {
     const targetSlPct = HARD_SL_PCT;
     const targetTpPct = 45.0;
     return {
@@ -140,7 +140,11 @@ export class AdaptiveLearningEngine {
   public onTradeClosed(outcome: TradeOutcomeFeedback): void {
     try {
       this.sampleTradeCount += 1;
-      const isWin = outcome.netPnlSol > 0 || outcome.pnlPct > 0;
+      // m-3 (2026-09-29): NET unification. A trade that is gross-positive but
+      // net-negative (fees ate it) is a LOSS — the old `|| outcome.pnlPct > 0`
+      // counted it as a win and flattered the attribution win-rate.
+      // One definition of win/loss = NET, everywhere.
+      const isWin = outcome.netPnlSol > 0;
       const setupKey = this.normalizeSetupKey(outcome.setupType, outcome.strategySource, outcome.reason);
 
       const existingAttributions = getStrategyAttributionRecords();
@@ -202,14 +206,18 @@ export class AdaptiveLearningEngine {
   private adaptEntryHurdleGated(): void {
     if (this.sampleTradeCount < MIN_TRADES_FOR_HURDLE_ADAPT) return;
     try {
+      // M-6 (2026-09-29): NET unification. The old query read pnl_sol (gross
+      // of buy fee) — a marginally gross-positive / net-negative trade counted
+      // as a win, biasing the 15-trade win-rate optimistic and loosening the
+      // entry hurdle exactly when it should tighten. One definition = NET.
       const recentRows = db.prepare(`
-        SELECT pnl_sol FROM trade_history
+        SELECT net_pnl_sol FROM trade_history
         WHERE action = 'SELL'
         ORDER BY id DESC LIMIT 15
-      `).all() as Array<{ pnl_sol: number }>;
+      `).all() as Array<{ net_pnl_sol: number }>;
       if (recentRows.length < 10) return;
 
-      const wins = recentRows.filter(r => r.pnl_sol > 0).length;
+      const wins = recentRows.filter(r => (r.net_pnl_sol ?? 0) > 0).length;
       const winRate = (wins / recentRows.length) * 100;
 
       let target = 75;

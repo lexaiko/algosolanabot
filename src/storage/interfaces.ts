@@ -30,6 +30,15 @@ export interface IStorageRepository {
   recordDecision(entry: DecisionJournalRecord): Promise<void>;
   getDecisions(limit?: number): Promise<DecisionJournalRecord[]>;
   updateCounterfactualOutcome(decisionId: string, returns: { return15m?: number; return1h?: number; return4h?: number }): Promise<void>;
+  /** M4 (2026-09-29): mark an EVALUATED decision with its real outcome —
+   *  EXECUTED (real fill) or FAILED (rejected/failed buy). New columns only. */
+  markDecisionOutcome(decisionId: string, outcome: {
+    decision: 'EXECUTED' | 'FAILED';
+    verdict?: 'PASS' | 'SKIP';
+    positionId?: number;
+    executedAt?: string;
+    reason?: string;
+  }): Promise<void>;
 
   // Orders & Positions
   saveOrder(order: OrderIntent): Promise<void>;

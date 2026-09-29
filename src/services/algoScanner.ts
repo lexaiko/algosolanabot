@@ -1,8 +1,8 @@
 import axios from 'axios';
 import { getTokenMarketData, getMultiTokenMarketData, getSolPriceUsd } from './dexscreener';
 import { checkTokenSafety } from './antirug';
-import { executeBuyToken, getDynamicAlgoBuyAmount } from './tradeManager';
-import { getOpenPositions, getOpenPositionByToken, getLastClosedPosition, getPaperBalance, getWhaleQueue, isTokenBlacklisted } from '../db/index';
+import { executeBuyToken, getDynamicAlgoBuyAmount, classifyExitReason } from './tradeManager';
+import { getOpenPositions, getOpenPositionByToken, getLastClosedPosition, getPaperBalance, isTokenBlacklisted } from '../db/index';
 import { discoveryFunnel } from '../market/discoveryFunnel';
 import { opportunityScorer } from '../execution/opportunityScorer';
 import { entryEngine } from '../execution/entryEngine';
@@ -10,17 +10,25 @@ import { adaptiveLearningEngine } from '../strategies/adaptiveLearningEngine';
 import { addTokenToWatchlist } from './marketStreamer';
 import { FeatureVector, StrategySignal } from '../core/types';
 import { CONFIG } from '../config';
-import { tokenTape } from '../market/tokenTape';
+import { tokenTape, tapeVolume5mNormalized, tapeReturnPerMinutePct } from '../market/tokenTape';
 import { DecisionJournal } from '../journal/decisionJournal';
 import { getStorageRepository } from '../storage/index';
+// O-10 (2026-09-29): autonomy kill-switch — no autonomous buys without oversight.
+import { isAutonomousBuyEnabled, getAutonomyDisableReason } from '../core/autonomy';
 
 /**
  * Multi-Stream Candidate Ingestion with Institutional Upstream Quality Filtering:
- * 1. Collects candidates from GeckoTerminal Solana Trending Pools (Real on-chain DEX volume across Raydium, Meteora, Orca).
- * 2. Fetches DexScreener Solana High Volume Search & Trending Pairs (Real AMM activity, NOT paid ads).
- * 3. Enriches with Local SQLite Whale Queue targets.
- * 4. Discards 100% of micro-liquidity (<$35k) traps upfront.
- * 5. Sorts genuine runners by 5m volume & velocity descending.
+ * 1. Collects candidates from Raydium v3 Pools by 24h Volume and GeckoTerminal
+ *    Solana Trending Pools (on-chain DEX activity).
+ *    M8 (2026-09-29): the DexScreener token-BOOSTS feed was REMOVED — it is a
+ *    PAID ads endpoint, and the old docstring's "NOT paid ads" claim was false.
+ *    Feeding paid placements into the candidate pool is systematic adverse
+ *    selection (promotion/dump schemes buy their way in).
+ * 2. Enriches with batch DexScreener market data.
+ *    m16 (2026-09-29): the legacy SQLite whale-queue ingestion was REMOVED —
+ *    this project does not track whale wallets; the queue was a dead concept.
+ * 3. Discards 100% of micro-liquidity (<$35k) traps upfront.
+ * 4. Sorts genuine runners by 5m volume & velocity descending.
  */
 export async function getOrganicTrendingTokens(limit: number = 18): Promise<Array<{
   tokenMint: string;
@@ -42,12 +50,18 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
       isTokenBlacklisted(mint)
     ) return true;
 
-    // Strict 24-Hour Quarantine (1440m) for any token that triggered Stop-Loss or Rescue Dump
+    // Strict 24-Hour Quarantine (1440m) for any token with a forced or losing exit.
+    // m6 (2026-09-29): keys off ExitClass via classifyExitReason (STOP /
+    // EMERGENCY / TIME_STOP) — the old includes('SL')/includes('DUMP') substring
+    // check missed FLASH_EXIT_RUG_BUSTER, ZOMBIE_* and TIME_STOP/MAX_HOLD exits.
+    // Consistent with the buy-path quarantine in executeBuyToken.
     const lastClosed = getLastClosedPosition(mint);
     if (lastClosed && lastClosed.closed_at) {
       const msSince = Date.now() - new Date(lastClosed.closed_at).getTime();
       const minsSince = msSince / 60000;
-      if (lastClosed.pnl_pct <= 0 || (lastClosed.close_reason && (lastClosed.close_reason.includes('SL') || lastClosed.close_reason.includes('DUMP')))) {
+      const lastCloseClass = lastClosed.close_reason ? classifyExitReason(lastClosed.close_reason) : 'PROFIT_TAKE';
+      const wasForcedExit = lastCloseClass === 'STOP' || lastCloseClass === 'EMERGENCY' || lastCloseClass === 'TIME_STOP';
+      if (lastClosed.pnl_pct <= 0 || wasForcedExit) {
         if (minsSince < 1440) return true; // Exclude from candidate ingestion
       }
     }
@@ -69,22 +83,6 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
     }
   } catch (err: any) {
     console.warn('[AlgoScanner] Raydium v3 pools unavailable:', err.message);
-  }
-
-  // 1b. DexScreener Top Boosted Solana Velocity Tokens (Hot runners with verified organic volume & community velocity)
-  try {
-    const boostRes = await axios.get('https://api.dexscreener.com/token-boosts/top/v1', {
-      timeout: 6000,
-      headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
-    });
-    const items = Array.isArray(boostRes.data) ? boostRes.data : [];
-    for (const item of items) {
-      if (item.chainId === 'solana' && item.tokenAddress && !isExcluded(item.tokenAddress)) {
-        rawMints.add(item.tokenAddress);
-      }
-    }
-  } catch (err: any) {
-    console.warn('[AlgoScanner] DexScreener boosted pools unavailable:', err.message);
   }
 
   // 2. GeckoTerminal Multi-Page Trending Pools (Solana network-wide on-chain velocity across Raydium, Orca, Meteora)
@@ -112,15 +110,9 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
     console.warn('[AlgoScanner] GeckoTerminal trending pools unavailable:', err.message);
   }
 
-  // 3. Local SQLite Whale Queue targets (Smart money wallets)
-  try {
-    const queued = getWhaleQueue(15);
-    for (const w of queued) {
-      if (w.reference_token && !isExcluded(w.reference_token)) {
-        rawMints.add(w.reference_token);
-      }
-    }
-  } catch {}
+  // m16 (2026-09-29): legacy whale-queue ingestion REMOVED. This project does
+  // not track whale wallets and does no whale-follow; ingesting the queue as
+  // candidates was a dead concept kept alive by habit.
 
   const allCandidateMints = Array.from(rawMints);
   if (allCandidateMints.length === 0) return [];
@@ -168,11 +160,14 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
   }
 
   // Sort by Positive Momentum Velocity & Volatility (Favors genuine uptrend runners over bleeding dumps)
+  // m17 (2026-09-29): the old Math.max(0.1, momentum) collapsed every
+  // negative-momentum token to 0.1 — dumps were never deprioritized vs flat
+  // tokens. Raw momentum now sorts dumps to the bottom honestly.
   validRunners.sort((a, b) => {
     const momA = (a.priceChange5m * 2.0 + a.priceChange1h * 0.8);
     const momB = (b.priceChange5m * 2.0 + b.priceChange1h * 0.8);
-    const scoreA = Math.max(0.1, momA) * Math.log10(Math.max(10, a.volume5m));
-    const scoreB = Math.max(0.1, momB) * Math.log10(Math.max(10, b.volume5m));
+    const scoreA = momA * Math.log10(Math.max(10, a.volume5m));
+    const scoreB = momB * Math.log10(Math.max(10, b.volume5m));
     return scoreB - scoreA;
   });
 
@@ -181,6 +176,9 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
 
 let isScannerRunning = false;
 let scannerTimer: NodeJS.Timeout | null = null;
+// O-20 (2026-09-29): shutdown guard — set by stopAlgoScanner; runAlgoScanCycle
+// must not fire a buy once shutdown has begun.
+let isShuttingDown = false;
 const SCAN_INTERVAL_MS = 10 * 60 * 1000; // 10m gentle background watchdog sync (Live trading handled by marketStreamer WS)
 
 type TelegramNotifier = (message: string, extra?: any) => Promise<void>;
@@ -216,9 +214,12 @@ export interface ScannedCandidate {
   ret1h: number;
   buys5m: number;
   sells5m: number;
-  volume5mUsd: number;
+  volume5mUsd?: number;
   regime: string;
   entryMode?: 'PULLBACK_ABSORPTION';
+  /** M4: decision-journal id of the EVALUATED log, passed to executeBuyToken
+   *  so the fill (or rejection) can mark it EXECUTED / FAILED. */
+  decisionId?: string;
 }
 
 /**
@@ -236,7 +237,15 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
     try {
       let market = marketMap.get(item.tokenMint) || await getTokenMarketData(item.tokenMint);
 
-      // Fast on-chain fallback for Pump.fun tokens if DexScreener has not indexed yet
+      // Fast on-chain fallback for Pump.fun tokens if DexScreener has not indexed yet.
+      // C2 FIX (2026-09-29): the old code INVENTED a full market snapshot here
+      // (priceChange5m: 3.5, volume1h/5m as fractions of liquidity, txns 20/6,
+      // fake pair age) — values tuned to PASS the entry gates, so a token with
+      // ZERO measured data could reach ENTRY. Now: real bonding-curve fields only
+      // (price/liquidity); momentum, volume and flow stay UNKNOWN (undefined).
+      // The candidate is quarantined to tape observation until DexScreener indexes
+      // it — it is recorded below but never scored on invented data.
+      let marketDataUnindexed = false;
       if (!market && item.tokenMint.endsWith('pump')) {
         try {
           const { getOnChainBondingCurve } = await import('./bondingCurve');
@@ -256,14 +265,17 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
               dexId: 'pumpfun',
               url: `https://pump.fun/${item.tokenMint}`,
               priceChange24h: 0,
-              priceChange5m: 3.5,
-              volume24h: curve.liquiditySol * solPrice,
-              volume1h: (curve.liquiditySol * solPrice) * 0.3,
-              volume5m: (curve.liquiditySol * solPrice) * 0.1,
-              txns5mBuys: 20,
-              txns5mSells: 6,
-              pairCreatedAt: Date.now() - (600 * 1000)
+              priceChange5m: undefined,
+              volume24h: undefined,
+              volume1h: undefined,
+              volume5m: undefined,
+              txns5mBuys: undefined,
+              txns5mSells: undefined,
+              pairCreatedAt: undefined,
+              // M7: real curve fields only — timestamped like any market snapshot.
+              fetchedAt: Date.now()
             };
+            marketDataUnindexed = true;
           }
         } catch {}
       }
@@ -274,15 +286,27 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
       // features over synthetic derivations. Fed by WS ticks (watchlist) and
       // these 10-min snapshots (all scanned tokens).
       tokenTape.record(item.tokenMint, market.priceUsd, market.volume24h || 0, market.liquidityUsd || 0);
+
+      // C2 quarantine: observe via tape, do NOT score until real market data exists.
+      if (marketDataUnindexed) {
+        console.log(`[AlgoScanner] ⏳ ${item.tokenMint.slice(0, 8)}... belum ter-index DexScreener (momentum/volume/flow unknown) — observasi tape dulu, scoring ditunda.`);
+        continue;
+      }
       const tape = tokenTape.getFeatures(item.tokenMint);
       const tapeReady = tape.hasTape && tape.points >= 2;
 
       const safety = await checkTokenSafety(item.tokenMint);
 
-      // Real token age calculated from blockchain pair creation timestamp
-      let tokenAgeSec = 600;
+      // m5 (2026-09-29): token age UNKNOWN fails closed. The old default of 600s
+      // let age-less tokens sail through the 180s anti-genesis gate — a token
+      // whose pair creation time is unknown must not be scored.
+      let tokenAgeSec: number | undefined = undefined;
       if (market.pairCreatedAt) {
         tokenAgeSec = Math.max(1, Math.floor((Date.now() - market.pairCreatedAt) / 1000));
+      }
+      if (tokenAgeSec === undefined) {
+        console.log(`[AlgoScanner] ⏳ ${item.tokenMint.slice(0, 8)}... umur token unknown (pairCreatedAt tak ada) — tolak (fail closed).`);
+        continue;
       }
 
       const isPump = item.tokenMint.endsWith('pump');
@@ -300,13 +324,21 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
             }
           }
         } catch {}
-        if (bondingCurvePct === undefined) bondingCurvePct = 50.0;
+        // m4 (2026-09-29): curve fetch FAILED fails closed. The old fallback of
+        // 50.0 sat inside the [15, 85] funnel gate — an unverifiable curve
+        // passed the safety gate by invention.
+        if (bondingCurvePct === undefined) {
+          console.log(`[AlgoScanner] ⛔ ${item.tokenMint.slice(0, 8)}... bonding curve tak terverifikasi (fetch gagal) — tolak (fail closed).`);
+          continue;
+        }
       }
 
-      // Real holder metrics from anti-rug audit
-      const top10 = safety.top10HoldersPct || 35.0;
-      const devHoldingPct = Math.min(top10 * 0.08, 6.0);
-      const uniqueHoldersCount = Math.max(30, Math.floor((market.volume24h || 50000) / 1500));
+      // M5+M6 (2026-09-29): DELETED the fabricated "holder metrics". The old
+      // code computed devHoldingPct = min(top10 * 0.08, 6.0) (capped below the
+      // 8.0 gate — could never fire) and uniqueHoldersCount = max(30, vol/1500)
+      // (a volume gate in disguise), then labeled them "Real holder metrics
+      // from anti-rug audit". We measure neither; funnel STAGEs 4/5 are gone
+      // and the volume bar is explicit in CONFIG.MIN_VOLUME_24H_USD.
 
       const funnelEval = discoveryFunnel.evaluateCandidate({
         token: {
@@ -334,25 +366,35 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
         priceUsd: market.priceUsd,
         tokenAgeSeconds: tokenAgeSec,
         bondingCurveProgressPct: bondingCurvePct,
-        devHoldingPct,
-        uniqueHoldersCount,
         safetyReport: safety
       });
 
-      // Real Microstructure Feature Vector computed from live DexScreener & on-chain data
-      const buys5m = market.txns5mBuys || 0;
-      const sells5m = market.txns5mSells || 0;
+      // Real Microstructure Feature Vector computed from live DexScreener & on-chain data.
+      // C3 FIX (2026-09-29): ONE honest rule for the ratio. "No sells measured" is
+      // NOT "infinite buy dominance" — the old code invented 3.0 here (2.5 on the WS
+      // path, 2.0 in the Telegram reason), all tuned to PASS the buy-dominance gate.
+      // When sells5m == 0 or flow is unknown, the ratio is UNDEFINED and downstream
+      // gates fail closed; flowImbalance already answers dominance without invention.
+      const txnsUnknown = market.txns5mBuys === undefined || market.txns5mSells === undefined;
+      const buys5m = market.txns5mBuys ?? 0;
+      const sells5m = market.txns5mSells ?? 0;
       const tradeCount5m = buys5m + sells5m;
-      const buySellRatio = sells5m > 0 ? (buys5m / sells5m) : (buys5m > 0 ? 3.0 : 1.0);
+      const buySellRatio: number | undefined =
+        (!txnsUnknown && sells5m > 0) ? (buys5m / sells5m) : undefined;
       const flowImbalance = tradeCount5m > 0 ? (buys5m - sells5m) / tradeCount5m : 0;
-      // True interval flow from the tape (delta of 24h volume between observations)
-      // beats DexScreener's 5m field; fall back to the field, then to a 24h slice.
-      const volume5mUsd = tape.intervalVolumeUsd ?? market.volume5m ?? ((market.volume24h || 0) / 288);
-      const volume1hUsd = market.volume1h || ((market.volume24h || 0) / 24);
-      
-      // Pro Trader RVOL: 5m relative volume acceleration vs 1h baseline
-      const rvol5m = volume1hUsd > 0 ? Math.min(10, (volume5mUsd * 12) / volume1hUsd) : 1.0;
-      const volumeAcceleration = rvol5m;
+      // M1 (2026-09-29): the tape's interval volume is normalized to a 5-minute
+      // equivalent by ACTUAL elapsed minutes (tapeVolume5mNormalized). The old
+      // code annualized the raw ~10-minute delta x12, inflating
+      // volumeAcceleration ~2x and weakening the R1 absorption gate to ~0.75x
+      // of its design (plus 2x-inflated avgTradeSize/netBuyFlow/BUY_PRESSURE).
+      // Null (unmeasurable) stays undefined -> scorer Volume 0 pts, R1 fails
+      // closed (C4 semantics preserved).
+      const volume5mUsd: number | undefined = tapeVolume5mNormalized(tape) ?? market.volume5m;
+      const volume1hUsd: number | undefined = market.volume1h;
+      const volumeAcceleration: number | undefined =
+        (volume5mUsd !== undefined && volume1hUsd !== undefined && volume1hUsd > 0)
+          ? Math.min(10, (volume5mUsd * 12) / volume1hUsd)
+          : undefined;
 
       const ret5m = market.priceChange5m || 0;
       // Realized vol from the tape when mature; otherwise a same-scale proxy.
@@ -363,21 +405,29 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
       // We do NOT track whale wallets. Both fields below are heuristics derived
       // from aggregate buy/sell counts, documented as estimates, and left
       // undefined when the trade sample is too thin to say anything.
-      const solPriceVal = (market.priceNative && market.priceNative > 0) ? (market.priceUsd / market.priceNative) : 180;
-      const avgTradeSizeUsd = tradeCount5m > 0 ? volume5mUsd / tradeCount5m : 80;
-      const avgTradeSizeSol = solPriceVal > 0 ? (avgTradeSizeUsd / solPriceVal) : 0.5;
+      // m2 (2026-09-29): no $180 literal — fall back to the cached SOL price.
+      const solPriceVal = (market.priceNative && market.priceNative > 0) ? (market.priceUsd / market.priceNative) : await getSolPriceUsd();
+      // m15 (2026-09-29): no $80 invented trade size — unknown stays unknown
+      // (netBuyFlowSolEst goes undefined instead of being built on a guess).
+      const avgTradeSizeUsd: number | undefined = (tradeCount5m > 0 && volume5mUsd !== undefined) ? volume5mUsd / tradeCount5m : undefined;
+      const avgTradeSizeSol: number | undefined = (avgTradeSizeUsd !== undefined && solPriceVal > 0) ? (avgTradeSizeUsd / solPriceVal) : undefined;
       const netTrades = Math.max(0, buys5m - sells5m);
-      const netBuyFlowSolEst = (buySellRatio >= 1.5 && tradeCount5m >= 10)
+      const netBuyFlowSolEst = (buySellRatio !== undefined && buySellRatio >= 1.5 && tradeCount5m >= 10 && avgTradeSizeSol !== undefined)
         ? Math.round(netTrades * avgTradeSizeSol * 10) / 10
         : undefined;
+      // C3: buyPressureScore from measured flow only. The old code let an INVENTED
+      // ratio (3.0) push this to 90 on "no sells measured". Now: ratio undefined →
+      // judge by flowImbalance (honest); thin sample → undefined (fail closed).
       const buyPressureScore = tradeCount5m >= 10
-        ? (buySellRatio >= 1.8 ? 90 : (buySellRatio >= 1.3 ? 75 : 45))
+        ? (buySellRatio !== undefined
+            ? (buySellRatio >= 1.8 ? 90 : (buySellRatio >= 1.3 ? 75 : 45))
+            : (flowImbalance >= 0.6 ? 90 : (flowImbalance >= 0.3 ? 75 : 45)))
         : undefined;
 
       // Construct Strategy Signals for Multi-Factor Consensus
       const tokenSym = market.symbol || item.poolName || 'UNKNOWN';
       const signals: StrategySignal[] = [];
-      if (rvol5m >= 1.6 && ret5m >= 2.5) {
+      if (volumeAcceleration !== undefined && volumeAcceleration >= 1.6 && ret5m >= 2.5) {
         signals.push({
           signalId: `sig_${item.tokenMint.slice(0, 6)}_${Date.now()}_mom`,
           tokenId: item.tokenMint,
@@ -385,17 +435,25 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
           strategyName: 'MOMENTUM',
           strategyVersion: '1.0',
           direction: 'BUY',
-          confidence: Math.min(1.0, rvol5m / 3.0),
+          confidence: Math.min(1.0, volumeAcceleration / 3.0),
           regime: 'TRENDING_UP',
           invalidationPriceUsd: market.priceUsd * 0.9,
           targetTpPct: 25,
           targetSlPct: 8,
           suggestedHoldingPeriodMinutes: 15,
           featureSnapshot: {},
+          // M11: all three scanner signals derive from the SAME 5m DexScreener
+          // window — tagged honestly so the consensus bonus is not paid in full.
+          sourceTag: 'dexscreener-5m',
           generatedAt: new Date().toISOString()
         });
       }
-      if (buySellRatio >= 1.6 && tradeCount5m >= 8) {
+      // C3: FLOW signal from measured dominance only. Zero-sell case judged by
+      // flowImbalance on the same scale (never an invented ratio).
+      const flowSignalStrength = buySellRatio !== undefined
+        ? buySellRatio
+        : (flowImbalance >= 0.6 ? 2.0 : 0);
+      if (flowSignalStrength >= 1.6 && tradeCount5m >= 8) {
         signals.push({
           signalId: `sig_${item.tokenMint.slice(0, 6)}_${Date.now()}_flow`,
           tokenId: item.tokenMint,
@@ -403,13 +461,16 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
           strategyName: 'FLOW_IMBALANCE',
           strategyVersion: '1.0',
           direction: 'BUY',
-          confidence: Math.min(1.0, buySellRatio / 3.0),
+          confidence: Math.min(1.0, flowSignalStrength / 3.0),
           regime: 'TRENDING_UP',
           invalidationPriceUsd: market.priceUsd * 0.9,
           targetTpPct: 20,
           targetSlPct: 7,
           suggestedHoldingPeriodMinutes: 10,
           featureSnapshot: {},
+          // M11: all three scanner signals derive from the SAME 5m DexScreener
+          // window — tagged honestly so the consensus bonus is not paid in full.
+          sourceTag: 'dexscreener-5m',
           generatedAt: new Date().toISOString()
         });
       }
@@ -428,40 +489,48 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
           targetSlPct: 6,
           suggestedHoldingPeriodMinutes: 20,
           featureSnapshot: {},
+          // M11: all three scanner signals derive from the SAME 5m DexScreener
+          // window — tagged honestly so the consensus bonus is not paid in full.
+          sourceTag: 'dexscreener-5m',
           generatedAt: new Date().toISOString()
         });
       }
 
-      // Pullback & rebound state: REAL tape first, synthetic proxy only while the
-      // tape is too young. The old code derived all of these algebraically from
-      // ret5m alone (one input, five "features") — that is now the fallback.
-      // Note: ret1h is NOT fabricated from 24h anymore; unknown means unknown.
+      // Pullback & rebound state: REAL tape only. There is no synthetic fallback:
+      // C1 (2026-09-29) deleted the old branch that invented drawdownFromPeakPct
+      // and return1m from ret5m alone while the tape was immature — the token is
+      // skipped (continue) before reaching here until the tape matures.
+      // Note: ret1h is NOT fabricated from 24h; when unknown it falls back to 0
+      // for DISPLAY only — but the exhaustion veto fails closed on unknown
+      // (m13): an unmeasurable 1h window cannot prove "not exhausted".
       let drawdownFromPeakPct: number;
-      let return1m: number;
+      // M2 (2026-09-29): per-minute rebound rate (%/min), normalized by actual
+      // minutes between tape points. UNDEFINED when unmeasurable — entryEngine
+      // R4 fails closed (reject) on undefined.
+      let return1m: number | undefined;
       let upperWickRatio: number | undefined;
 
       if (tapeReady) {
         drawdownFromPeakPct = tape.drawdownFromPeakPct;
-        // Freshest real momentum on the tape (tick-resolution for WS tokens,
-        // 10-min resolution for scanner-only tokens).
-        return1m = tape.returnSinceLastPct ?? 0;
+        // M2: returnSinceLastPct spans minutesSincePrevPoint minutes (~10 on the
+        // scanner path) — it is NOT a 1-minute tick. The old code fed the raw
+        // ~10m return into R4's per-minute bar (+0.3%), making the rebound gate
+        // ~10x weaker than designed. Normalized to %/min here.
+        return1m = tapeReturnPerMinutePct(tape) ?? undefined;
         if (tape.upperWickRatio !== null) upperWickRatio = tape.upperWickRatio;
       } else {
-        // Conservative fallback while the tape matures: no invented drawdown,
-        // no invented wicks. The wick guard is SKIPPED when unknown (see entryEngine).
-        if (ret5m < 0) {
-          drawdownFromPeakPct = Math.abs(ret5m);
-          return1m = (buySellRatio >= 1.35 && ret5m >= -6.5) ? 0.5 : ret5m * 0.2;
-        } else if (ret5m > 8.0) {
-          drawdownFromPeakPct = 0.5;
-          return1m = 1.0;
-        } else {
-          drawdownFromPeakPct = 0;
-          return1m = ret5m * 0.15;
-        }
-        upperWickRatio = undefined;
+        // C1 FIX (2026-09-29) — FAIL CLOSED. The old code invented drawdownFromPeakPct
+        // and return1m here (the two DEFINING inputs of PULLBACK_ABSORPTION) from a
+        // single 5m return while the tape was immature — manufacturing the exact
+        // setup the model needs out of one number. Its comment even claimed
+        // "no invented drawdown" while inventing both. Now: no tape → no pullback
+        // scoring at all. The observation was already recorded above, so the token
+        // becomes scorable on a later cycle once the tape matures.
+        console.log(`[AlgoScanner] ⏳ ${item.tokenMint.slice(0, 8)}... tape belum matang (${tape.points} poin) — observasi dulu, scoring ditunda.`);
+        continue;
       }
 
+      const ret1hKnown = market.priceChange1h !== undefined;
       const ret1h = market.priceChange1h ?? 0;
 
       // Real execution economics: price impact of OUR reference buy size on THIS
@@ -476,6 +545,7 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
         tokenId: item.tokenMint,
         timestampMs: Date.now(),
         timeframe: '5m',
+        priceUsd: market.priceUsd,
         return1m,
         return5m: ret5m,
         // Honest 15m: tape-measured when mature, otherwise unknown (undefined).
@@ -512,6 +582,12 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
       if (upperWickRatio !== undefined && upperWickRatio > 0.40) {
         isExhausted = true;
         exhaustionReason = `UPPER_WICK_REJECTION (Jarum atas ${(upperWickRatio * 100).toFixed(0)}% > 40% dari body - dev/insider distribusi)`;
+      } else if (!ret1hKnown) {
+        // m13 (2026-09-29): veto FAILS CLOSED. The old `ret1h ?? 0` let the
+        // exhaustion veto never fire on unknown 1h momentum (fail-open) — an
+        // unmeasurable 1h window cannot prove the token isn't post-pump.
+        isExhausted = true;
+        exhaustionReason = `POST_PUMP_EXHAUSTION_UNKNOWN (momentum 1j tak terukur — veto fail-closed, bukan diasumsikan sehat)`;
       } else if (ret1h > 70.0 && ret5m < 0) {
         isExhausted = true;
         exhaustionReason = `POST_PUMP_EXHAUSTION (1h +${ret1h.toFixed(0)}% with 5m rolling down ${ret5m.toFixed(1)}%)`;
@@ -543,14 +619,16 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
           } else {
             const prevPeak = lastClosed.peak_price_usd || lastClosed.entry_price_usd;
             const isNewHighBreakout = market.priceUsd >= prevPeak * 0.98;
-            const hasStrongFlow = buySellRatio >= 1.8 && volumeAcceleration >= 1.4;
+            const hasStrongFlow =
+              (buySellRatio !== undefined ? buySellRatio >= 1.8 : flowImbalance >= 0.6) &&
+              (volumeAcceleration !== undefined && volumeAcceleration >= 1.4);
 
             if (!isNewHighBreakout) {
               isReEntryRejected = true;
               reEntryRejectReason = `RE_ENTRY_BELOW_PEAK (Price $${market.priceUsd.toFixed(6)} < Prev Peak $${prevPeak.toFixed(6)} - catching dump)`;
             } else if (!hasStrongFlow) {
               isReEntryRejected = true;
-              reEntryRejectReason = `RE_ENTRY_WEAK_FLOW (Buy/Sell ratio ${buySellRatio.toFixed(1)} < 1.8 for re-entry)`;
+              reEntryRejectReason = `RE_ENTRY_WEAK_FLOW (Buy/Sell ratio ${buySellRatio?.toFixed(1) ?? 'unknown'} < 1.8 for re-entry)`;
             } else {
               console.log(`[AlgoScanner] 🌊 APPROVED SMART RE-ENTRY WAVE for ${market.symbol}! (Prev Win: +${lastClosed.pnl_pct.toFixed(1)}%, New High Confirmed: $${market.priceUsd.toFixed(6)} >= $${prevPeak.toFixed(6)})`);
             }
@@ -587,6 +665,9 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
         category = 'DISCARDED';
       }
 
+      // M4: journaled below; the decisionId links the fill/rejection outcome.
+      let decisionId: string | undefined = undefined;
+
       results.push({
         mint: item.tokenMint,
         symbol: market.symbol,
@@ -605,25 +686,32 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
         sells5m,
         volume5mUsd,
         regime: vector.regime,
-        entryMode: entryDecision.entryMode
+        entryMode: entryDecision.entryMode,
+        decisionId
       });
 
-      // INSTITUTIONAL DECISION LOG: every evaluated candidate is persisted with
-      // its real features, score, and the scanner's verdict. This table is the
-      // dataset that lets us fit scorer weights empirically instead of
-      // hand-tuning them — the missing link between "strategy" and "evidence".
+      // INSTITUTIONAL DECISION LOG (M4, 2026-09-29): every evaluated candidate
+      // is persisted as EVALUATED with its PASS/SKIP verdict — NEVER as
+      // EXECUTED. The old code wrote EXECUTED at verdict time for every passed
+      // candidate (even though only qualifying[0] is ever bought, and any veto
+      // after the verdict never updated the label), contaminating the dataset
+      // used to fit scorer weights with fills that never happened. EXECUTED is
+      // written only by executeBuyToken after a real fill (keyed by
+      // decisionId); FAILED when the buy is rejected or fails.
       try {
         const journal = new DecisionJournal(getStorageRepository());
-        await journal.logCandidateDecision({
+        const rec = await journal.logCandidateDecision({
           tokenId: item.tokenMint,
           tokenSymbol: market.symbol || 'UNKNOWN',
-          decision: isPassed ? 'EXECUTED' : 'SKIPPED',
+          decision: 'EVALUATED',
+          verdict: isPassed ? 'PASS' : 'SKIP',
           compositeScore: scoreResult.compositeScore,
-          rejectionReasons: isPassed ? ['SCANNER_DECISION_EXECUTE'] : [rejectReason || 'UNKNOWN'],
+          rejectionReasons: isPassed ? ['VERDICT_PASS_AWAITING_FILL'] : [rejectReason || 'UNKNOWN'],
           featuresSnapshot: vector,
           regime: vector.regime,
           strategyName: signals.map(s => s.strategyName).join('+') || 'NONE'
         });
+        decisionId = rec.decisionId;
       } catch {}
     } catch (err: any) {
       // Continue next token
@@ -636,8 +724,24 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
 /**
  * Autonomous Background Loop: Scans and auto-buys high-scoring tokens when ALGO_ONLY or HYBRID is active
  */
+let isScanCycleRunning = false;
 export async function runAlgoScanCycle() {
+  // m19 (2026-09-29): no overlapping scan cycles. Two overlapping cycles could
+  // pass the balance check TOCTOU and double-allocate (the order lock is only
+  // per-token); the 50% heat cap bounds the damage but the design gap stays.
+  if (isScanCycleRunning) {
+    console.log('[AlgoScanner] ⏭️ Siklus scan sebelumnya masih berjalan — lewati (anti-overlap).');
+    return;
+  }
+  isScanCycleRunning = true;
   try {
+    // O-10 (2026-09-29): autonomy kill-switch. With TELEGRAM_ADMIN_ID=0 there
+    // is zero human oversight (no alerts, no /kick), so index.ts disables
+    // autonomy fail-closed — the whole autonomous cycle is skipped loudly.
+    if (!isAutonomousBuyEnabled()) {
+      console.log(`[AlgoScanner] 🛑 AUTONOMOUS BUY MATI (fail-closed): ${getAutonomyDisableReason()} — siklus scan dilewati.`);
+      return;
+    }
     console.log(`[AlgoScanner] 🔍 Menjalankan siklus scan pasar kuantitatif otonom...`);
     const dynamicMinScore = adaptiveLearningEngine.getMinEntryScore();
     const candidates = await scanMarketOnce(6);
@@ -678,6 +782,22 @@ export async function runAlgoScanCycle() {
     console.log(`[AlgoScanner] 🚀 GOLDEN OPPORTUNITY DETECTED: ${best.symbol} (${best.name}) Skor: ${best.score}/100 (Ambang Adaptif: >=${dynamicMinScore})!`);
     console.log(`[AlgoScanner] 💰 Dynamic Equity Sizing: ${allocatedSol} SOL (${dynamicSizing.rationale})`);
     
+    // O-20 (2026-09-29): a buy must never fire while shutdown is in progress.
+    // stopAlgoScanner waits for in-flight cycles, but this is the last line of
+    // defense — the race window between the check and the fill is intentional.
+    if (isShuttingDown) {
+      const shutMsg = 'SHUTDOWN_IN_PROGRESS — buy dibatalkan (O-20)';
+      console.log(`[AlgoScanner] 🛑 ${shutMsg}: ${best.symbol}`);
+      if (best.decisionId) {
+        try {
+          await new DecisionJournal(getStorageRepository()).markDecisionOutcome({
+            decisionId: best.decisionId, decision: 'FAILED', reason: shutMsg
+          });
+        } catch {}
+      }
+      return;
+    }
+
     // Execute Autonomous Buy
     await executeBuyToken(
       best.mint,
@@ -694,20 +814,26 @@ export async function runAlgoScanCycle() {
         explanation: best.explanation,
         priceChange5m: best.ret5m,
         priceChange1h: best.ret1h,
-        buySellRatio: best.sells5m > 0 ? (best.buys5m / best.sells5m) : 2.0,
+        // C3: never print an invented ratio as measured fact. Unknown → undefined.
+        buySellRatio: best.sells5m > 0 ? (best.buys5m / best.sells5m) : undefined,
         volume5mUsd: best.volume5mUsd,
         buys5m: best.buys5m,
-        sells5m: best.sells5m
+        sells5m: best.sells5m,
+        // M4: link the fill/rejection back to the scanner's EVALUATED journal row.
+        decisionId: best.decisionId
       }
     );
   } catch (err: any) {
     console.error('[AlgoScanner] Error during scan cycle:', err.message);
+  } finally {
+    isScanCycleRunning = false;
   }
 }
 
 export function startAlgoScanner() {
   if (isScannerRunning) return;
   isScannerRunning = true;
+  isShuttingDown = false; // O-20: a fresh start clears the shutdown guard.
   console.log('[AlgoScanner] 🚀 Autonomous Hedge Fund Algo Scanner aktif (Goldilocks & Volatility Engine).');
 
   // Initial delayed scan
@@ -715,10 +841,23 @@ export function startAlgoScanner() {
   scannerTimer = setInterval(() => runAlgoScanCycle(), SCAN_INTERVAL_MS);
 }
 
-export function stopAlgoScanner() {
+export async function stopAlgoScanner(): Promise<void> {
+  // O-20 (2026-09-29): the timer is cleared first so no NEW cycle starts, then
+  // we wait for an IN-FLIGHT cycle to finish before reporting stopped — a buy
+  // must never fire while the process is tearing down. The isShuttingDown
+  // guard inside runAlgoScanCycle is the last line of defense for the race
+  // window between our check and the fill.
+  isShuttingDown = true;
   if (scannerTimer) {
     clearInterval(scannerTimer);
     scannerTimer = null;
+  }
+  const waitStart = Date.now();
+  while (isScanCycleRunning && Date.now() - waitStart < 30_000) {
+    await new Promise(r => setTimeout(r, 200));
+  }
+  if (isScanCycleRunning) {
+    console.warn('[AlgoScanner] ⚠️ Siklus scan masih berjalan setelah 30s — lanjut shutdown (buy diblokir via isShuttingDown).');
   }
   isScannerRunning = false;
   console.log('[AlgoScanner] 🛑 Algo Scanner dinonaktifkan.');

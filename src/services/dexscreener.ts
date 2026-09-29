@@ -94,14 +94,20 @@ export async function getTokenMarketData(tokenAddress: string, forceFresh: boole
         dexId: bestPair.dexId || 'raydium',
         url: bestPair.url || `https://dexscreener.com/solana/${tokenAddress}`,
         priceChange24h: bestPair.priceChange?.h24 || 0,
-        priceChange1h: bestPair.priceChange?.h1 || 0,
-        priceChange5m: bestPair.priceChange?.m5 || 0,
+        // M7 (2026-09-29): preserve unknown-vs-measured. "No data" must NOT become
+        // "measured zero" at the source — downstream gates fail closed on undefined.
+        priceChange1h: bestPair.priceChange?.h1,
+        // m3 (2026-09-29): unknown 5m momentum stays undefined at the source
+        // (was `|| 0`, which manufactured a "measured 0%" reading).
+        priceChange5m: bestPair.priceChange?.m5,
         volume24h: bestPair.volume?.h24 || 0,
-        volume1h: bestPair.volume?.h1 || 0,
-        volume5m: bestPair.volume?.m5 || 0,
-        txns5mBuys: bestPair.txns?.m5?.buys || 0,
-        txns5mSells: bestPair.txns?.m5?.sells || 0,
+        volume1h: bestPair.volume?.h1,
+        volume5m: bestPair.volume?.m5,
+        txns5mBuys: bestPair.txns?.m5?.buys,
+        txns5mSells: bestPair.txns?.m5?.sells,
         pairCreatedAt: bestPair.pairCreatedAt ? Number(bestPair.pairCreatedAt) : undefined,
+        // M7: when this snapshot was fetched — buy-side rejects data older than 60s.
+        fetchedAt: Date.now(),
       };
 
       marketDataCache.set(tokenAddress, { data, timestamp: Date.now() });
@@ -208,14 +214,18 @@ export async function getMultiTokenMarketData(tokenAddresses: string[]): Promise
             dexId: bestPair.dexId || 'raydium',
             url: bestPair.url || `https://dexscreener.com/solana/${addr}`,
             priceChange24h: bestPair.priceChange?.h24 || 0,
-            priceChange1h: bestPair.priceChange?.h1 || 0,
-            priceChange5m: bestPair.priceChange?.m5 || 0,
+            // M7 (2026-09-29): preserve unknown-vs-measured (see single-token mapping above).
+            priceChange1h: bestPair.priceChange?.h1,
+            // m3 (2026-09-29): unknown 5m momentum stays undefined at the source.
+            priceChange5m: bestPair.priceChange?.m5,
             volume24h: bestPair.volume?.h24 || 0,
-            volume1h: bestPair.volume?.h1 || 0,
-            volume5m: bestPair.volume?.m5 || 0,
-            txns5mBuys: bestPair.txns?.m5?.buys || 0,
-            txns5mSells: bestPair.txns?.m5?.sells || 0,
+            volume1h: bestPair.volume?.h1,
+            volume5m: bestPair.volume?.m5,
+            txns5mBuys: bestPair.txns?.m5?.buys,
+            txns5mSells: bestPair.txns?.m5?.sells,
             pairCreatedAt: bestPair.pairCreatedAt ? Number(bestPair.pairCreatedAt) : undefined,
+            // M7: when this snapshot was fetched — buy-side rejects data older than 60s.
+            fetchedAt: Date.now(),
           };
           marketDataCache.set(addr, { data, timestamp: Date.now() });
           result.set(addr, data);

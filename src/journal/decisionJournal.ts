@@ -15,6 +15,8 @@ export class DecisionJournal {
     tokenId: string;
     tokenSymbol: string;
     decision: DecisionType;
+    /** M4: scanner verdict at EVALUATED time. */
+    verdict?: 'PASS' | 'SKIP';
     compositeScore: number;
     rejectionReasons?: string[];
     featuresSnapshot: Partial<FeatureVector>;
@@ -27,6 +29,7 @@ export class DecisionJournal {
       tokenId: params.tokenId,
       tokenSymbol: params.tokenSymbol,
       decision: params.decision,
+      verdict: params.verdict,
       compositeScore: params.compositeScore,
       rejectionReasons: params.rejectionReasons,
       featuresSnapshot: params.featuresSnapshot,
@@ -38,6 +41,27 @@ export class DecisionJournal {
 
     await this.storage.recordDecision(record);
     return record;
+  }
+
+  /**
+   * M4 (2026-09-29): marks a previously EVALUATED decision with its real
+   * outcome. EXECUTED only after a real fill (with position id + timestamp);
+   * FAILED when the buy is rejected or fails. Never invents a fill.
+   */
+  public async markDecisionOutcome(params: {
+    decisionId: string;
+    decision: 'EXECUTED' | 'FAILED';
+    positionId?: number;
+    executedAt?: string;
+    reason?: string;
+  }): Promise<void> {
+    await this.storage.markDecisionOutcome(params.decisionId, {
+      decision: params.decision,
+      verdict: params.decision === 'EXECUTED' ? 'PASS' : 'SKIP',
+      positionId: params.positionId,
+      executedAt: params.executedAt,
+      reason: params.reason,
+    });
   }
 
   /**

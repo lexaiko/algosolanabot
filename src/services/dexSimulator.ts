@@ -38,7 +38,7 @@ export interface RealisticSellResult {
   networkFeeSol: number;
   dexFeeSol: number;
   feeBreakdown?: RealFeeBreakdown;
-  executionMethod: 'JUPITER_LIVE_QUOTE' | 'AMM_CONSTANT_PRODUCT' | 'POOL_EXHAUSTION_LIMIT';
+  executionMethod: 'JUPITER_LIVE_QUOTE' | 'AMM_CONSTANT_PRODUCT' | 'POOL_EXHAUSTION_LIMIT' | 'LIQUIDITY_UNKNOWN';
   isFlashWickRejected: boolean;
   simulatedLatencyMs: number;
   warning?: string;
@@ -52,7 +52,7 @@ export interface RealisticBuyResult {
   priceImpactPct: number;
   networkFeeSol: number;
   feeBreakdown?: RealFeeBreakdown;
-  executionMethod: 'JUPITER_LIVE_QUOTE' | 'AMM_CONSTANT_PRODUCT';
+  executionMethod: 'JUPITER_LIVE_QUOTE' | 'AMM_CONSTANT_PRODUCT' | 'LIQUIDITY_UNKNOWN';
   warning?: string;
 }
 
@@ -144,7 +144,29 @@ export async function simulateRealisticSell(
   }
 
   // 2. FALLBACK: AMM CONSTANT PRODUCT (x * y = k) SIMULATOR
-  const safeLiquidityUsd = Math.max(500, poolLiquidityUsd);
+  // M-1 (2026-09-29): FAIL CLOSED on unknown depth. The old Math.max(500, ...)
+  // invented a $500 pool out of thin air, producing clean-looking fills for
+  // positions that were actually unexitable (exactly the rug scenario). A
+  // missing depth reading is information — return failure and let the caller
+  // decide (refuse + retry, or an explicitly-marked emergency fill).
+  // Never invent liquidity.
+  if (!(poolLiquidityUsd > 0)) {
+    return {
+      success: false,
+      effectiveExitPriceUsd: 0,
+      grossSol: 0,
+      netSol: 0,
+      priceImpactPct: 0,
+      networkFeeSol,
+      dexFeeSol: 0,
+      feeBreakdown: liveFee,
+      executionMethod: 'LIQUIDITY_UNKNOWN',
+      isFlashWickRejected: false,
+      simulatedLatencyMs,
+      warning: 'LIQUIDITY_UNKNOWN'
+    };
+  }
+  const safeLiquidityUsd = poolLiquidityUsd;
   const poolSolReserve = safeLiquidityUsd / (2 * solPriceUsd);
   const poolTokenReserve = currentPriceUsd > 0 ? safeLiquidityUsd / (2 * currentPriceUsd) : 1_000_000;
 
@@ -241,7 +263,22 @@ export async function simulateRealisticBuy(
   }
 
   // 2. FALLBACK: AMM CONSTANT PRODUCT
-  const safeLiquidityUsd = Math.max(500, poolLiquidityUsd);
+  // M-1 (2026-09-29): FAIL CLOSED on unknown depth — see sell path above.
+  // Never invent a $500 pool to price a fill that may not exist.
+  if (!(poolLiquidityUsd > 0)) {
+    return {
+      success: false,
+      effectiveEntryPriceUsd: 0,
+      tokensAcquired: 0,
+      effectiveSolSpent: 0,
+      priceImpactPct: 0,
+      networkFeeSol: buyFeeSol,
+      feeBreakdown: liveFee,
+      executionMethod: 'LIQUIDITY_UNKNOWN',
+      warning: 'LIQUIDITY_UNKNOWN'
+    };
+  }
+  const safeLiquidityUsd = poolLiquidityUsd;
   const poolSolReserve = safeLiquidityUsd / (2 * solPriceUsd);
   const poolTokenReserve = currentPriceUsd > 0 ? safeLiquidityUsd / (2 * currentPriceUsd) : 1_000_000;
 

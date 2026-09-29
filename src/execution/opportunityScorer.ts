@@ -23,15 +23,34 @@ export class OpportunityScorer {
     if (features.return5m >= 2.5 && features.return5m <= 55.0) {
       momentumScore = Math.min(weights.momentumWeight, Math.round((features.return5m / 35.0) * weights.momentumWeight));
     }
+    // R8 (2026-09-29): cap top-tick momentum. A vertical pump with dd < 1.5%
+    // is exit-liquidity shape — it must not earn a high momentum score no
+    // matter how vertical. (The old [1.5%, 2%) edge was closed by M12, which
+    // moved the rebound gate to >= 1.5%.)
+    if (features.drawdownFromPeakPct < 1.5) {
+      momentumScore = Math.min(momentumScore, 6);
+    }
     positivePoints['Momentum'] = momentumScore;
 
-    // 1.5. Volatility Expansion Component (Rewards active trading volatility!)
-    if (features.regime === 'HIGH_VOLATILITY' || (features.realizedVol && features.realizedVol >= 12.0)) {
+    // 1.5. Volatility Expansion Component.
+    // m9 RECONCILED (2026-09-29): the old code awarded +8 for HIGH_VOLATILITY
+    // regime while entryEngine adds a +5 hurdle bump for the SAME regime —
+    // high-vol setups cleared the bar +3 EASIER, i.e. the scorer paid for the
+    // risk the hurdle was pricing (mixed message). Now the reward only fires in
+    // regimes the hurdle does NOT penalize: volatility as tradeability, never
+    // as double-paid risk.
+    const hostileRegime =
+      features.regime === 'PANIC' || features.regime === 'HIGH_VOLATILITY' || features.regime === 'TRENDING_DOWN';
+    if (!hostileRegime && features.realizedVol !== undefined && features.realizedVol >= 12.0) {
       positivePoints['Volatility'] = 8;
     }
 
-    // 2. Volume Acceleration Component (Adaptive Weight)
-    const volAccelRatio = Math.min(features.volumeAcceleration, 3.0) / 3.0;
+    // 2. Volume Acceleration Component (Adaptive Weight).
+    // C4 (2026-09-29): undefined baseline → 0 points (fail closed), never scored
+    // on a synthesized 24h/24 or 24h/288 baseline.
+    const volAccelRatio = features.volumeAcceleration === undefined
+      ? 0
+      : Math.min(features.volumeAcceleration, 3.0) / 3.0;
     const volAccelScore = Math.min(weights.volumeWeight, Math.round(volAccelRatio * weights.volumeWeight));
     positivePoints['Volume'] = volAccelScore;
 
@@ -42,10 +61,18 @@ export class OpportunityScorer {
     }
     positivePoints['Flow'] = flowScore;
 
-    // 4. Liquidity Quality Component (Adaptive Weight)
+    // 4. Liquidity Quality Component (Adaptive Weight).
+    // m8 (2026-09-29): the old `min(liq/10k, 4)/4` saturated at 1.0 for every
+    // candidate past the $35k upstream gate — ~17/20 points for the whole
+    // universe, zero discrimination. Now log-scaled over the realistic memecoin
+    // range ($10k -> 0 pts, $100k -> full pts) so deeper books actually outscore
+    // thinner ones.
     const liqFloor = 10000;
-    const liqRatio = Math.min(features.liquidityUsd / liqFloor, 4.0) / 4.0;
-    const liquidityScore = Math.min(weights.liquidityWeight, Math.round(liqRatio * weights.liquidityWeight));
+    const liqCeil = 100000;
+    const liqLogRatio = Math.max(0, Math.min(1,
+      Math.log(Math.max(liqFloor, features.liquidityUsd) / liqFloor) / Math.log(liqCeil / liqFloor)
+    ));
+    const liquidityScore = Math.min(weights.liquidityWeight, Math.round(liqLogRatio * weights.liquidityWeight));
     positivePoints['Liquidity'] = liquidityScore;
 
     // 5. Buy-Pressure Component (Adaptive Weight)
@@ -57,10 +84,36 @@ export class OpportunityScorer {
     }
     positivePoints['BuyPressure'] = buyPressurePts;
 
-    // 6. Strategy Consensus Bonus (Adaptive Weight)
+    // 6. Strategy Consensus Bonus (Adaptive Weight).
+    // M11 (2026-09-29): the old code paid the FULL bonus whenever >= 2 signals
+    // fired — but in the scanner path MOMENTUM, FLOW_IMBALANCE and BUY_PRESSURE
+    // all derive from the SAME 5-minute DexScreener window. One observation
+    // wearing three hats is not consensus. The full bonus now requires signals
+    // from >= 2 INDEPENDENT sourceTags (e.g. tape vs DexScreener field);
+    // same-source agreement gets a smaller +4 with this honest label.
+    const distinctSources = new Set(signals.map(s => s.sourceTag ?? 'unknown'));
     if (signals.length >= 2) {
-      positivePoints['StrategyConsensus'] = weights.consensusBonus;
+      positivePoints['StrategyConsensus'] = distinctSources.size >= 2
+        ? weights.consensusBonus
+        : Math.min(4, weights.consensusBonus);
     }
+
+    // 7. Pullback-Shape Bonus (R8, 2026-09-29) — structural fix for the
+    //    scorer/entry-model mismatch. An ideal pullback (ret5m +6%, dd 4%,
+    //    green tick, buy-dominant flow) scored 55/100: below the watching
+    //    threshold, far below the 75 hurdle — while 75+ was only reachable by
+    //    vertical pumps the entry model forbids. The hurdle stays 75; we fix
+    //    WHAT earns points, not the bar. Max +15, fully explainable.
+    //    M12 (2026-09-29): healthy-pullback band lowered 2.0% -> 1.5% to match
+    //    the closed [1.5%, 2%) gap in entryEngine Invalidation 5.
+    let pullbackShapeBonus = 0;
+    const pbDd = features.drawdownFromPeakPct;
+    if (pbDd >= 1.5 && pbDd <= 8.0) pullbackShapeBonus += 5; // healthy pullback band
+    // M2: return1m is a per-minute rate now; undefined (unmeasurable) earns
+    // nothing — an unconfirmed rebound is not a green tick.
+    if (features.return1m !== undefined && features.return1m > 0) pullbackShapeBonus += 5; // green rebound tick
+    if (features.flowImbalance > 0.3) pullbackShapeBonus += 5; // buy-side absorption
+    positivePoints['PullbackShape'] = pullbackShapeBonus;
 
     // --- PENALTIES ---
     // Slippage / Price impact penalty

@@ -11,22 +11,33 @@ import {
   getPositionById,
   halfClosePosition,
   getLastClosedPosition,
-  recordWhaleTrade,
   isCircuitBreakerActive,
   tripCircuitBreaker,
   getDailyStopLossCount,
   getConsecutiveAlgoLosses,
   getEmpiricalKellyStats,
-  getDailyRealizedPnl
+  getDailyRealizedPnl,
+  setBalanceClampAlertHandler
 } from '../db/index';
 import { getTokenMarketData, getSolPriceUsd, calculatePriceImpactPct } from './dexscreener';
 import { getOnChainBondingCurve, getBondingCurveAddress, decodeBondingCurveBuffer } from './bondingCurve';
 import { checkTokenSafety } from './antirug';
 import { getBuyQuote, getSellQuote } from './jupiter';
-import { Whale, Position, ExecutionDataReason } from '../types/index';
+import { Whale, Position, ExecutionDataReason, ExitClass } from '../types/index';
 import { getDedicatedConnection, getDedicatedEndpoint } from './solanaConnection';
 import { adaptiveLearningEngine } from '../strategies/adaptiveLearningEngine';
 import { simulateRealisticSell, simulateRealisticBuy } from './dexSimulator';
+// [EXITFIX] 2026-09-29: single source of truth for fee math + ratchet floor.
+// estimateRoundTripFeePct is re-exported so any external importer keeps working.
+import { computeRatchetFloorPct } from '../execution/feeModel';
+export { estimateRoundTripFeePct } from '../execution/feeModel';
+// M3 (2026-09-29): fresh-data entry re-validation at fill time.
+// M4 (2026-09-29): honest decision lifecycle journaling.
+import { revalidateEntryOnFreshData } from '../execution/entryEngine';
+import { DecisionJournal } from '../journal/decisionJournal';
+import { getStorageRepository } from '../storage/index';
+// O-10 (2026-09-29): autonomy kill-switch — no autonomous buys without oversight.
+import { isAutonomousBuyEnabled, getAutonomyDisableReason } from '../core/autonomy';
 
 const positionEndpoint = getDedicatedEndpoint('POSITION_MANAGER');
 const wsUrl = positionEndpoint.wsUrl;
@@ -46,6 +57,21 @@ const activeOrderTokens = new Set<string>();
 const sellingPositionIds = new Set<number>();
 const tokenLossCooldownMap = new Map<string, number>();
 const LOSS_COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2 hours cooldown on tokens that suffered dump/SL
+// M-4 (2026-09-29): throttle for STALE_FEED warnings (pos.id -> last warn ms)
+const staleFeedWarnAt = new Map<number, number>();
+
+// m-1 (2026-09-29): phantom-guard fire metrics. The guard compares the
+// POST-impact effective exit price against entry, so on a thin pool it can
+// mistake genuine slippage for a fake-feed spike (guard-vs-impact ambiguity).
+// Behavior is intentionally UNCHANGED — these counters exist to collect the
+// incident data needed before any redesign of the guard.
+export const phantomGuardStats = {
+  fires: 0,
+  lastFireAt: 0,
+  lastImpactPct: 0,
+  lastEffLiquidityUsd: 0,
+  lastSymbol: '',
+};
 
 export function setTelegramNotifier(notifier: TelegramNotifier) {
   telegramNotifier = notifier;
@@ -79,18 +105,8 @@ export interface DynamicSizingResult {
   rationale: string;
 }
 
-/**
- * QUANT-01: Estimates round-trip execution cost as % of position notional.
- * Pump.fun DEX fee is 1.25% per side; plus Solana network fees (base + priority + Jito tip)
- * expressed as % of the position. Used to evaluate ratchet floors on NET pnl so a
- * "locked" level is genuinely profitable instead of being eaten by fees.
- */
-export function estimateRoundTripFeePct(entrySol: number): number {
-  const dexFeePct = 2 * 1.25; // buy-side + sell-side protocol/creator fee
-  const networkFeeSol = (CONFIG.ESTIMATED_BUY_FEE_SOL || 0.00035) + (CONFIG.ESTIMATED_SELL_FEE_SOL || 0.00025);
-  const networkFeePct = entrySol > 0 ? (networkFeeSol / entrySol) * 100 : 2.0;
-  return dexFeePct + networkFeePct;
-}
+// NOTE: estimateRoundTripFeePct lives in src/execution/feeModel.ts (venue-aware)
+// and is re-exported at the top of this file for compatibility.
 
 /**
  * Dynamic Equity Sizing with Consecutive Loss Scaling for Algo Bot
@@ -99,7 +115,7 @@ export function estimateRoundTripFeePct(entrySol: number): number {
  * falls back to the prior when the sample is small. Bounded [2%, 8%] so noisy
  * early estimates can never dictate reckless size. Anti-martingale loss-streak
  * decay is preserved on top.
- * - Empirical quarter-Kelly on (p=37.5%, b=10) ≈ 7.8% — fixed 5% was leaving edge on the table
+ * - Empirical quarter-Kelly on prior (p=35%, b=3.0, weight 20 trades) blended with live stats — fixed 5% was leaving edge on the table
  * - Floor: 0.030 SOL (preserves capital while maintaining viable on-chain trade)
  */
 export function getDynamicAlgoBuyAmount(): DynamicSizingResult {
@@ -170,6 +186,39 @@ export async function executeBuyToken(
   prefetchedMarketData?: any,
   dataReason?: ExecutionDataReason
 ): Promise<{ success: boolean; message: string; position?: Position }> {
+  // M4 (2026-09-29): honest decision lifecycle. The scanner logs EVALUATED with
+  // a decisionId (dataReason.decisionId); every rejection/failure below marks it
+  // FAILED, and only a real fill marks it EXECUTED. Manual/sniper buys carry no
+  // decisionId — the journal calls become no-ops for them.
+  const scanDecisionJournal = new DecisionJournal(getStorageRepository());
+  const scanDecisionId = dataReason?.decisionId;
+  const markScanDecisionFailed = async (reason: string): Promise<void> => {
+    if (!scanDecisionId) return;
+    try {
+      await scanDecisionJournal.markDecisionOutcome({ decisionId: scanDecisionId, decision: 'FAILED', reason });
+    } catch (err: any) {
+      console.warn('[TradeManager] markDecisionOutcome(FAILED) error:', err.message);
+    }
+  };
+  // M4: wraps every failure return so the scanner's EVALUATED verdict is always
+  // marked FAILED with the reason. Replaces `return { success: false, ... }`.
+  const failBuy = async (message: string): Promise<{ success: false; message: string }> => {
+    await markScanDecisionFailed(message);
+    return { success: false, message };
+  };
+
+  // O-10 (2026-09-29): autonomy kill-switch, enforced at the fill site so EVERY
+  // autonomous path is covered (scanner, WS stream, any future caller).
+  // With TELEGRAM_ADMIN_ID=0 there is zero human oversight — index.ts disables
+  // autonomy fail-closed. Manual Telegram buys are explicit admin actions (the
+  // admin IS the oversight) and stay allowed.
+  const isManualBuy = source === 'MANUAL' || source === 'MANUAL_SNIPER';
+  if (!isAutonomousBuyEnabled() && !isManualBuy) {
+    const autoMsg = `Autonomous buy dinonaktifkan (fail-closed): ${getAutonomyDisableReason() || 'tanpa oversight'} — manual Telegram tetap boleh`;
+    console.error(`[TradeManager] 🛑 ${autoMsg} (source=${source})`);
+    return failBuy(autoMsg);
+  }
+
   // Apply Dynamic Equity Sizing if amountSol is not explicitly specified or default
   if (!amountSol || amountSol === CONFIG.DEFAULT_BUY_AMOUNT_SOL) {
     const dynamicSizing = getDynamicAlgoBuyAmount();
@@ -192,20 +241,20 @@ export async function executeBuyToken(
         `ℹ️ _Notifikasi ini dibatasi (maks 1x per 15 menit) agar tidak spam._`;
       await notify(alertMsg);
     }
-    return { success: false, message: `Circuit breaker aktif (${remainingMins}m tersisa)` };
+    return failBuy(`Circuit breaker aktif (${remainingMins}m tersisa)`);
   }
 
   // 0. Concurrency Lock: Prevent simultaneous double-orders on the same token
   if (activeOrderTokens.has(tokenMint)) {
     console.log(`[AutoTrade] ⏳ Order untuk ${tokenMint} sedang diproses secara asinkron. Melewati order ganda.`);
-    return { success: false, message: 'Order token ini sedang diproses' };
+    return failBuy('Order token ini sedang diproses');
   }
 
   // Check if position already open
   const existing = getOpenPositionByToken(tokenMint);
   if (existing) {
     console.log(`[AutoTrade] ℹ️ Token ${existing.token_symbol} (${tokenMint}) sudah aktif di portofolio. Melewati pembelian duplikat.`);
-    return { success: false, message: `Posisi untuk token ${existing.token_symbol} sudah aktif dibuka.` };
+    return failBuy(`Posisi untuk token ${existing.token_symbol} sudah aktif dibuka.`);
   }
 
   // 0.5. Re-entry Loss Cooldown Guard: Persistent 24-Hour Quarantine from SQLite DB
@@ -213,11 +262,15 @@ export async function executeBuyToken(
   if (lastClosed && lastClosed.closed_at) {
     const msSinceClose = Date.now() - new Date(lastClosed.closed_at).getTime();
     const minsSinceClose = msSinceClose / 60000;
-    if (lastClosed.pnl_pct <= 0 || (lastClosed.close_reason && (lastClosed.close_reason.includes('SL') || lastClosed.close_reason.includes('DUMP')))) {
+    // F-01 follow-through: quarantine keys off the exit CLASS, not substrings —
+    // the old includes('SL')/includes('DUMP') missed FLASH_EXIT_RUG_BUSTER.
+    const lastCloseClass = lastClosed.close_reason ? classifyExitReason(lastClosed.close_reason) : 'PROFIT_TAKE';
+    const wasForcedExit = lastCloseClass === 'STOP' || lastCloseClass === 'EMERGENCY' || lastCloseClass === 'TIME_STOP';
+    if (lastClosed.pnl_pct <= 0 || wasForcedExit) {
       if (minsSinceClose < 1440) { // 24 hours quarantine
         const remainingHours = ((1440 - minsSinceClose) / 60).toFixed(1);
         console.log(`[AutoTrade] 🛡️ Re-entry Guard: Token ${lastClosed.token_symbol} (${tokenMint}) ditutup minus (${lastClosed.pnl_pct.toFixed(1)}%) ${minsSinceClose.toFixed(0)}m lalu. Karantina 24 jam aktif (${remainingHours} jam tersisa).`);
-        return { success: false, message: `Token sedang dalam karantina 24 jam pasca-SL (${remainingHours} jam tersisa)` };
+        return failBuy(`Token sedang dalam karantina 24 jam pasca-SL (${remainingHours} jam tersisa)`);
       }
     }
   }
@@ -226,7 +279,7 @@ export async function executeBuyToken(
   if (cooldownExpiry && Date.now() < cooldownExpiry) {
     const remainingMins = Math.ceil((cooldownExpiry - Date.now()) / 60000);
     console.log(`[AutoTrade] 🛡️ Re-entry Guard: Token ${tokenMint} baru saja dump/loss. Cooldown ${remainingMins}m tersisa.`);
-    return { success: false, message: `Token sedang dalam cooldown pasca-dump (${remainingMins}m tersisa)` };
+    return failBuy(`Token sedang dalam cooldown pasca-dump (${remainingMins}m tersisa)`);
   }
 
   activeOrderTokens.add(tokenMint);
@@ -258,16 +311,26 @@ export async function executeBuyToken(
         `🛡️ _Bot menolak membuka posisi baru untuk menjaga cadangan kas (Cash Buffer) sesuai standar manajemen risiko institusional._`;
       await notify(alertMsg);
     }
-    return { success: false, message: 'Maksimal posisi aktif portofolio tercapai' };
+    return failBuy('Maksimal posisi aktif portofolio tercapai');
   }
 
   // HEDGE-FUND RISK 2: Portfolio Heat Cap.
   // 15 positions x 8% sizing = 120% of equity deployable into a book where every
   // memecoin correlates ~0.7 in a selloff. Count-based limits are not enough:
   // cap total deployed notional as % of equity (default 50%).
+  //
+  // F-05 (2026-09-29): MARK-TO-MARKET equity. The old code valued deployed
+  // capital at ENTRY notional, so a book full of underwater positions overstated
+  // equity — the heat cap and daily stop were looser than claimed exactly when
+  // they mattered most (correlated selloff). Deployed = current market value.
+  const riskSolPriceUsd = await getSolPriceUsd().catch(() => 0);
+  const mtmValueSol = (pos: Position): number => {
+    const px = pos.current_price_usd > 0 ? pos.current_price_usd : pos.entry_price_usd;
+    return riskSolPriceUsd > 0 ? (pos.amount_tokens * px) / riskSolPriceUsd : (pos.entry_sol || 0);
+  };
   {
     const balanceForHeat = getPaperBalance();
-    const deployedSol = openPositions.reduce((s, p) => s + (p.entry_sol || 0), 0);
+    const deployedSol = openPositions.reduce((sum, pos) => sum + mtmValueSol(pos), 0);
     const equitySol = balanceForHeat + deployedSol;
     const heatCap = CONFIG.MAX_PORTFOLIO_HEAT_PCT || 0.50;
     if (equitySol > 0 && deployedSol / equitySol >= heatCap) {
@@ -279,7 +342,7 @@ export async function executeBuyToken(
           `_Bot menolak menambah eksposur agar satu selloff terkorelasi tidak menghantam seluruh book._`
         );
       }
-      return { success: false, message: 'Portfolio heat cap tercapai' };
+      return failBuy('Portfolio heat cap tercapai');
     }
   }
 
@@ -287,24 +350,31 @@ export async function executeBuyToken(
   // The 3-SL circuit breaker counts events; this counts MONEY. If realized net
   // PnL over the last 24h is worse than -8% of equity, no new risk is taken —
   // entries resume automatically tomorrow. Survive first.
+  //
+  // F-05 (2026-09-29): counts UNREALIZED drawdown too. The old code only looked
+  // at realized PnL, so a slow-bleed day with no closes never tripped the stop
+  // while new entries kept opening on top of a bleeding book. Conservative by
+  // design: open-position MTM is included in full.
   {
     const balanceForStop = getPaperBalance();
-    const deployedForStop = openPositions.reduce((s, p) => s + (p.entry_sol || 0), 0);
+    const deployedForStop = openPositions.reduce((sum, pos) => sum + mtmValueSol(pos), 0);
     const equityForStop = balanceForStop + deployedForStop;
+    const unrealizedPnlSol = openPositions.reduce((sum, pos) => sum + (mtmValueSol(pos) - (pos.entry_sol || 0)), 0);
     try {
       const daily = getDailyRealizedPnl();
+      const totalDrawdownSol = daily.netPnlSol + unrealizedPnlSol;
       const maxDailyLoss = (CONFIG.DAILY_MAX_LOSS_PCT || 0.08) * equityForStop;
-      if (daily.netPnlSol <= -maxDailyLoss && equityForStop > 0) {
-        console.log(`[AutoTrade] 🛑 DAILY EQUITY STOP: net ${daily.netPnlSol.toFixed(3)} SOL <= -${maxDailyLoss.toFixed(3)} SOL (24h). Menghentikan entry baru hari ini.`);
+      if (totalDrawdownSol <= -maxDailyLoss && equityForStop > 0) {
+        console.log(`[AutoTrade] 🛑 DAILY EQUITY STOP: drawdown ${totalDrawdownSol.toFixed(3)} SOL (realized ${daily.netPnlSol.toFixed(3)} + unrealized ${unrealizedPnlSol.toFixed(3)}) <= -${maxDailyLoss.toFixed(3)} SOL (24h). Menghentikan entry baru hari ini.`);
         if (shouldNotifyFilterSkip) {
           await notify(
             `🛑 *DAILY EQUITY STOP TERPICU*\n\n` +
-            `📉 *Net PnL 24 jam:* *${daily.netPnlSol.toFixed(3)} SOL* (batas harian -${maxDailyLoss.toFixed(3)} SOL)\n` +
+            `📉 *Drawdown 24 jam:* *${totalDrawdownSol.toFixed(3)} SOL* (realized ${daily.netPnlSol.toFixed(3)} + unrealized ${unrealizedPnlSol.toFixed(3)}, batas harian -${maxDailyLoss.toFixed(3)} SOL)\n` +
             `📊 *Win rate 24 jam:* ${daily.winRate} (${daily.winTrades}W/${daily.lossTrades}L dari ${daily.totalTrades} trade)\n\n` +
             `_Bot menghentikan seluruh entry baru hingga 24 jam ke depan demi melindungi modal. Posisi terbuka tetap dikelola exit engine._`
           );
         }
-        return { success: false, message: 'Daily equity stop aktif' };
+        return failBuy('Daily equity stop aktif');
       }
     } catch {}
   }
@@ -317,7 +387,7 @@ export async function executeBuyToken(
     if (shouldNotifyFilterSkip) {
       await notify(msg);
     }
-    return { success: false, message: msg };
+    return failBuy(msg);
   }
 
   // 1. High-Speed Concurrent Pipeline (<400ms parallel fetch instead of sequential waiting!)
@@ -335,7 +405,19 @@ export async function executeBuyToken(
 
   if (!marketData) {
     const msg = `❌ Gagal mengambil data pasar dari DexScreener untuk token \`${tokenMint}\`. Token mungkin terlalu baru atau likuiditas belum terdeteksi.`;
-    return { success: false, message: msg };
+    return failBuy(msg);
+  }
+
+  // M7 (2026-09-29): STALE-PRICE GUARD (buy side). getTokenMarketData serves
+  // stale cache during 429 backoff; TokenMarketData.fetchedAt records how old
+  // this snapshot is. Paper fills on minute-old prices are systematically
+  // optimistic (buying a pre-dump price that no longer exists). The sell side
+  // already had this guard — the buy side did not.
+  const marketDataAgeMs = Date.now() - (marketData.fetchedAt || 0);
+  if (!marketData.fetchedAt || marketDataAgeMs > 60_000) {
+    const staleMsg = `Data pasar basi (${marketData.fetchedAt ? Math.round(marketDataAgeMs / 1000) + 's' : 'tanpa timestamp'}) — tolak buy (M7 stale guard)`;
+    console.log(`[AutoTrade] 🛡️ ${staleMsg} (${marketData.symbol})`);
+    return failBuy(staleMsg);
   }
 
   // Ultra-Fast On-Chain Price for Pump.fun tokens (<50ms Direct PDA Buffer Decode)
@@ -382,15 +464,54 @@ export async function executeBuyToken(
           `🛡️ *Alasan:* Portofolio sudah memiliki ${matchingPositions.length} koin di sektor *${currentNarrative}* (${matchingPositions.map(p => p.token_symbol).join(', ')}). Bot mencegah risiko kerugian terkorelasi.`
         );
       }
-      return { success: false, message: `Maksimal posisi sektor ${currentNarrative} tercapai` };
+      return failBuy(`Maksimal posisi sektor ${currentNarrative} tercapai`);
     }
+  }
+
+  // M3 (2026-09-29): DECISION-FILL DECOUPLING FIX. The scan verdict was made on
+  // data fetched 30-60s ago; the fill below uses THIS fresh snapshot. Rebuild a
+  // compact feature vector from the fresh data + in-memory tape and re-run the
+  // full entry engine — a setup whose rebound already failed must not be bought
+  // on a stale PASS.
+  const freshEval = await revalidateEntryOnFreshData(marketData, tokenMint);
+  if (!freshEval.shouldEnter) {
+    const revalMsg = `Setup tak terkonfirmasi pada data fresh: ${freshEval.reason}`;
+    console.log(`[AutoTrade] 🛡️ M3 re-validation menolak buy ${marketData.symbol}: ${freshEval.reason}`);
+    if (shouldNotifyFilterSkip) {
+      await notify(
+        `⚠️ *ORDER DIBATALKAN: SETUP KEDALUWARSA (M3)*\n\n` +
+        `🪙 *Token:* *${marketData.symbol}* (${marketData.name})\n` +
+        `📝 *CA:* \`${tokenMint}\`\n\n` +
+        sourceInfoSection +
+        `🔍 *Alasan:* ${freshEval.reason}\n\n` +
+        `_Verdict dibuat pada data 30-60 detik lalu; pada data fresh saat ini setup tidak lagi lolos gate entry._`
+      );
+    }
+    return failBuy(revalMsg);
   }
 
   // Pump.fun bonding curve tokens have guaranteed virtual liquidity in the contract (even before Raydium graduation)
   const isPumpFun = tokenMint.endsWith('pump') || marketData.dexId === 'pumpfun';
-  const effectiveLiquidity = marketData.liquidityUsd > 0 
-    ? marketData.liquidityUsd 
-    : (isPumpFun && marketData.marketCap >= 5000 ? Math.max(5000, marketData.marketCap * 0.35) : marketData.liquidityUsd);
+  // M10 (2026-09-29): FAIL CLOSED on unverified depth. The old code GUESSED
+  // 35% of mcap (min $5k) when the on-chain curve fetch failed AND DexScreener
+  // reported 0 liquidity — the guess then PASSED the liquidity gate below and
+  // understated simulated price impact. If depth can't be verified, no buy.
+  if (isPumpFun && !(marketData.liquidityUsd > 0)) {
+    const depthMsg = 'Likuiditas tak terverifikasi (curve fetch gagal + DexScreener 0) — tolak buy (M10 fail-closed)';
+    console.log(`[AutoTrade] 🛡️ ${depthMsg} (${marketData.symbol})`);
+    if (shouldNotifyFilterSkip) {
+      await notify(
+        `⚠️ *ORDER DIBATALKAN: LIKUIDITAS TAK TERVERIFIKASI*\n\n` +
+        `🪙 *Token:* *${marketData.symbol}* (${marketData.name})\n` +
+        `📝 *CA:* \`${tokenMint}\`\n\n` +
+        sourceInfoSection +
+        `💧 *Likuiditas Pool:* *tak terverifikasi* (fetch curve on-chain gagal dan DexScreener lapor 0)\n\n` +
+        `_Bot menolak menebak depth pool — estimasi 35% mcap yang dulu dipakai bisa menyembunyikan slippage raksasa._`
+      );
+    }
+    return failBuy(depthMsg);
+  }
+  const effectiveLiquidity = marketData.liquidityUsd > 0 ? marketData.liquidityUsd : 0;
 
   // Institutional Risk Control 2: Minimum Liquidity & Market Cap Floor
   if (effectiveLiquidity < CONFIG.MIN_LIQUIDITY_USD) {
@@ -404,7 +525,7 @@ export async function executeBuyToken(
         `_Bot menolak membeli di pool illiquid untuk mencegah jebakan slippage dan price impact raksasa._`;
       await notify(alertMsg);
     }
-    return { success: false, message: 'Likuiditas pool di bawah standar minimum' };
+    return failBuy('Likuiditas pool di bawah standar minimum');
   }
 
   // Institutional Risk Control 2b: Minimum 24h Volume Floor (Active Market Depth)
@@ -419,7 +540,7 @@ export async function executeBuyToken(
         `_Bot menolak token sepi transaksi untuk menghindari risiko token mati / zombie memecoin._`;
       await notify(alertMsg);
     }
-    return { success: false, message: 'Volume 24 jam token di bawah standar minimum' };
+    return failBuy('Volume 24 jam token di bawah standar minimum');
   }
 
   if (marketData.marketCap < CONFIG.MIN_MARKET_CAP_USD) {
@@ -433,7 +554,7 @@ export async function executeBuyToken(
         `_Bot menolak token kapitalisasi mikro dengan risiko manipulasi dev tinggi._`;
       await notify(alertMsg);
     }
-    return { success: false, message: 'Market Cap di bawah standar minimum' };
+    return failBuy('Market Cap di bawah standar minimum');
   }
 
   // Institutional Risk Control 3: Anti-Chase / Price Drift Guard (Pucuk Guard)
@@ -451,7 +572,7 @@ export async function executeBuyToken(
           `_Bot menolak mengejar koin yang sudah terlanjur melambung tinggi agar modal Anda tidak menjadi exit liquidity!_`;
         await notify(alertMsg);
       }
-      return { success: false, message: 'Harga sudah naik terlalu tinggi dari entry paus' };
+      return failBuy('Harga sudah naik terlalu tinggi dari entry paus');
     }
   }
 
@@ -467,7 +588,7 @@ export async function executeBuyToken(
         `_Bot mendeteksi candle parabola vertikal yang rawan aksi dump instan._`;
       await notify(alertMsg);
     }
-    return { success: false, message: 'Candle 5 menit terlalu overextended' };
+    return failBuy('Candle 5 menit terlalu overextended');
   }
 
   // Institutional Risk Control 4b: Upper Wick Rejection Guard (Pucuk Guard)
@@ -483,7 +604,7 @@ export async function executeBuyToken(
         `_Bot menolak membeli koin yang baru saja terbanting dari pucuknya agar modal Anda tidak menjadi exit liquidity!_`;
       await notify(alertMsg);
     }
-    return { success: false, message: 'Upper wick candle 5 menit terlalu panjang (> 40% dari body)' };
+    return failBuy('Upper wick candle 5 menit terlalu panjang (> 40% dari body)');
   }
 
   // 2. Anti-Rug Safety Audit (Result from concurrent Promise.all)
@@ -500,7 +621,7 @@ export async function executeBuyToken(
         `_Bot melindungi saldo Anda dari potensi rug pull / honeypot._`;
       await notify(alertMsg);
     }
-    return { success: false, message: 'Token tidak lolos filter Anti-Rug.' };
+    return failBuy('Token tidak lolos filter Anti-Rug.');
   }
 
   // 3. 100% Real DEX Buy Execution (Jupiter live router + AMM Constant Product depth)
@@ -512,6 +633,14 @@ export async function executeBuyToken(
     effectiveLiquidity,
     CONFIG.SLIPPAGE_PCT
   );
+  // M-1 (exit-risk fix, 2026-09-29): the simulator now FAILS CLOSED on unknown
+  // pool depth (LIQUIDITY_UNKNOWN) instead of inventing a $500 pool. Never open
+  // a position on an unpriced fill. -- entry team: please review/own this guard.
+  if (!simBuy.success) {
+    const msg = `Order beli DIBATALKAN (fail-closed): ${simBuy.warning || 'simulasi eksekusi gagal'} — tidak ada fill yang dikarang pada likuiditas unknown.`;
+    console.warn(`[TradeManager] ⛔ ${msg} (${tokenMint})`);
+    return failBuy(msg);
+  }
   const effectiveEntryPriceUsd = simBuy.effectiveEntryPriceUsd;
   const amountTokens = simBuy.tokensAcquired;
   const priceImpactPct = simBuy.priceImpactPct;
@@ -521,16 +650,21 @@ export async function executeBuyToken(
   const totalBuyDeductionSol = amountSol + liveBuyFeeSol + ATA_RENT_EXEMPT_SOL;
   updatePaperBalance(-totalBuyDeductionSol);
 
-  // Institutional Continuous Conditional Risk/Reward Engine (Self-Learning)
+  // Institutional Continuous Conditional Risk/Reward Engine (Self-Learning).
+  // M6 (2026-09-29): dropped the banned `absVol * 1.2` synthesis at the call site —
+  // the engine ignores both args and returns static 45/9.5 (honest docstring above).
   const absVol = marketData.priceChange5m ? Math.abs(marketData.priceChange5m) : 0;
-  const dynamicTargets = adaptiveLearningEngine.getDynamicTpSl(absVol, absVol * 1.2);
+  const dynamicTargets = adaptiveLearningEngine.getDynamicTpSl(absVol);
   const targetTpPct = dynamicTargets.targetTpPct;
   const targetSlPct = dynamicTargets.targetSlPct;
 
   // Determine Source Label
+  // M5 (2026-09-29): no "Smart Money" framing — this project does not track whale
+  // wallets and does not do whale-follow. The whale param is legacy/never set by
+  // live callers; kept only so the signature stays compatible.
   let sourceLabel = '⚡ Manual Sniper';
   if (whale) {
-    sourceLabel = `🐋 ${whale.label} (Smart Money)`;
+    sourceLabel = `🐋 ${whale.label}`;
   } else if (source === 'LIVE_WS_STREAM') {
     sourceLabel = '⚡ Live WebSocket Stream (Helius Sub-Detik)';
   } else if (source === 'ALGO_AUTONOMOUS') {
@@ -542,15 +676,14 @@ export async function executeBuyToken(
   }
 
   // Setup Model Classification
-  const setup = dataReason?.setupType || (source === 'LIVE_WS_STREAM' ? 'PULLBACK_ABSORPTION' : (source === 'ALGO_AUTONOMOUS' ? 'MOMENTUM_RUNNER' : (whale ? 'WHALE_COPY' : 'MANUAL_SNIPER')));
+  // M5 (2026-09-29): WHALE_COPY removed — no whale-follow in this project.
+  const setup = dataReason?.setupType || (source === 'LIVE_WS_STREAM' ? 'PULLBACK_ABSORPTION' : (source === 'ALGO_AUTONOMOUS' ? 'MOMENTUM_RUNNER' : 'MANUAL_SNIPER'));
 
   let setupHeader = '🎯 Algorithmic Entry';
   if (setup === 'PARABOLIC_BREAKOUT') {
     setupHeader = '🚀 PARABOLIC BREAKOUT (God Candle Momentum)';
   } else if (setup === 'PULLBACK_ABSORPTION') {
     setupHeader = '📉 PULLBACK ABSORPTION (Diskon Sehat + Rebound)';
-  } else if (setup === 'WHALE_COPY') {
-    setupHeader = '🐋 SMART MONEY INFLOW (Paus Akumulasi)';
   } else if (setup === 'MOMENTUM_RUNNER' || setup === 'QUANT_MOMENTUM') {
     setupHeader = '🔥 ORGANIC RUNNER (Volume Shock & Velocity)';
   } else if (setup === 'MANUAL_SNIPER') {
@@ -580,6 +713,21 @@ export async function executeBuyToken(
     entry_regime: dataReason?.regime
   });
   refreshPositionWebSocketSubscriptions();
+
+  // M4 (2026-09-29): the fill REALLY happened — only now may the scanner's
+  // EVALUATED decision be marked EXECUTED (with position id + timestamp).
+  if (scanDecisionId) {
+    try {
+      await scanDecisionJournal.markDecisionOutcome({
+        decisionId: scanDecisionId,
+        decision: 'EXECUTED',
+        positionId: position.id,
+        executedAt: new Date().toISOString()
+      });
+    } catch (err: any) {
+      console.warn('[TradeManager] markDecisionOutcome(EXECUTED) error:', err.message);
+    }
+  }
 
   const remainingBalance = getPaperBalance();
 
@@ -632,7 +780,8 @@ export async function executeBuyToken(
     `• Biaya On-Chain Riil: *${liveBuyFeeSol.toFixed(6)} SOL* (Base 5k lamports + Priority + Jito Tip)\n` +
     `• Sisa Saldo Dummy: *${remainingBalance.toFixed(3)} SOL*\n` +
     dataReasonSection + '\n' +
-    `🎯 *Target TP:* +${targetTpPct}% | 🛑 *Cut Loss:* -${targetSlPct}% (Adaptive Volatility)\n` +
+    `🎯 *Exit:* ratchet trailing 100% (tier +22/+45/+80/+150, floor NET-of-fees kontinu) | 🛑 *Hard SL:* -${targetSlPct}%\n` +
+    `_Zombie reaper 2.5j, max-hold ${CONFIG.MAX_HOLD_TIME_HOURS}j. Tidak ada partial TP / moonbag._\n` +
     `_Bot memantau pergerakan harga secara realtime._`;
 
   await notify(buyAlert, {
@@ -653,10 +802,28 @@ export async function executeBuyToken(
 }
 
 // 2. EXECUTE SELL / CLOSE POSITION
+
+/**
+ * F-01/F-06 (2026-09-29): explicit exit classification. Replaces the old
+ * case-sensitive regex over free-text `reason`, which misclassified
+ * MANUAL_* sells (blocked underwater — the user could not cut loss) and
+ * "TIME_STOP (... Zombie Exit)" (capital Z never matched /ZOMBIE/).
+ * Order matters: AUTO_SL contains "SL" but is an emergency-class exit.
+ */
+export function classifyExitReason(reason: string): ExitClass {
+  const r = (reason || '').toUpperCase();
+  if (r.includes('MANUAL')) return 'MANUAL';
+  if (r.includes('FLASH_EXIT') || r.includes('VELOCITY_DUMP') || r.includes('AUTO_SL')) return 'EMERGENCY';
+  if (r.includes('STOP_LOSS') || r.includes('STOPLOSS') || /\bSL\b/.test(r)) return 'STOP';
+  if (r.includes('ZOMBIE') || r.includes('TIME_STOP') || r.includes('MAX_HOLD')) return 'TIME_STOP';
+  return 'PROFIT_TAKE';
+}
+
 export async function executeSellToken(
   positionId: number,
   sellPct: number = 100,
-  reason: string = 'MANUAL_SELL'
+  reason: string = 'MANUAL_SELL',
+  exitClass?: ExitClass
 ): Promise<{ success: boolean; message: string }> {
   // D) Per-position concurrency lock: kunci di awal agar WS tick & heartbeat 3s tidak double-sell posisi yang sama
   if (sellingPositionIds.has(positionId)) {
@@ -677,13 +844,17 @@ export async function executeSellToken(
       return { success: false, message: 'Posisi tidak ditemukan atau sudah ditutup.' };
     }
 
+    // F-01: resolve the exit class ONCE — every guard below keys off this, never off substrings.
+    const cls: ExitClass = exitClass ?? classifyExitReason(reason);
+
     // Fetch live market data for exit price
     const marketData = await getTokenMarketData(pos.token_address);
     const solPriceUsd = await getSolPriceUsd();
+    const isPumpSell = pos.token_address.endsWith('pump');
 
     // C) Anti stale/fake price: menolak jual pada harga stale ketika market data gagal,
-    // kecuali alasan emergency (FLASH_EXIT / VELOCITY_DUMP / AUTO_SL) yang tetap boleh cut darurat.
-    const isEmergencyExit = reason.includes('FLASH_EXIT') || reason.includes('VELOCITY_DUMP') || reason.includes('AUTO_SL');
+    // kecuali exit emergency yang tetap boleh cut darurat.
+    const isEmergencyExit = cls === 'EMERGENCY';
     const marketDataValid = !!(marketData && marketData.priceUsd > 0);
 
     if (!marketDataValid && !isEmergencyExit) {
@@ -697,6 +868,11 @@ export async function executeSellToken(
     const lastKnownLiq = lastKnownLiquidity.get(pos.id) || 0;
     let currentPriceUsd: number;
     let effLiquidity: number;
+    // M-4 (2026-09-29): second independent price confirmation for emergency
+    // exits on a stale feed. Pump tokens get the on-chain bonding curve as the
+    // second source; for everything else the simulator's Jupiter live quote
+    // (checked via executionMethod below) is the second source.
+    let secondPriceConfirmed = marketDataValid;
     if (marketDataValid) {
       currentPriceUsd = marketData!.priceUsd;
       effLiquidity = marketData!.liquidityUsd || lastKnownLiq;
@@ -704,29 +880,96 @@ export async function executeSellToken(
       // Emergency exit pada harga stale: izinkan, tapi tetap dengan depth riil terakhir (bukan angka karangan)
       currentPriceUsd = pos.current_price_usd;
       effLiquidity = lastKnownLiq;
-      console.warn(`[TradeManager] ⚠️ EMERGENCY STALE-PRICE EXIT for ${pos.token_symbol}: market data gagal, jual darurat (${reason}) pada harga terakhir $${currentPriceUsd.toFixed(8)} dengan likuiditas terakhir $${effLiquidity.toFixed(0)}.`);
+      if (isPumpSell) {
+        try {
+          const curve = await getOnChainBondingCurve(pos.token_address);
+          if (curve && !curve.complete && curve.spotPriceSol > 0 && solPriceUsd > 0) {
+            currentPriceUsd = curve.spotPriceSol * solPriceUsd;
+            effLiquidity = curve.liquiditySol * solPriceUsd;
+            secondPriceConfirmed = true;
+          }
+        } catch { /* curve read failed — stays unconfirmed, tagged below */ }
+      }
+      console.warn(`[TradeManager] ⚠️ EMERGENCY STALE-PRICE EXIT for ${pos.token_symbol}: market data gagal, jual darurat (${reason}) pada harga $${currentPriceUsd.toFixed(8)} (likuiditas terakhir $${effLiquidity.toFixed(0)}, konfirmasi kedua: ${secondPriceConfirmed ? 'YA' : 'TIDAK'}).`);
     }
 
+    // F-02 (2026-09-29): emergency exits (AUTO_SL / VELOCITY_DUMP / FLASH_EXIT)
+    // happen exactly when liquidity evaporates — simulate them with the
+    // emergency-dump slippage path (8%+ tolerance, 2-4.5% adverse penalty),
+    // not calm-market fills. Paper P&L for the worst exits was systematically optimistic.
     const simResult = await simulateRealisticSell(
       pos.token_address,
       tokensToSell,
       currentPriceUsd,
       solPriceUsd,
       effLiquidity,
-      CONFIG.SLIPPAGE_PCT
+      CONFIG.SLIPPAGE_PCT,
+      isEmergencyExit
     );
 
-    const effectiveExitPriceUsd = simResult.effectiveExitPriceUsd;
-    const actualCreditedSol = simResult.netSol;
-    const grossExitSol = simResult.grossSol;
-    const priceImpactPct = simResult.priceImpactPct;
+    // M-1 (2026-09-29): the simulator FAILS CLOSED on unknown depth
+    // (LIQUIDITY_UNKNOWN) instead of inventing a $500 pool. Never book an
+    // exit on an invented fill. Non-emergency exits are refused and retried
+    // naturally on the next evaluation cycle (position stays OPEN).
+    let effectiveExitPriceUsd: number;
+    let actualCreditedSol: number;
+    let grossExitSol: number;
+    let priceImpactPct: number;
+    let sellNetworkFeeSol: number;
+    let dexFeeSol: number;
+    if (!simResult.success) {
+      if (simResult.warning === 'LIQUIDITY_UNKNOWN' && isEmergencyExit) {
+        // Disaster path: capital must stay movable even when depth is unknown.
+        // Fill with a punitive, EXPLICITLY MARKED haircut — never presented as
+        // a clean market exit. Auditable via the [STALE_LIQUIDITY_FILL] reason tag.
+        const punitiveHaircutPct = 25.0;
+        effectiveExitPriceUsd = currentPriceUsd * (1 - punitiveHaircutPct / 100);
+        priceImpactPct = punitiveHaircutPct;
+        grossExitSol = (tokensToSell * effectiveExitPriceUsd) / (solPriceUsd > 0 ? solPriceUsd : 1);
+        const dexFeePctSL = isPumpSell ? 1.25 : 0.25;
+        dexFeeSol = grossExitSol * (dexFeePctSL / 100);
+        sellNetworkFeeSol = simResult.networkFeeSol;
+        actualCreditedSol = Math.max(0, grossExitSol - dexFeeSol - sellNetworkFeeSol);
+        reason = `${reason} [STALE_LIQUIDITY_FILL]`;
+        console.error(`[TradeManager] 🚨 STALE_LIQUIDITY_FILL for ${pos.token_symbol}: emergency exit on UNKNOWN depth — punitive -25% fill @ $${effectiveExitPriceUsd.toFixed(8)}, tagged in reason for audit.`);
+      } else {
+        console.warn(`[TradeManager] ⏸️ EXIT REFUSED (LIQUIDITY_UNKNOWN) for ${pos.token_symbol}: ${simResult.warning || 'simulasi gagal'} — posisi tetap OPEN, retry otomatis pada evaluasi berikutnya.`);
+        return { success: false, message: 'Likuiditas pool unknown — exit ditolak (fail-closed), retry otomatis pada evaluasi berikutnya.' };
+      }
+    } else {
+      effectiveExitPriceUsd = simResult.effectiveExitPriceUsd;
+      actualCreditedSol = simResult.netSol;
+      grossExitSol = simResult.grossSol;
+      priceImpactPct = simResult.priceImpactPct;
+      sellNetworkFeeSol = simResult.networkFeeSol;
+      dexFeeSol = simResult.dexFeeSol;
+      // M-4: a Jupiter live quote IS an independent second price source —
+      // an emergency exit confirmed by it is not a stale-price fill.
+      if (simResult.executionMethod === 'JUPITER_LIVE_QUOTE') secondPriceConfirmed = true;
+    }
+
+    // M-4: an emergency exit executed without ANY second confirmation rode on
+    // a stale print — tag it so paper P&L never hides the fact.
+    if (isEmergencyExit && !marketDataValid && !secondPriceConfirmed && !reason.includes('STALE_PRICE_FILL')) {
+      reason = `${reason} [STALE_PRICE_FILL]`;
+      console.warn(`[TradeManager] ⚠️ STALE_PRICE_FILL tagged for ${pos.token_symbol}: emergency exit tanpa konfirmasi harga kedua.`);
+    }
 
     // B) REALITY GUARD (anti phantom-exit, dipulihkan dari commit 28cac92):
     // Jika reason adalah take-profit/ratchet/trailing (bukan emergency dump), harga efektif keluar
     // WAJIB di atas entry. Jika tidak, ini phantom spike DexScreener -> tolak jualan, jangan eksekusi.
-    const isProfitTakingExit = !/SL|DUMP|FLASH|VELOCITY|ZOMBIE|MAX_HOLD/.test(reason);
-    if (isProfitTakingExit && effectiveExitPriceUsd <= pos.entry_price_usd) {
-      console.warn(`[TradeManager] 🛡️ PHANTOM EXIT BLOCKED for ${pos.token_symbol}: reason ${reason} mensyaratkan profit, tapi effective exit price $${effectiveExitPriceUsd.toFixed(8)} <= entry $${pos.entry_price_usd.toFixed(8)} (simulasi padam $${(currentPriceUsd * (1 - priceImpactPct / 100)).toFixed(8)}, impact ${priceImpactPct.toFixed(2)}%, likuiditas $${effLiquidity.toFixed(0)}). Aborting sell untuk lindungi modal!`);
+    // F-01: phantom-exit guard applies ONLY to profit-taking exits. MANUAL sells
+    // (user explicitly asked), STOP/EMERGENCY exits and TIME_STOP reaps must
+    // always be allowed underwater — blocking them traps capital in losers.
+    if (cls === 'PROFIT_TAKE' && effectiveExitPriceUsd <= pos.entry_price_usd) {
+      // m-1: record the fire for the guard-vs-impact incident dataset.
+      // Behavior intentionally unchanged (see phantomGuardStats docstring).
+      phantomGuardStats.fires++;
+      phantomGuardStats.lastFireAt = Date.now();
+      phantomGuardStats.lastImpactPct = priceImpactPct;
+      phantomGuardStats.lastEffLiquidityUsd = effLiquidity;
+      phantomGuardStats.lastSymbol = pos.token_symbol;
+      console.warn(`[TradeManager] 🛡️ PHANTOM EXIT BLOCKED for ${pos.token_symbol}: reason ${reason} mensyaratkan profit, tapi effective exit price $${effectiveExitPriceUsd.toFixed(8)} <= entry $${pos.entry_price_usd.toFixed(8)} (simulasi padam $${(currentPriceUsd * (1 - priceImpactPct / 100)).toFixed(8)}, impact ${priceImpactPct.toFixed(2)}%, likuiditas $${effLiquidity.toFixed(0)}). [metrics] fires=${phantomGuardStats.fires}. Aborting sell untuk lindungi modal!`);
       return { success: false, message: 'Phantom exit blocked — effective exit price tidak di atas entry price.' };
     }
 
@@ -748,7 +991,7 @@ export async function executeSellToken(
       return { success: false, message: 'Posisi sudah ditutup sebelum eksekusi.' };
     }
 
-    const closed = closePosition(pos.id, effectiveExitPriceUsd, actualCreditedSol, `${reason} (${sellPct}%)`);
+    const closed = closePosition(pos.id, effectiveExitPriceUsd, actualCreditedSol, `${reason} (${sellPct}%)`, sellNetworkFeeSol);
     if (!closed) {
       console.warn(`[TradeManager] ⛔ closePosition gagal (sudah CLOSED?) untuk ${pos.token_symbol} (#${pos.id}). Saldo tidak dikredit.`);
       return { success: false, message: 'Posisi gagal ditutup; saldo tidak dikredit.' };
@@ -763,42 +1006,25 @@ export async function executeSellToken(
     const isProfit = pnlPct >= 0;
 
   // True Net Fee Accounting with Live Real Fees (Base + Priority + Jito tip + DEX protocol)
-  const sellGasSol = simResult.networkFeeSol;
-  const buyGasSol = 0.00008 * (sellPct / 100);
-  const dexFeeSol = simResult.dexFeeSol;
+  // F-08 (2026-09-29): buy leg uses the same CONFIG estimate the BUY history row
+  // records — the old hardcoded 0.00008 understated buy fees ~4x vs the project's
+  // own estimate, flattering every reported net P&L.
+  const sellGasSol = sellNetworkFeeSol;
+  const buyGasSol = CONFIG.ESTIMATED_BUY_FEE_SOL * (sellPct / 100);
+  // dexFeeSol resolved above: real simulator value, or the punitive
+  // STALE_LIQUIDITY_FILL estimate (explicitly tagged in reason).
   const roundTripFeeSol = buyGasSol + sellGasSol + dexFeeSol;
   const netPnlSol = grossPnlSol - roundTripFeeSol;
   const isNetProfit = netPnlSol >= 0;
 
   // Institutional Risk Control: 2-Hour Loss Token Cooldown (Anti-Revenge Trading & Knife Catching)
-  if (!isProfit || reason.includes('SL') || reason.includes('VELOCITY_DUMP') || reason.includes('FLASH_DUMP') || reason.includes('FLASH_EXIT')) {
+  if (!isProfit || cls === 'STOP' || cls === 'EMERGENCY') {
     tokenLossCooldownMap.set(pos.token_address, Date.now() + LOSS_COOLDOWN_MS);
     console.log(`[TradeManager] 🛡️ Re-entry Guard: Token ${pos.token_symbol} masuk cooldown 2 jam pasca-dump.`);
   }
 
-  // Record whale performance for institutional grading & auto-promotion
-  if (pos.whale_source && pos.whale_source !== 'MANUAL' && pos.whale_source !== 'MANUAL_SNIPER') {
-    const perf = recordWhaleTrade(pos.whale_source, netPnlSol, isNetProfit);
-    if (perf?.promoted) {
-      const promoMsg = `🎖️ *PROMOSI ELITE SMART MONEY!*\n\n` +
-        `Dompet *${perf.whale.label}* (\`${perf.whale.address.slice(0, 6)}...${perf.whale.address.slice(-4)}\`) berhasil membuktikan profitabilitas!\n` +
-        `• Win Rate: *${perf.winRate.toFixed(1)}%*\n` +
-        `• Total PnL: *+${perf.whale.total_pnl_sol.toFixed(4)} SOL*\n` +
-        `• Status Baru: *VERIFIED ELITE (AUTO-COPY AKTIF)* 🚀\n\n` +
-        `_Mulai sekarang, bot akan otomatis menyalin trade dari paus terverifikasi ini._`;
-      await notify(promoMsg);
-    } else if (perf?.demoted) {
-      const demoteMsg = `⏸️ *ALPHA BENCH: PAUS DIISTIRAHATKAN KE SHADOW MODE!*\n\n` +
-        `Dompet *${perf.whale.label}* (\`${perf.whale.address.slice(0, 6)}...${perf.whale.address.slice(-4)}\`) mengalami ${CONFIG.MAX_CONSECUTIVE_LOSSES_DEMOTE}x Stop-Loss beruntun.\n` +
-        `• Status Baru: *PROBATION (SHADOW BENCH)* 🔬\n` +
-        `• Status Copy: *OFF (0 SOL Modal Dipertaruhkan)* 🛡️\n\n` +
-        `_Paus tidak dihapus permanen untuk menguji apakah ini murni nasib sial (variance) atau sinyal rusak. Bot mengamankan modal Anda di balik layar. Begitu mencetak profit kembali di shadow mode, statusnya otomatis dipromosikan ke VERIFIED!_`;
-      await notify(demoteMsg);
-    }
-  }
-
   // Execution Escalation Log for Emergency Exits
-  if (reason.includes('SL') || reason.includes('FLASH_EXIT') || reason.includes('WHALE_DUMP') || reason.includes('VELOCITY_DUMP')) {
+  if (cls === 'STOP' || cls === 'EMERGENCY') {
     console.log(`[TradeManager] ⚡ Emergency Exit detected (${reason}). Escalating priority fee & widening slippage tolerance.`);
   }
 
@@ -871,7 +1097,9 @@ export async function executeSellToken(
   });
 
   // Institutional Risk Control: Circuit Breaker Max Daily Drawdown / Consecutive Stop-Loss Guard
-  if (CONFIG.CIRCUIT_BREAKER_ENABLED && (!isProfit || reason.includes('SL') || reason.includes('STOP_LOSS'))) {
+  // F-03: trip check on any unprofitable exit OR any forced exit class
+  // (STOP/EMERGENCY/TIME_STOP) — the count itself comes from getDailyStopLossCount.
+  if (CONFIG.CIRCUIT_BREAKER_ENABLED && (!isProfit || cls === 'STOP' || cls === 'EMERGENCY' || cls === 'TIME_STOP')) {
     const dailyLosses = getDailyStopLossCount();
     if (dailyLosses >= CONFIG.CIRCUIT_BREAKER_MAX_DAILY_LOSSES) {
       tripCircuitBreaker(
@@ -896,33 +1124,6 @@ export async function executeSellToken(
       // D) Lepas lock selalu, walau sukses, gagal, atau exception
       sellingPositionIds.delete(pos.id);
     }
-}
-
-// 2.5 EXECUTE WHALE SELL FOLLOW (DUMP SYNCHRONIZATION)
-export async function executeWhaleSellFollow(
-  whale: Whale,
-  tokenMint: string,
-  tokensSold?: number
-): Promise<{ success: boolean; message: string }> {
-  if (!CONFIG.COPY_SELL_ENABLED) {
-    return { success: false, message: 'Whale copy-sell synchronization dinonaktifkan di konfigurasi.' };
-  }
-
-  const pos = getOpenPositionByToken(tokenMint);
-  if (!pos) {
-    return { success: false, message: 'Tidak ada posisi terbuka untuk token ini.' };
-  }
-
-  console.log(`[TradeManager] 🚨 WHALE SELL DETECTED! Paus ${whale.label} mendump token ${pos.token_symbol}. Melikuidasi posisi instan...`);
-
-  const exitAlert = `🚨 *WHALE DUMP DETECTED — EMERGENCY SELL FOLLOW!* 🚨\n\n` +
-    `🐋 *Paus:* *${whale.label}* (\`${whale.address.slice(0, 6)}...${whale.address.slice(-4)}\`)\n` +
-    `🪙 *Token:* *${pos.token_symbol}*\n` +
-    `⚡ *Aksi Paus:* Terdeteksi swap SELL di DEX!\n\n` +
-    `🛡️ *Respons Instan:* Bot mengeksekusi likuidasi 100% seketika untuk mengamankan modal sebelum liquidity pool terkuras habis!`;
-  await notify(exitAlert);
-
-  return await executeSellToken(pos.id, 100, `WHALE_DUMP_FOLLOW (${whale.label})`);
 }
 
 // 3. REAL-TIME WEBSOCKET POSITION MONITORING & EVALUATION
@@ -1015,40 +1216,74 @@ export async function evaluatePosition(
     if (!pos || pos.status !== 'OPEN') return;
 
     const solPriceUsd = await getSolPriceUsd();
+    const isPumpEval = pos.token_address.endsWith('pump');
     let currentPrice = overridePrice || pos.current_price_usd;
     let currentLiquidityUsd = overrideLiquidityUsd || 0;
 
+    // M-4 (2026-09-29): a price is only VALID if it came from a FRESH source
+    // this cycle: explicit override, pump on-chain curve, or a fresh DexScreener
+    // quote. Falling back to pos.current_price_usd means the feed is STALE —
+    // price-based exits must NOT fire on a stale print (the rug scenario:
+    // price -> 0, feed dies, bot "sells" at the last pre-rug price and books
+    // a fictional recovery).
+    let marketDataValid = !!overridePrice;
+
     // Direct on-chain bonding curve math for Pump.fun tokens if no override
-    if (!overridePrice && pos.token_address.endsWith('pump')) {
+    if (!overridePrice && isPumpEval) {
       const onChainCurve = await getOnChainBondingCurve(pos.token_address);
       if (onChainCurve && !onChainCurve.complete && onChainCurve.spotPriceSol > 0) {
         currentPrice = onChainCurve.spotPriceSol * solPriceUsd;
         currentLiquidityUsd = onChainCurve.liquiditySol * solPriceUsd;
+        marketDataValid = true;
       }
     }
 
-    // Fallback to DexScreener if not a bonding curve token or graduated to Raydium
-    if (currentPrice === pos.current_price_usd || currentLiquidityUsd === 0) {
+    // Fallback to DexScreener if not a bonding curve token or graduated to Raydium.
+    // M-4: this codebase has no on-chain AMM decoder for Raydium — DexScreener
+    // is the only price source there. When it fails, the feed is STALE
+    // (the simulator's Jupiter live quote acts as second confirmation at exit).
+    if (!marketDataValid) {
       // Always fetch fresh quotes for open active positions (never rely on 12-second stale cache during dump)
       const marketData = await getTokenMarketData(pos.token_address, true);
-      if (marketData) {
+      if (marketData && marketData.priceUsd > 0) {
         currentPrice = marketData.priceUsd;
         currentLiquidityUsd = marketData.liquidityUsd;
+        marketDataValid = true;
       }
     }
 
     if (!currentPrice || currentPrice <= 0) return;
+
+    // M-4: STALE FEED — suspend ALL price-based exits this cycle. Only the
+    // time-based max-hold reaper (not price-based) may still act.
+    if (!marketDataValid) {
+      const nowStale = Date.now();
+      if (nowStale - (staleFeedWarnAt.get(pos.id) || 0) > 5 * 60 * 1000) {
+        staleFeedWarnAt.set(pos.id, nowStale);
+        console.warn(`[TradeManager] 📡 STALE_FEED for ${pos.token_symbol}: no fresh price source — price-based exits suspended, max-hold reaper only.`);
+      }
+      const hoursHeldStale = (Date.now() - new Date(pos.opened_at).getTime()) / 3600000;
+      if (hoursHeldStale >= CONFIG.MAX_HOLD_TIME_HOURS) {
+        await executeSellToken(pos.id, 100, `MAX_HOLD_TIMEOUT (${hoursHeldStale.toFixed(1)}h Exit) [STALE_FEED]`, 'TIME_STOP');
+      }
+      return;
+    }
 
     // Flash-Exit Rug Buster: Detect sudden catastrophic liquidity drainage (Dev pulling liquidity)
     if (CONFIG.FLASH_EXIT_ENABLED && currentLiquidityUsd > 0) {
       const prevLiq = lastKnownLiquidity.get(pos.id);
       if (prevLiq && prevLiq > 5000) {
         const dropPct = ((prevLiq - currentLiquidityUsd) / prevLiq) * 100;
-        // Genuine rug drain: liquidity dumped > 50% AND collapsed below $12k liquidity floor
-        if (dropPct >= 50.0 && currentLiquidityUsd < 12000) {
+        // M-2 (2026-09-29): the drop threshold is now a LIVE config knob
+        // (FLASH_EXIT_DROP_PCT, default 50.0) — the old hardcoded 50.0 made the
+        // knob dead while Telegram claimed ">30%". Genuine rug drain: liquidity
+        // dumped past the knob AND collapsed below the $12k floor, so normal
+        // whale exits (30-40% pool swings) can't whipsaw the book.
+        const flashDropThreshold = CONFIG.FLASH_EXIT_DROP_PCT > 0 ? CONFIG.FLASH_EXIT_DROP_PCT : 50.0;
+        if (dropPct >= flashDropThreshold && currentLiquidityUsd < 12000) {
           console.log(`[TradeManager] 🚨 FLASH-EXIT RUG BUSTER TRIGGERED for ${pos.token_symbol}! Liquidity dropped ${dropPct.toFixed(1)}% to $${currentLiquidityUsd.toFixed(0)}.`);
           lastKnownLiquidity.delete(pos.id);
-          await executeSellToken(pos.id, 100, `FLASH_EXIT_RUG_BUSTER (-${dropPct.toFixed(0)}% Liq Drain)`);
+          await executeSellToken(pos.id, 100, `FLASH_EXIT_RUG_BUSTER (-${dropPct.toFixed(0)}% Liq Drain)`, 'EMERGENCY');
           return;
         }
       }
@@ -1076,7 +1311,8 @@ export async function evaluatePosition(
 
     const pnlPct = updated.pnl_pct;
     const peakPrice = updated.peak_price_usd;
-    const targetTp = pos.target_tp_pct || CONFIG.TAKE_PROFIT_PCT;
+    // m-4 (2026-09-29): targetTp REMOVED — decorative variable, never read by
+    // any exit logic (the engine is 100% ratchet; there is no TP).
     const targetSl = pos.target_sl_pct || CONFIG.STOP_LOSS_PCT;
 
     // 1. VELOCITY DUMP RESCUE (Strict Anti-Rug / Honeypot Early Cut)
@@ -1089,57 +1325,40 @@ export async function evaluatePosition(
         ? `Fresh collapse (${pnlPct.toFixed(1)}% in ${ageSec.toFixed(0)}s < 90s)` 
         : `Plunge drop (${pnlPct.toFixed(1)}% with severe tick velocity)`;
       console.log(`[TradeManager] ⚡ VELOCITY DUMP RESCUE triggered for ${pos.token_symbol}: ${reasonDetail}`);
-      await executeSellToken(pos.id, 100, `VELOCITY_DUMP_RESCUE (${reasonDetail})`);
+      await executeSellToken(pos.id, 100, `VELOCITY_DUMP_RESCUE (${reasonDetail})`, 'EMERGENCY');
       return;
     }
 
     // 2. HARD STOP-LOSS (Strict Institutional Hard Ceiling)
     if (pnlPct <= -targetSl) {
       console.log(`[TradeManager] 🛑 HARD SL Triggered for ${pos.token_symbol} (${pnlPct.toFixed(1)}% <= -${targetSl}%)`);
-      await executeSellToken(pos.id, 100, `AUTO_SL (${pnlPct.toFixed(1)}%)`);
+      await executeSellToken(pos.id, 100, `AUTO_SL (${pnlPct.toFixed(1)}%)`, 'EMERGENCY');
       return;
     }
 
     // 3. INSTITUTIONAL DYNAMIC RATCHET TRAILING STOP (100% Single-Exit, Max Power Law Engine)
     // No partial sales! 100% bag captures exponential runs, Stop-Loss ratchets up like a one-way ladder.
     //
-    // QUANT-01 (net-of-fees floors): round-trip execution cost (~2.5% DEX fee + network fees
-    // as % of position) is ADDED to every floor, so a "locked" level is genuinely profitable.
-    // The old +3.5% gross BEP lock netted ~+0.6% after fees — an illusion of safety.
+    // M-3/F-09 (2026-09-29): CONTINUOUS floor via computeRatchetFloorPct —
+    // floor(peak) = max(guarantee(peak), peak - trail(peak)) + feeBuffer, with
+    // guarantee ramping 3.5% -> 25% over [22,45) and 25/50/100 segment minimums
+    // above. No cliffs at 22/45/80/150 (see src/execution/feeModel.ts).
     //
-    // QUANT-02 (adaptive trailing): trail-back width scales with peak gain (volatility proxy).
-    // Parabolic runners get wider trails (harder to wick out on noise); small breakouts get
-    // tighter trails (less giveback). Width = 10% + 5% of peak gain, clamped [10%, 20%].
-    // Guaranteed minimum floors (+25/+50/+100) are unchanged.
+    // QUANT-01 (net-of-fees floors): round-trip execution cost (venue-aware DEX
+    // fee + network fees as % of position) is ADDED to every floor, so a
+    // "locked" level is genuinely profitable. The old +3.5% gross BEP lock
+    // netted ~+0.6% after fees — an illusion of safety.
+    //
+    // QUANT-02 (adaptive trailing): trail-back width scales with peak gain
+    // (volatility proxy). Width = 10% + 5% of peak gain, clamped [10%, 20%].
     if (peakPrice > pos.entry_price_usd) {
       const peakGainPct = ((peakPrice - pos.entry_price_usd) / pos.entry_price_usd) * 100;
-      const feeBufferPct = estimateRoundTripFeePct(pos.entry_sol);
-      const adaptiveTrailPct = Math.min(20, Math.max(10, 10 + peakGainPct * 0.05));
-      let ratchetFloorPct: number | null = null;
-      let ratchetReason = '';
-
-      if (peakGainPct >= 150.0) {
-        // Tier 4: God Candle / Mega Parabolic Runner (adaptive trail, guaranteed floor >= +100% net)
-        ratchetFloorPct = Math.max(100.0, peakGainPct - adaptiveTrailPct) + feeBufferPct;
-        ratchetReason = `MEGA_RUNNER_100_EXIT (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${ratchetFloorPct.toFixed(1)}% net)`;
-      } else if (peakGainPct >= 80.0) {
-        // Tier 3: Strong Parabolic Runner (adaptive trail, guaranteed floor >= +50% net)
-        ratchetFloorPct = Math.max(50.0, peakGainPct - adaptiveTrailPct) + feeBufferPct;
-        ratchetReason = `SUPER_RUNNER_100_EXIT (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${ratchetFloorPct.toFixed(1)}% net)`;
-      } else if (peakGainPct >= 45.0) {
-        // Tier 2: Solid Breakout (adaptive trail, guaranteed floor >= +25% net)
-        ratchetFloorPct = Math.max(25.0, peakGainPct - adaptiveTrailPct) + feeBufferPct;
-        ratchetReason = `SOLID_BREAKOUT_100_EXIT (Peak +${peakGainPct.toFixed(1)}% -> Locked @ +${ratchetFloorPct.toFixed(1)}% net)`;
-      } else if (peakGainPct >= 22.0) {
-        // Tier 1: Risk-Free Breakout Lock (net BEP floor: fees covered + real profit locked)
-        // Once a token breaks out +22%, this trade can NEVER lose capital net of fees.
-        ratchetFloorPct = 3.5 + feeBufferPct;
-        ratchetReason = `RISK_FREE_BEP_LOCK (Peak +${peakGainPct.toFixed(1)}% -> Secured @ +${ratchetFloorPct.toFixed(1)}% net BEP)`;
-      }
-
+      const ratchetFloorPct = computeRatchetFloorPct(peakGainPct, pos.entry_sol, isPumpEval);
       if (ratchetFloorPct !== null && pnlPct <= ratchetFloorPct) {
+        const tier = peakGainPct >= 150 ? 'T4_MEGA' : peakGainPct >= 80 ? 'T3_SUPER' : peakGainPct >= 45 ? 'T2_SOLID' : 'T1_BEP';
+        const ratchetReason = `RATCHET_${tier}_EXIT (Peak +${peakGainPct.toFixed(1)}% -> Floor +${ratchetFloorPct.toFixed(1)}% net)`;
         console.log(`[TradeManager] 🎯 DYNAMIC RATCHET TRAILING STOP TRIGGERED for ${pos.token_symbol}! (Peak: +${peakGainPct.toFixed(1)}%, Floor: +${ratchetFloorPct.toFixed(1)}% net, Exit: +${pnlPct.toFixed(1)}%)`);
-        await executeSellToken(pos.id, 100, ratchetReason);
+        await executeSellToken(pos.id, 100, ratchetReason, 'PROFIT_TAKE');
         return;
       }
     }
@@ -1155,16 +1374,21 @@ export async function evaluatePosition(
       ? ((peakPrice - pos.entry_price_usd) / pos.entry_price_usd) * 100
       : 0;
     const zombieCeilPct = Math.min(12, Math.max(4, peakGainPctZombie * 0.5));
-    if (hoursHeld >= 2.5 && pnlPct >= -6.0 && pnlPct <= zombieCeilPct) {
+    // m-2 (2026-09-29): lower bound -9.0% (was -6.0%) to close the dead zone
+    // [-9.5%, -6%) where a stagnant loser was touched by neither the reaper
+    // nor the hard SL (-9.5%) — dead capital the reaper exists to recycle.
+    if (hoursHeld >= 2.5 && pnlPct >= -9.0 && pnlPct <= zombieCeilPct) {
       console.log(`[TradeManager] ⌛ ZOMBIE TIME-STOP v2: ${pos.token_symbol} held for ${hoursHeld.toFixed(1)}h, peak +${peakGainPctZombie.toFixed(1)}% decayed to ${pnlPct.toFixed(1)}% (stagnant band ≤ +${zombieCeilPct.toFixed(1)}%). Liquidating 100% to rotate capital.`);
-      await executeSellToken(pos.id, 100, `ZOMBIE_TIME_STOP (${hoursHeld.toFixed(1)}h Stagnant Exit)`);
+      await executeSellToken(pos.id, 100, `ZOMBIE_TIME_STOP (${hoursHeld.toFixed(1)}h Stagnant Exit)`, 'TIME_STOP');
       return;
     }
 
-    // Hard ceiling timeout (12 hours max)
-    if (hoursHeld >= 12.0) {
+    // Hard ceiling timeout — F-11 (2026-09-29): single source of truth is
+    // CONFIG.MAX_HOLD_TIME_HOURS (default 24h). The old hardcoded 12.0 made the
+    // config knob dead and disagreed with the heartbeat reaper path.
+    if (hoursHeld >= CONFIG.MAX_HOLD_TIME_HOURS) {
       console.log(`[TradeManager] ⌛ MAX HOLD TIME REACHED for ${pos.token_symbol} (${hoursHeld.toFixed(1)}h held). Liquidating 100%...`);
-      await executeSellToken(pos.id, 100, `MAX_HOLD_TIMEOUT (${hoursHeld.toFixed(1)}h Exit)`);
+      await executeSellToken(pos.id, 100, `MAX_HOLD_TIMEOUT (${hoursHeld.toFixed(1)}h Exit)`, 'TIME_STOP');
       return;
     }
   } catch (err: any) {
@@ -1177,6 +1401,17 @@ export async function evaluatePosition(
 export function startPositionManager() {
   if (monitorInterval) return;
   console.log('[TradeManager] ⚡ Live Position Event-Driven WebSocket Engine aktif (Fallback timeout: 35s).');
+
+  // m-7/F-13 (2026-09-29): route balance-clamp incidents to Telegram — a clamp
+  // means the accounting went negative, which must be investigated, not hidden.
+  setBalanceClampAlertHandler((info) => {
+    notify(
+      `🚨 *BALANCE CLAMP AKTIF (mungkin bug akuntansi!)*\n\n` +
+      `Upaya saldo: *${info.attempted.toFixed(4)} SOL* → dijepit ke *${info.clampedTo.toFixed(4)} SOL*\n` +
+      `Delta tersembunyi: *${info.hiddenDelta.toFixed(4)} SOL*\n\n` +
+      `_Saldo tidak boleh negatif. Rekonsiliasi vs trade_history — kemungkinan double-debit._`
+    ).catch(() => {});
+  });
 
   refreshPositionWebSocketSubscriptions();
   checkPositions();
@@ -1221,7 +1456,7 @@ async function evaluatePositionForHeartbeat(pos: Position, now: number, wsSilenc
   const hoursHeld = (now - openedTime) / (1000 * 60 * 60);
   if (hoursHeld >= CONFIG.MAX_HOLD_TIME_HOURS) {
     console.log(`[TradeManager] ⌛ Time-Stop Triggered for ${pos.token_symbol} (${hoursHeld.toFixed(1)}h held). Liquidating to free capital...`);
-    await executeSellToken(pos.id, 100, `TIME_STOP (${hoursHeld.toFixed(1)}h Zombie Exit)`);
+    await executeSellToken(pos.id, 100, `TIME_STOP (${hoursHeld.toFixed(1)}h Zombie Exit)`, 'TIME_STOP');
     return;
   }
 
