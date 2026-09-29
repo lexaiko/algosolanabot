@@ -124,6 +124,47 @@ function startHeartbeat(): void {
   console.log('[System] 💓 Health heartbeat aktif (bot.health tiap 30 dtk).');
 }
 
+// ---------------------------------------------------------------------------
+// NET-RESILIENCE (2026-09-29): memory guard. Kematian diam-diam 29 Sep 2026
+// (heartbeat berhenti tanpa exception/log — kemungkinan OOM saat egress down
+// dan re-subscribe churn) tidak boleh terulang tanpa jejak. Kalau memori
+// mendekati batas, mati BERISIK via fatalShutdown supaya watchdog restart
+// bersih, bukan dibunuh kernel tanpa alert.
+// Dipantau RSS (bukan cuma heap): socket/TLS/proxy buffer bocor di native
+// tidak terlihat di heapUsed tapi membunuh via OOM killer.
+// ---------------------------------------------------------------------------
+const RSS_WARN_BYTES = 1536 * 1024 * 1024; // 1.5 GB
+const RSS_FATAL_BYTES = 2048 * 1024 * 1024; // 2 GB
+const HEAP_WARN_BYTES = 1024 * 1024 * 1024; // 1 GB
+const HEAP_FATAL_BYTES = Math.floor(HEAP_WARN_BYTES * 1.5); // 1.5 GB
+let heapGuardTimer: NodeJS.Timeout | null = null;
+let memWarned = false;
+
+function startHeapGuard(): void {
+  const check = () => {
+    try {
+      const { rss, heapUsed } = process.memoryUsage();
+      const rssMb = Math.round(rss / 1048576);
+      const heapMb = Math.round(heapUsed / 1048576);
+      if (rss >= RSS_FATAL_BYTES || heapUsed >= HEAP_FATAL_BYTES) {
+        fatalShutdown(
+          `Memori kritis (RSS ${rssMb} MB / heap ${heapMb} MB) — indikasi leak/OOM, restart bersih.`
+        );
+      } else if ((rss >= RSS_WARN_BYTES || heapUsed >= HEAP_WARN_BYTES) && !memWarned) {
+        memWarned = true;
+        console.warn(
+          `[System] ⚠️ Memori tinggi: RSS ${rssMb} MB / heap ${heapMb} MB — pantau, mendekati batas restart.`
+        );
+      } else if (rss < RSS_WARN_BYTES && heapUsed < HEAP_WARN_BYTES) {
+        memWarned = false;
+      }
+    } catch {}
+  };
+  heapGuardTimer = setInterval(check, 60 * 1000);
+  if (heapGuardTimer.unref) heapGuardTimer.unref();
+  console.log('[System] 🛡️ Memory guard aktif (RSS warn 1.5GB/restart 2GB, heap warn 1GB/restart 1.5GB).');
+}
+
 /** Best-effort fatal alert, then die so the watchdog restarts a clean process. */
 function fatalShutdown(message: string): void {
   console.error(message);
@@ -187,6 +228,7 @@ async function main() {
 
   startAlertOutboxFlusher();
   startHeartbeat();
+  startHeapGuard();
 
   // 2. Start Quantitative Execution Engines (Zero-Polling Event-Driven WebSocket First)
   startPositionManager();
@@ -240,6 +282,7 @@ async function main() {
   const shutdown = async () => {
     console.log('\n[System] Shutting down cleanly...');
     if (heartbeatTimer) clearInterval(heartbeatTimer);
+    if (heapGuardTimer) clearInterval(heapGuardTimer);
     stopPositionManager();
     stopMarketStreamer();
     await stopAlgoScanner(); // O-20: async — waits for in-flight scan cycle so no buy fires mid-shutdown

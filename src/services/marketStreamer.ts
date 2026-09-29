@@ -66,8 +66,26 @@ let wsHealthCheckTimer: NodeJS.Timeout | null = null;
 // Cached SOL/USD, refreshed whenever the curve handler fetches a fresh quote.
 // Seed 180 is only a pre-first-fetch fallback, documented at use sites.
 let cachedSolPriceUsd = 180;
-/** Per-mint reconnect state: [backoffMs, lastAttemptMs]. */
-const wsReconnectState: Map<string, { backoffMs: number; lastAttemptAt: number }> = new Map();
+/** Per-mint reconnect state. */
+interface WsReconnectState {
+  backoffMs: number;
+  lastAttemptAt: number;
+  /** Consecutive re-subscribe attempts that produced no new tick. */
+  failCount: number;
+  /** lastTickAt observed at the previous attempt (to detect zero progress). */
+  lastTickAtSeen: number;
+  /** Logged the give-up warning already? */
+  gaveUpLogged: boolean;
+}
+/**
+ * NET-RESILIENCE (2026-09-29): after this many consecutive re-subscribes with
+ * zero new ticks, stop WS attempts for that mint — the endpoint/network is
+ * down, churning only leaks resources. The Raydium batch syncer still covers
+ * price data. Reset automatically when ticks resume (health check deletes
+ * state for healthy mints).
+ */
+const WS_MAX_CONSECUTIVE_RESUB_FAILS = 15;
+const wsReconnectState: Map<string, WsReconnectState> = new Map();
 
 let isStreamerRunning = false;
 let pumpportalWs: WebSocket | null = null;
@@ -197,9 +215,32 @@ function checkHeliusSubscriptionHealth(): void {
     // Guard: don't retry faster than the exponential backoff allows.
     const state = wsReconnectState.get(mint) ?? {
       backoffMs: WS_RECONNECT_MIN_BACKOFF_MS,
-      lastAttemptAt: 0
+      lastAttemptAt: 0,
+      failCount: 0,
+      lastTickAtSeen: item.lastTickAt,
+      gaveUpLogged: false,
     };
     if (now - state.lastAttemptAt < state.backoffMs) continue;
+
+    // NET-RESILIENCE: no tick since the previous attempt => this attempt
+    // (if we make it) starts from zero progress. Give up WS for this mint
+    // after too many consecutive fruitless attempts.
+    if (item.lastTickAt === state.lastTickAtSeen) {
+      state.failCount++;
+    } else {
+      state.failCount = 0;
+      state.lastTickAtSeen = item.lastTickAt;
+    }
+    if (state.failCount >= WS_MAX_CONSECUTIVE_RESUB_FAILS) {
+      if (!state.gaveUpLogged) {
+        state.gaveUpLogged = true;
+        console.warn(
+          `[MarketStreamer] 🛑 ${item.symbol}: ${state.failCount}x re-subscribe tanpa tick baru — hentikan percobaan WS (batch syncer tetap cover).`
+        );
+      }
+      wsReconnectState.set(mint, state);
+      continue;
+    }
 
     console.warn(`[MarketStreamer] 📡 Helius subscription for ${item.symbol} silent for ${Math.round(silenceMs / 1000)}s. Re-subscribing (backoff ${Math.round(state.backoffMs / 1000)}s)...`);
     state.lastAttemptAt = now;

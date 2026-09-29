@@ -8,6 +8,7 @@ import { opportunityScorer } from '../execution/opportunityScorer';
 import { entryEngine } from '../execution/entryEngine';
 import { adaptiveLearningEngine } from '../strategies/adaptiveLearningEngine';
 import { addTokenToWatchlist } from './marketStreamer';
+import { markContinuationConsumed } from '../execution/continuationTracker';
 import { FeatureVector, StrategySignal } from '../core/types';
 import { CONFIG } from '../config';
 import { tokenTape, tapeVolume5mNormalized, tapeReturnPerMinutePct } from '../market/tokenTape';
@@ -254,7 +255,7 @@ export interface ScannedCandidate {
   sells5m: number;
   volume5mUsd?: number;
   regime: string;
-  entryMode?: 'PULLBACK_ABSORPTION';
+  entryMode?: 'PULLBACK_ABSORPTION' | 'MOMENTUM_CONTINUATION';
   /** M4: decision-journal id of the EVALUATED log, passed to executeBuyToken
    *  so the fill (or rejection) can mark it EXECUTED / FAILED. */
   decisionId?: string;
@@ -810,7 +811,16 @@ export async function runAlgoScanCycle() {
     }
 
     const dynamicSizing = getDynamicAlgoBuyAmount();
-    const allocatedSol = dynamicSizing.allocatedSol;
+    // MOMENTUM_CONTINUATION (2026-09-29): buying a confirmed rally at the top
+    // is a worse average entry than a dip — half size compensates the lower
+    // expected win rate. Pullback entries keep full Kelly size.
+    const isContinuation = best.entryMode === 'MOMENTUM_CONTINUATION';
+    const allocatedSol = isContinuation
+      ? dynamicSizing.allocatedSol * 0.5
+      : dynamicSizing.allocatedSol;
+    if (isContinuation) {
+      console.log(`[AlgoScanner] 📈 Continuation entry: size setengah (${allocatedSol.toFixed(4)} SOL) — entry di rally terkonfirmasi`);
+    }
 
     const balance = getPaperBalance();
     if (balance < allocatedSol + CONFIG.ESTIMATED_BUY_FEE_SOL) {
@@ -837,7 +847,7 @@ export async function runAlgoScanCycle() {
     }
 
     // Execute Autonomous Buy
-    await executeBuyToken(
+    const buyResult = await executeBuyToken(
       best.mint,
       allocatedSol,
       'ALGO_AUTONOMOUS',
@@ -861,6 +871,12 @@ export async function runAlgoScanCycle() {
         decisionId: best.decisionId
       }
     );
+    // MOMENTUM_CONTINUATION: a filled continuation entry consumes its track so
+    // the same rally can't re-fire immediately after exit. A failed buy leaves
+    // the track alive — the thesis may still confirm on the next cycle.
+    if (buyResult.success && best.entryMode === 'MOMENTUM_CONTINUATION') {
+      markContinuationConsumed(best.mint);
+    }
   } catch (err: any) {
     console.error('[AlgoScanner] Error during scan cycle:', err.message);
   } finally {

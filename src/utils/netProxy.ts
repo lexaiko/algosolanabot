@@ -47,10 +47,14 @@ function patchOneWs(require: NodeRequire, wsPath: string, agent: HttpsProxyAgent
       constructor(address: string, protocols?: any, options?: any) {
         // `ws` supports both (address, options) and (address, protocols, options).
         // Normalize so the proxy agent is never dropped by the 2-arg shifting.
+        // NET-RESILIENCE (2026-09-29): handshakeTimeout dipaksa (default 15s)
+        // supaya koneksi ke proxy yang mati tidak gantung selamanya dalam state
+        // CONNECTING — itu yang bikin soket zombie menumpuk saat egress down.
+        // Urutan spread: nilai eksplisit dari caller tetap menang.
         if (protocols && typeof protocols === 'object' && !Array.isArray(protocols)) {
-          super(address, { agent, ...protocols });
+          super(address, { handshakeTimeout: 15000, agent, ...protocols });
         } else {
-          super(address, protocols, { agent, ...(options || {}) });
+          super(address, protocols, { handshakeTimeout: 15000, agent, ...(options || {}) });
         }
       }
     }

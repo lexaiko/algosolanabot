@@ -684,6 +684,8 @@ export async function executeBuyToken(
     setupHeader = '🚀 PARABOLIC BREAKOUT (God Candle Momentum)';
   } else if (setup === 'PULLBACK_ABSORPTION') {
     setupHeader = '📉 PULLBACK ABSORPTION (Diskon Sehat + Rebound)';
+  } else if (setup === 'MOMENTUM_CONTINUATION') {
+    setupHeader = '📈 MOMENTUM CONTINUATION (3x Higher-High Terkonfirmasi, Half Size)';
   } else if (setup === 'MOMENTUM_RUNNER' || setup === 'QUANT_MOMENTUM') {
     setupHeader = '🔥 ORGANIC RUNNER (Volume Shock & Velocity)';
   } else if (setup === 'MANUAL_SNIPER') {

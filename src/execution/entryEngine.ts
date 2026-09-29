@@ -5,6 +5,7 @@ import { adaptiveLearningEngine } from '../strategies/adaptiveLearningEngine';
 import { tokenTape, tapeVolume5mNormalized, tapeReturnPerMinutePct } from '../market/tokenTape';
 import { getSolPriceUsd } from '../services/dexscreener';
 import { CONFIG } from '../config';
+import { observeContinuation, CONTINUATION_CONFIRM_BARS } from './continuationTracker';
 
 export interface EntryDecisionResult {
   shouldEnter: boolean;
@@ -13,10 +14,16 @@ export interface EntryDecisionResult {
   reason: string;
   explanation: string;
   invalidationReason?: string;
-  /** Which entry model fired. Single-model since 2026-09-29: PULLBACK_ABSORPTION
-   * (dip + rebound). PARABOLIC_BREAKOUT was deleted after 0/4 live paper trades —
-   * buying spike tops is structural exit-liquidity provision, not an edge. */
-  entryMode?: 'PULLBACK_ABSORPTION';
+  /** Which entry model fired.
+   * Two models since 2026-09-29:
+   * - PULLBACK_ABSORPTION (dip + rebound). PARABOLIC_BREAKOUT was deleted after
+   *   0/4 live paper trades — buying spike tops is structural exit-liquidity
+   *   provision, not an edge.
+   * - MOMENTUM_CONTINUATION (3x confirmed higher-high pushes with rising
+   *   volume + dominant flow, half size). For runners whose pullback never
+   *   comes; the top-tick guard routes 75+ hugging-the-top candidates here
+   *   instead of parking them in pullback-watch forever. */
+  entryMode?: 'PULLBACK_ABSORPTION' | 'MOMENTUM_CONTINUATION';
 }
 
 export class EntryEngine {
@@ -109,11 +116,49 @@ export class EntryEngine {
 
     // Invalidation 4: Top-Tick Pucuk Trap Guard
     // Never buy a token clinging to the top of its 5m candle (+8% with < 1.5%
-    // drawdown). The old code exempted "genuine parabolic breakouts" from this
-    // guard — that exemption was deleted 2026-09-29 after 0/4 live paper trades
-    // proved it buys exit-liquidity tops. Now unconditional: wait for a healthy
-    // pullback (-2% to -6%) and let absorption confirm the rebound instead.
+    // drawdown) on a SINGLE observation. The old code exempted "genuine
+    // parabolic breakouts" from this guard — that exemption was deleted
+    // 2026-09-29 after 0/4 live paper trades proved it buys exit-liquidity
+    // tops.
+    //
+    // MOMENTUM_CONTINUATION (2026-09-29): when the hurdle is already cleared
+    // (score >= dynamicMinScore), the candidate is NOT parked in pullback-watch
+    // forever — it is routed to the continuation tracker. Three confirmed
+    // higher-high pushes (rising volume + dominant flow each) prove the rally
+    // is real and fire a half-size entry. A breakdown > 4% kills the thesis.
+    // Below-hurdle candidates keep the old unconditional rejection.
     if (features.return5m > 8.0 && features.drawdownFromPeakPct < 1.5) {
+      const priceUsd = features.priceUsd;
+      if (score >= dynamicMinScore && priceUsd !== undefined && priceUsd > 0) {
+        const cont = observeContinuation(
+          features.tokenId,
+          priceUsd,
+          features.volumeAcceleration,
+          features.buySellRatio,
+          features.flowImbalance,
+          score
+        );
+        if (cont.confirmed) {
+          const entryMode = 'MOMENTUM_CONTINUATION' as const;
+          return {
+            shouldEnter: true,
+            state: 'ENTRY',
+            compositeScore: score,
+            reason: `Setup terkonfirmasi [${entryMode}]: ${CONTINUATION_CONFIRM_BARS}x higher-high bervolume, skor ${score}/100, flow dominan — rally terbukti, entry setengah size`,
+            explanation: scoreResult.explanation,
+            entryMode
+          };
+        }
+        const resetNote = cont.reset ? ' (thesis lama break >4% — tracking diulang dari awal)' : '';
+        return {
+          shouldEnter: false,
+          state: 'SETUP_FORMING',
+          compositeScore: score,
+          reason: `Harga menempel di puncak candle (+${features.return5m.toFixed(1)}%). Continuation ${cont.confirmations}/${CONTINUATION_CONFIRM_BARS} — menunggu higher-high bervolume berikutnya${resetNote}`,
+          explanation: scoreResult.explanation,
+          invalidationReason: 'AWAITING_CONTINUATION_CONFIRMATION'
+        };
+      }
       return {
         shouldEnter: false,
         state: 'SETUP_FORMING',

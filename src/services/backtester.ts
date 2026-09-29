@@ -45,6 +45,14 @@ export interface BacktestOptions {
   solPriceUsd?: number;
   /** Adverse fill slippage applied to every exit (%). Default CONFIG.SLIPPAGE_PCT. */
   slippagePct?: number;
+  /**
+   * Synthetic entry signal variant (NOT the production scorer/gates):
+   * - 'baseline': 1-bar momentum (prevBar > +2.5% + rising volume), full size.
+   * - 'continuation3': 3 consecutive rising closes, each with rising volume
+   *   (mimics MOMENTUM_CONTINUATION's 3x higher-high confirmation), HALF size.
+   * Default 'baseline'.
+   */
+  entrySignal?: 'baseline' | 'continuation3';
 }
 
 /**
@@ -189,6 +197,10 @@ export function runBacktest(
   const solPriceUsd = options.solPriceUsd && options.solPriceUsd > 0 ? options.solPriceUsd : 180;
   const slippagePct = options.slippagePct && options.slippagePct > 0 ? options.slippagePct : CONFIG.SLIPPAGE_PCT;
   const dexFeePct = isPump ? 1.25 : 0.25;
+  const entrySignal = options.entrySignal || 'baseline';
+  // continuation3 entries run at half size, mirroring the production rule that
+  // MOMENTUM_CONTINUATION buys a worse average entry (top of rally) than dips.
+  const entrySizeSol = entrySignal === 'continuation3' ? tradeSizeSol * 0.5 : tradeSizeSol;
   const networkBuyFeeSol = CONFIG.ESTIMATED_BUY_FEE_SOL || 0.00035;
   const networkSellFeeSol = CONFIG.ESTIMATED_SELL_FEE_SOL || 0.00025;
 
@@ -196,7 +208,7 @@ export function runBacktest(
     `Exit engine: production mirror (PositionManager.evaluatePositionExit) — 100% single-exit dynamic ratchet, continuous net-of-fees floors, zombie v2, max-hold ${CONFIG.MAX_HOLD_TIME_HOURS}h`,
     `Fees: venue-aware (${isPump ? 'pump.fun 1.25%/side' : 'Raydium 0.25%/side'}) + network ~${(networkBuyFeeSol + networkSellFeeSol).toFixed(5)} SOL round-trip — charged on BOTH legs`,
     `Fills: every exit filled ADVERSE at trigger price minus ${slippagePct}% slippage (emergency exits: ${Math.max(8, slippagePct * 2.5)}%)`,
-    `Entries: SYNTHETIC breakout signal (momentum bar + rising volume + anti-chase) — NOT the production scorer/gates`,
+    `Entries: SYNTHETIC ${entrySignal === 'continuation3' ? 'continuation signal (3 rising closes + rising volume, HALF size — mirror of MOMENTUM_CONTINUATION)' : 'breakout signal (momentum bar + rising volume + anti-chase, full size)'} — NOT the production scorer/gates`,
     `Granularity: per-bar; intrabar order assumed adverse (low before high); no Jupiter routing; no per-bar liquidity data so flash-liquidity exits cannot trigger (rug losses understated)`,
   ];
 
@@ -291,7 +303,7 @@ export function runBacktest(
     }
 
     // 2. ENTRY SIGNAL EVALUATION (synthetic — NOT the production scorer)
-    if (!activePosition && currentBalance >= tradeSizeSol + networkBuyFeeSol) {
+    if (!activePosition && currentBalance >= entrySizeSol + networkBuyFeeSol) {
       const prevBarChangePct = ((prevCandle.close - prevCandle.open) / prevCandle.open) * 100;
       const curBarChangePct = candle.open > 0 && prevCandle.close > 0
         ? ((candle.open - prevCandle.close) / prevCandle.close) * 100
@@ -300,10 +312,28 @@ export function runBacktest(
       // Anti-Chase Guard (drift ceiling)
       if (curBarChangePct > CONFIG.MAX_PRICE_DRIFT_PCT) continue;
 
-      // Synthetic signal: positive momentum breakout bar + rising volume
-      if (prevBarChangePct > 2.5 && candle.volume > prevCandle.volume && candle.open > 0) {
-        const buyFeeSol = networkBuyFeeSol + tradeSizeSol * (dexFeePct / 100);
-        currentBalance -= (tradeSizeSol + buyFeeSol);
+      let entryTriggered = false;
+      if (entrySignal === 'continuation3') {
+        // 3 consecutive rising closes, each with rising volume — the backtest
+        // mirror of MOMENTUM_CONTINUATION's 3x higher-high confirmation.
+        // NOTE: 5m bars make this SLOWER than production (tick-level pushes);
+        // results understate confirmation speed, not edge direction.
+        if (i >= 3 && candle.open > 0) {
+          const b1 = candles[i - 3], b2 = candles[i - 2], b3 = candles[i - 1];
+          const rising =
+            b1.close > b1.open && b2.close > b2.open && b3.close > b3.open &&
+            b2.close > b1.close && b3.close > b2.close;
+          const volRising = b2.volume > b1.volume && b3.volume > b2.volume && candle.volume >= b3.volume * 0.8;
+          entryTriggered = rising && volRising;
+        }
+      } else {
+        // Synthetic signal: positive momentum breakout bar + rising volume
+        entryTriggered = prevBarChangePct > 2.5 && candle.volume > prevCandle.volume && candle.open > 0;
+      }
+
+      if (entryTriggered) {
+        const buyFeeSol = networkBuyFeeSol + entrySizeSol * (dexFeePct / 100);
+        currentBalance -= (entrySizeSol + buyFeeSol);
 
         activePosition = {
           id: `bt-${i}`,
@@ -312,8 +342,8 @@ export function runBacktest(
           tokenName: tokenSymbol,
           status: 'OPEN',
           entryPriceUsd: candle.open,
-          entrySol: tradeSizeSol,
-          amountTokens: (tradeSizeSol * solPriceUsd) / candle.open,
+          entrySol: entrySizeSol,
+          amountTokens: (entrySizeSol * solPriceUsd) / candle.open,
           currentPriceUsd: candle.open,
           peakPriceUsd: candle.open,
           pnlUsd: 0,
@@ -324,7 +354,7 @@ export function runBacktest(
           strategyName: 'BACKTEST_MIRROR',
           openedAt: new Date(barTsSec * 1000).toISOString(),
         };
-        activeSizeSol = tradeSizeSol;
+        activeSizeSol = entrySizeSol;
         activeBuyFeeSol = buyFeeSol;
         activeEntryTs = barTsSec;
       }
