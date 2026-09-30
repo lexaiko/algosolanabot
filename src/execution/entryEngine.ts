@@ -126,10 +126,19 @@ export class EntryEngine {
     // forever — it is routed to the continuation tracker. Three confirmed
     // higher-high pushes (rising volume + dominant flow each) prove the rally
     // is real and fire a half-size entry. A breakdown > 4% kills the thesis.
-    // Below-hurdle candidates keep the old unconditional rejection.
+    //
+    // 2026-09-30 (supervisor): NEAR-MISS observation. In HIGH_VOL/PANIC the
+    // regime-adjusted hurdle (80/83) parks strong 70-79 runners at the top
+    // with NO second path — the old code only observed >= dynamicMinScore.
+    // Now 70+ parked candidates are also observed. This is NOT a hurdle cut:
+    // observation is cheap, ENTRY still demands the same 3 confirmed pushes
+    // (volume + flow proof each) and fires at half size. Below-70 candidates
+    // keep the old unconditional pullback-watch. The counterfactual tracker
+    // validates whether continuation-from-70 earns its keep.
+    const CONTINUATION_OBSERVE_MIN = 70;
     if (features.return5m > 8.0 && features.drawdownFromPeakPct < 1.5) {
       const priceUsd = features.priceUsd;
-      if (score >= dynamicMinScore && priceUsd !== undefined && priceUsd > 0) {
+      if (score >= CONTINUATION_OBSERVE_MIN && priceUsd !== undefined && priceUsd > 0) {
         const cont = observeContinuation(
           features.tokenId,
           priceUsd,
