@@ -25,6 +25,13 @@ export interface FunnelCandidate {
   bondingCurveProgressPct?: number;
   safetyReport?: RugCheckResult | null;
   isCabalSuspect?: boolean;
+  /** GRADUATION LANE (2026-09-30): 'graduation' for pump.fun Raydium
+   *  graduates. Liquidity floor rises to $15k (research: all clean runners
+   *  in the 2026-09-30 new-pair study had >= $20k), and the 24h-volume bar is
+   *  skipped — a minutes-old pool cannot have 24h volume by construction;
+   *  activity is proven at entry by the continuation model's real
+   *  volume-acceleration (>= 1.4x) + flow gates instead. Safety gate stays. */
+  lane?: 'standard' | 'graduation';
 }
 
 export interface FunnelEvaluation {
@@ -60,8 +67,10 @@ export class DiscoveryFunnel {
       tokenAgeSeconds,
       bondingCurveProgressPct,
       safetyReport, 
-      isCabalSuspect 
+      isCabalSuspect,
+      lane
     } = candidate;
+    const isGraduationLane = lane === 'graduation';
 
     // STAGE 1: Basic Eligibility (Non-system, valid address length)
     if (!token.address || token.address.length < 32 || SYSTEM_PROGRAMS.has(token.address)) {
@@ -146,7 +155,10 @@ export class DiscoveryFunnel {
     // wanted, it now lives EXPLICITLY in CONFIG.MIN_VOLUME_24H_USD (STAGE 7).
 
     // STAGE 6: Minimum Liquidity Depth
-    const minLiquidity = CONFIG.MIN_LIQUIDITY_USD || 6000;
+    // GRADUATION LANE: $15k floor (2026-09-30 new-pair study: every clean
+    // runner had >= $20k liquidity; $15k keeps a margin while filtering the
+    // micro-pool graveyard where most rugs live).
+    const minLiquidity = isGraduationLane ? 15000 : (CONFIG.MIN_LIQUIDITY_USD || 6000);
     if (liquidityUsd < minLiquidity) {
       return {
         passed: false,
@@ -157,8 +169,14 @@ export class DiscoveryFunnel {
     }
 
     // STAGE 7: Activity & Market Depth
+    // GRADUATION LANE: skipped. A minutes-old graduate cannot have 24h volume
+    // by construction — applying the standard bar would reject every genuine
+    // runner at birth. Activity is proven instead at ENTRY time by the
+    // continuation model's gates (real volumeAcceleration >= 1.4x + dominant
+    // flow on each of the 3 confirmation pushes), which is a strictly
+    // stronger activity proof than a static volume number.
     const minVolume = CONFIG.MIN_VOLUME_24H_USD || 25000;
-    if (volume24hUsd > 0 && volume24hUsd < minVolume) {
+    if (!isGraduationLane && volume24hUsd > 0 && volume24hUsd < minVolume) {
       return {
         passed: false,
         stageFailed: 'ACTIVITY_FILTER',
@@ -173,7 +191,8 @@ export class DiscoveryFunnel {
       safetyReport,
       isCabalSuspect,
       liquidityUsd,
-      marketCapUsd
+      marketCapUsd,
+      lane: isGraduationLane ? 'graduation' : 'standard'
     });
 
     if (!audit.allowed) {

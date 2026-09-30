@@ -27,8 +27,14 @@ export class SafetyGate {
     isCabalSuspect?: boolean;
     liquidityUsd: number;
     marketCapUsd: number;
+    /** GRADUATION LANE (2026-09-30): 'graduation' lowers the internal
+     *  liquidity floor to $15k (research: clean runners >= $20k; entries
+     *  fire at half size so slippage impact matches a $30k+ pool at full
+     *  size). The funnel's own STAGE 6 already enforces the same floor;
+     *  this keeps the two consistent. */
+    lane?: 'standard' | 'graduation';
   }): SafetyAuditResult {
-    const { tokenAddress, safetyReport, isCabalSuspect, liquidityUsd, marketCapUsd } = params;
+    const { tokenAddress, safetyReport, isCabalSuspect, liquidityUsd, marketCapUsd, lane } = params;
     const hardViolations: string[] = [];
     const softPenalties: Record<string, number> = {};
     let calculatedRiskScore = 15; // Baseline pristine score
@@ -70,8 +76,12 @@ export class SafetyGate {
     }
 
     // 3. HARD BLOCK: Liquidity Floor
+    // GRADUATION LANE (2026-09-30): $15k floor for fresh graduates (half-size
+    // entries => slippage comparable to $30k+ pools at full size). Matches
+    // the funnel's STAGE 6 graduation floor.
+    const liqFloor = lane === 'graduation' ? 15000 : (CONFIG.MIN_LIQUIDITY_USD || 6000);
     const minLiquidity = CONFIG.MIN_LIQUIDITY_USD || 6000;
-    if (liquidityUsd < minLiquidity) {
+    if (liquidityUsd < liqFloor) {
       hardViolations.push(`LIQUIDITY_SUB_FLOOR_$${liquidityUsd.toFixed(0)}`);
       calculatedRiskScore = 100;
     }

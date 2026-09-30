@@ -135,10 +135,20 @@ export class EntryEngine {
     // (volume + flow proof each) and fires at half size. Below-70 candidates
     // keep the old unconditional pullback-watch. The counterfactual tracker
     // validates whether continuation-from-70 earns its keep.
+    //
+    // GRADUATION LANE (2026-09-30): fresh Raydium graduates are observed
+    // regardless of score. They rarely reach 70 on thin tape, but the
+    // continuation proof (3 confirmed higher-high pushes, each with rising
+    // volume + dominant flow) is tape-agnostic — it does not depend on the
+    // Goldilocks composite at all. Research 2026-09-30 (n=68): median 94 min
+    // to 2x, so the scan cycle can catch them; every 2x+ excursion dumped
+    // >50% within 24h, so ENTRY still requires the full 3 confirmations and
+    // fires at half size, with the ratchet trailing stop as the exit.
     const CONTINUATION_OBSERVE_MIN = 70;
+    const isGraduateLane = features.isFreshGraduate === true;
     if (features.return5m > 8.0 && features.drawdownFromPeakPct < 1.5) {
       const priceUsd = features.priceUsd;
-      if (score >= CONTINUATION_OBSERVE_MIN && priceUsd !== undefined && priceUsd > 0) {
+      if ((score >= CONTINUATION_OBSERVE_MIN || isGraduateLane) && priceUsd !== undefined && priceUsd > 0) {
         const cont = observeContinuation(
           features.tokenId,
           priceUsd,

@@ -38,6 +38,12 @@ export interface WatchedCandidate {
   lastTickAt: number;
   tickCount: number;
   priceHistory: Array<{ timestamp: number; priceUsd: number; solLiquidity: number }>;
+  /** GRADUATION LANE (2026-09-30): true when added via a Raydium migration
+   *  event (pump.fun graduate). Graduates get a 30-min eviction grace so the
+   *  scanner gets a fair observation window, and are evaluated through the
+   *  graduation funnel lane + score-agnostic continuation observation. */
+  freshGraduate: boolean;
+  graduatedAt: number;
 }
 
 const MAX_WATCHLIST_SIZE = 20; // Trimmed 2026-09-29: 50 WS subs burned Helius credits 24/7 with zero entries to show for it. Top-20 by score still covers every 75+ candidate + continuation tracking.
@@ -139,7 +145,14 @@ function evictLowestPriorityToken() {
     const inactiveMs = now - item.lastTickAt;
     let evictionPriority = 0;
 
-    if (inactiveMs > INACTIVE_PURGE_MS) {
+    // GRADUATION LANE (2026-09-30): fresh graduates get a 30-minute eviction
+    // grace — the lane's inventory needs a fair observation window before the
+    // normal churn rules apply. Bounded: worst case ~storm-rate x 30 min of
+    // extra subs, then they age into normal priority.
+    const GRADUATE_GRACE_MS = 30 * 60 * 1000;
+    if (item.freshGraduate && now - item.graduatedAt < GRADUATE_GRACE_MS) {
+      evictionPriority = -1;
+    } else if (inactiveMs > INACTIVE_PURGE_MS) {
       evictionPriority = 1000 + (inactiveMs / 1000);
     } else {
       let peakPrice = 0;
@@ -324,12 +337,18 @@ export async function addTokenToWatchlist(
   symbol: string,
   poolName: string = '',
   pairAddress: string = '',
-  score: number = 50
+  score: number = 50,
+  opts?: { freshGraduate?: boolean }
 ): Promise<boolean> {
   if (watchlist.has(tokenMint)) {
     const existing = watchlist.get(tokenMint)!;
     if (score > (existing.score || 0)) existing.score = score;
     if (pairAddress && !existing.pairAddress) existing.pairAddress = pairAddress;
+    // A migration event upgrades an already-tracked token to graduate status.
+    if (opts?.freshGraduate === true && !existing.freshGraduate) {
+      existing.freshGraduate = true;
+      existing.graduatedAt = Date.now();
+    }
     return true;
   }
 
@@ -361,7 +380,9 @@ export async function addTokenToWatchlist(
       addedAt: Date.now(),
       lastTickAt: Date.now(),
       tickCount: 0,
-      priceHistory: []
+      priceHistory: [],
+      freshGraduate: opts?.freshGraduate === true,
+      graduatedAt: opts?.freshGraduate === true ? Date.now() : 0
     };
 
     subId = resubscribeCandidate(candidate);
@@ -709,9 +730,11 @@ function startPumpPortalMigrationStream() {
         if (payload.txType === 'migrate' || payload.type === 'migration' || payload.event === 'migration') {
           const mint = payload.mint || payload.tokenAddress;
           const symbol = payload.symbol || 'MIGRATED';
-          if (mint && !watchlist.has(mint)) {
+          if (mint) {
             console.log(`[MarketStreamer] 🚀 HOT RAYDIUM MIGRATION EVENT: ${symbol} (${mint.slice(0, 8)}...) baru saja graduated ke Raydium! Menambahkan ke Watchlist...`);
-            await addTokenToWatchlist(mint, symbol, 'Raydium Migration Runner');
+            // addTokenToWatchlist upgrades an already-tracked token to
+            // graduate status via opts (dedupes internally).
+            await addTokenToWatchlist(mint, symbol, 'Raydium Migration Runner', '', 50, { freshGraduate: true });
           }
         }
       } catch {}
@@ -910,4 +933,27 @@ export function getWatchlistStatus(): Array<{
       drawdownFromPeakPct
     };
   });
+}
+
+/**
+ * GRADUATION LANE (2026-09-30): fresh Raydium graduates (pump.fun migrations)
+ * younger than 6h, for evaluation through the graduation funnel lane. The
+ * scanner injects these alongside discovery candidates each cycle — migration
+ * tokens otherwise sit in the WS watchlist with a growing tape but are NEVER
+ * evaluated for entry (the scanner only scored discovery-feed tokens).
+ */
+export function getFreshGraduates(): Array<{
+  tokenMint: string;
+  symbol: string;
+  pairAddress?: string;
+}> {
+  const now = Date.now();
+  const MAX_GRADUATE_AGE_MS = 6 * 60 * 60 * 1000;
+  const out: Array<{ tokenMint: string; symbol: string; pairAddress?: string }> = [];
+  for (const w of watchlist.values()) {
+    if (w.freshGraduate && now - w.graduatedAt < MAX_GRADUATE_AGE_MS) {
+      out.push({ tokenMint: w.tokenMint, symbol: w.symbol, pairAddress: w.pairAddress });
+    }
+  }
+  return out;
 }

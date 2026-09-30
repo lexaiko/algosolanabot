@@ -47,6 +47,10 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
    *  discovery-source attribution in the decision journal (which feed's
    *  pool is toxic vs productive). */
   source: string;
+  /** GRADUATION LANE (2026-09-30): true for fresh Raydium graduates
+   *  (pump.fun migrations < 6h old). They bypass the upstream quality gate
+   *  and are evaluated through the graduation funnel lane. */
+  isFreshGraduate?: boolean;
 }>> {
   const isExcluded = (mint: string) => {
     if (!mint) return true;
@@ -185,6 +189,7 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
     priceChange1h: number;
     pairAddress?: string;
     source: string;
+    isFreshGraduate?: boolean;
   }> = [];
 
   for (const mint of allCandidateMints) {
@@ -224,7 +229,57 @@ export async function getOrganicTrendingTokens(limit: number = 18): Promise<Arra
     return scoreB - scoreA;
   });
 
-  return validRunners.slice(0, limit);
+  const sliced = validRunners.slice(0, limit);
+
+  // GRADUATION LANE (2026-09-30): inject fresh Raydium graduates. Migration
+  // tokens sit in the WS watchlist with a growing tape but were NEVER
+  // evaluated for entry — the scanner only scored discovery-feed tokens.
+  // Research 2026-09-30 (n=68): pool mentah = kuburan (median 4 buyer),
+  // tapi token yang lolos filter atensi punya 11.8% excursion 2x+ dengan
+  // median 94 menit ke 2x — scan cycle 10 menit bisa nangkep. Graduates
+  // bypass the upstream quality gate (liq $35k / vol24h $30k — a minutes-old
+  // pool cannot have 24h volume by construction); their lane gates are the
+  // graduation funnel (liq >= $15k, safety gate, no 24h-vol bar) + the
+  // continuation model's 3-confirmation proof at entry. Capped to bound
+  // per-cycle API load; first-seen attribution preserved (source stays
+  // 'migration' only when the mint wasn't already tagged by a feed).
+  try {
+    const { getFreshGraduates } = await import('./marketStreamer');
+    const graduates = getFreshGraduates();
+    const seenMints = new Set(sliced.map(r => r.tokenMint));
+    let injected = 0;
+    for (const g of graduates) {
+      if (injected >= 10) break;
+      if (seenMints.has(g.tokenMint) || isExcluded(g.tokenMint)) continue;
+      seenMints.add(g.tokenMint);
+      injected++;
+      sliced.push({
+        tokenMint: g.tokenMint,
+        poolName: `${g.symbol} / SOL`,
+        volumeUsd: 0,
+        volume5m: 0,
+        priceChange5m: 0,
+        priceChange1h: 0,
+        pairAddress: g.pairAddress,
+        source: rawMints.get(g.tokenMint) || 'migration',
+        isFreshGraduate: true
+      });
+    }
+    // Mark graduates that ALSO surfaced via discovery feeds (first-seen-wins
+    // keeps their feed source for attribution, but the lane flag still applies).
+    for (const r of sliced) {
+      if (!r.isFreshGraduate && graduates.some(g => g.tokenMint === r.tokenMint)) {
+        r.isFreshGraduate = true;
+      }
+    }
+    if (injected > 0) {
+      console.log(`[AlgoScanner] 🎓 Graduation lane: ${injected} fresh graduate(s) di-inject ke evaluasi siklus ini.`);
+    }
+  } catch (err: any) {
+    console.warn('[AlgoScanner] Graduation lane injection gagal:', err.message);
+  }
+
+  return sliced;
 }
 
 let isScannerRunning = false;
@@ -273,6 +328,12 @@ export interface ScannedCandidate {
   /** 2026-09-30 (supervisor): first-seen discovery feed for this mint
    *  ('raydium_vol' | 'raydium_apr' | 'gecko_trending' | 'unknown'). */
   discoverySource?: string;
+  /** GRADUATION LANE (2026-09-30): true when this candidate passed via the
+   *  fresh-graduate lane (confirmed MOMENTUM_CONTINUATION, score gate
+   *  bypassed — the 3-confirmation proof is the conviction, not the
+   *  Goldilocks composite). Lets the qualifying filter admit it without
+   *  lowering the bar for the standard lane. */
+  gradLane?: boolean;
   /** M4: decision-journal id of the EVALUATED log, passed to executeBuyToken
    *  so the fill (or rejection) can mark it EXECUTED / FAILED. */
   decisionId?: string;
@@ -422,7 +483,10 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
         priceUsd: market.priceUsd,
         tokenAgeSeconds: tokenAgeSec,
         bondingCurveProgressPct: bondingCurvePct,
-        safetyReport: safety
+        safetyReport: safety,
+        // GRADUATION LANE (2026-09-30): fresh graduates get liq >= $15k,
+        // no 24h-volume bar, safety gate stays.
+        lane: item.isFreshGraduate ? 'graduation' : 'standard'
       });
 
       // Real Microstructure Feature Vector computed from live DexScreener & on-chain data.
@@ -602,9 +666,11 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
         timestampMs: Date.now(),
         timeframe: '5m',
         priceUsd: market.priceUsd,
+        // GRADUATION LANE (2026-09-30): lets the entry engine observe this
+        // token for MOMENTUM_CONTINUATION regardless of composite score.
+        isFreshGraduate: item.isFreshGraduate === true,
         return1m,
-        return5m: ret5m,
-        // Honest 15m: tape-measured when mature, otherwise unknown (undefined).
+        return5m: ret5m,        // Honest 15m: tape-measured when mature, otherwise unknown (undefined).
         // Never synthesized from shorter timeframes.
         return15m: tape.return15mPct ?? undefined,
         realizedVol,
@@ -693,7 +759,18 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
       }
 
       const dynamicMinScore = adaptiveLearningEngine.getMinEntryScore();
-      let isPassed = funnelEval.passed && entryDecision.shouldEnter && scoreResult.compositeScore >= dynamicMinScore;
+      // GRADUATION LANE (2026-09-30): a fresh graduate with a CONFIRMED
+      // momentum-continuation setup (3 higher-high pushes, each with rising
+      // volume + dominant flow) bypasses the composite-score gate — the
+      // 3-confirmation proof IS the conviction, and thin-tape graduates
+      // rarely reach 75 anyway. This is NOT a hurdle cut for the standard
+      // lane: funnel (liq >= $15k, safety gate), exhaustion, re-entry and
+      // quarantine checks all still apply, and entry fires at half size.
+      const isGradLanePass = item.isFreshGraduate === true
+        && entryDecision.shouldEnter
+        && entryDecision.entryMode === 'MOMENTUM_CONTINUATION';
+      let isPassed = funnelEval.passed && entryDecision.shouldEnter
+        && (isGradLanePass || scoreResult.compositeScore >= dynamicMinScore);
       
       let rejectReason: string | undefined = undefined;
       if (!funnelEval.passed) {
@@ -744,6 +821,7 @@ export async function scanMarketOnce(limit: number = 8): Promise<ScannedCandidat
         regime: vector.regime,
         entryMode: entryDecision.entryMode,
         discoverySource: item.source,
+        gradLane: isGradLanePass === true,
         decisionId
       });
 
@@ -811,7 +889,10 @@ export async function runAlgoScanCycle() {
       }
     }
 
-    const qualifying = candidates.filter(c => c.passed && c.score >= dynamicMinScore);
+    // GRADUATION LANE (2026-09-30): gradLane passes carry their own
+    // conviction (3 confirmed continuation pushes); the score gate is not
+    // re-applied to them here. Standard-lane bar unchanged.
+    const qualifying = candidates.filter(c => c.passed && (c.gradLane === true || c.score >= dynamicMinScore));
 
     if (qualifying.length === 0) {
       console.log(`[AlgoScanner] ℹ️ Tidak ada token baru yang memenuhi ambang batas skor adaptif (>=${dynamicMinScore}). Menunggu siklus berikutnya.`);

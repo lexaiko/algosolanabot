@@ -101,6 +101,15 @@ export interface FeatureVector {
    *  The counterfactual tracker needs this — it was reading priceUsd from the
    *  snapshot but producers never set it (0/446 counterfactuals filled). */
   priceUsd?: number;
+  /** GRADUATION LANE (2026-09-30): true when this token entered via a
+   *  Raydium migration event (pump.fun graduate). Fresh graduates rarely
+   *  score 75+ on thin tape, but continuation proof (3 confirmed higher-high
+   *  pushes) is tape-agnostic — the entry engine observes them for
+   *  MOMENTUM_CONTINUATION regardless of score. ENTRY still demands the same
+   *  3 confirmations + volume + flow, half size. Research: new-pair study
+   *  2026-09-30 (n=68) — median 94 min to 2x, all 2x+ excursions dumped >50%
+   *  within 24h, so profit comes only from confirmed-leg entry + trailing. */
+  isFreshGraduate?: boolean;
   
   // Price Structure
   /** Per-minute rebound rate (%/min) = returnSinceLastPct / minutes between tape
