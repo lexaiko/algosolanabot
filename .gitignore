@@ -9,3 +9,5 @@ dist/
 scratch/
 ecosystem.config.cjs
 
+
+hidden_files/

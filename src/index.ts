@@ -11,6 +11,7 @@ import { startPositionManager, stopPositionManager } from './services/tradeManag
 import { startAlgoScanner, stopAlgoScanner } from './services/algoScanner';
 import { startMarketStreamer, stopMarketStreamer } from './services/marketStreamer';
 import { startCounterfactualTracker, stopCounterfactualTracker } from './services/counterfactualTracker';
+import { restoreTapeSnapshot, startTapeAutosave, stopTapeAutosave, saveTapeSnapshot } from './market/tapePersistence';
 
 /**
  * REDACTED stack formatter:
@@ -230,10 +231,16 @@ async function main() {
   startHeartbeat();
   startHeapGuard();
 
+  // 2026-09-30 (supervisor): restore tape snapshot BEFORE engines start, so
+  // the first scan cycle already has history (no ~10 min blind window after
+  // a SIGKILL restart). Stale/corrupt snapshots are discarded fail-closed.
+  restoreTapeSnapshot();
+
   // 2. Start Quantitative Execution Engines (Zero-Polling Event-Driven WebSocket First)
   startPositionManager();
   await startMarketStreamer();
   startAlgoScanner();
+  startTapeAutosave(); // snapshot tape tiap 60 dtk — batas data hilang saat SIGKILL
   startCounterfactualTracker(); // Validasi "apakah penolakan/eksekusi scanner benar?"
 
   // 3. Start Telegram Bot with Resilient Auto-Retry Loop
@@ -283,6 +290,8 @@ async function main() {
     console.log('\n[System] Shutting down cleanly...');
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     if (heapGuardTimer) clearInterval(heapGuardTimer);
+    stopTapeAutosave();
+    saveTapeSnapshot(); // final tape snapshot — restart berikutnya langsung punya history
     stopPositionManager();
     stopMarketStreamer();
     await stopAlgoScanner(); // O-20: async — waits for in-flight scan cycle so no buy fires mid-shutdown

@@ -187,6 +187,71 @@ export class TokenTapeTracker {
   }
 
   /**
+   * 2026-09-30 (supervisor): serializable snapshot of all tapes for
+   * crash-resilience. Points older than MAX_AGE_MS are dropped — the file
+   * stays small and only decision-relevant history is kept. Returns a deep
+   * copy; mutating the result never affects live tapes.
+   */
+  public snapshot(): Record<string, TapePoint[]> {
+    const now = Date.now();
+    const cutoff = now - MAX_AGE_MS;
+    const out: Record<string, TapePoint[]> = {};
+    for (const [mint, tape] of this.tapes) {
+      const fresh = tape.filter(p => p.t >= cutoff && p.priceUsd > 0);
+      if (fresh.length > 0) out[mint] = fresh.map(p => ({ ...p }));
+    }
+    return out;
+  }
+
+  /**
+   * 2026-09-30 (supervisor): restore tapes from a snapshot (e.g. after a
+   * SIGKILL restart). Every point is re-validated: bad shapes, non-positive
+   * prices, and points older than MAX_AGE_MS are discarded, per-mint length
+   * is capped at MAX_POINTS. Restored points keep their ORIGINAL timestamps —
+   * features derived from them (span, returns, drawdown) stay honest about
+   * their age. Returns the number of mints restored.
+   */
+  public restore(data: Record<string, TapePoint[]>): number {
+    if (!data || typeof data !== 'object') return 0;
+    const now = Date.now();
+    const cutoff = now - MAX_AGE_MS;
+    let restored = 0;
+    for (const [mint, points] of Object.entries(data)) {
+      if (!mint || !Array.isArray(points) || points.length === 0) continue;
+      const clean: TapePoint[] = [];
+      for (const p of points) {
+        if (
+          p && typeof p.t === 'number' && Number.isFinite(p.t) &&
+          p.t >= cutoff && p.t <= now + 60000 &&
+          typeof p.priceUsd === 'number' && p.priceUsd > 0
+        ) {
+          clean.push({
+            t: Math.floor(p.t),
+            priceUsd: p.priceUsd,
+            volume24hUsd: typeof p.volume24hUsd === 'number' && p.volume24hUsd > 0 ? p.volume24hUsd : 0,
+            liquidityUsd: typeof p.liquidityUsd === 'number' && p.liquidityUsd > 0 ? p.liquidityUsd : 0
+          });
+        }
+      }
+      if (clean.length === 0) continue;
+      clean.sort((a, b) => a.t - b.t);
+      const capped = clean.slice(-MAX_POINTS);
+      // Merge with any live tape (e.g. ticks that arrived before restore ran)
+      const live = this.tapes.get(mint);
+      if (live && live.length > 0) {
+        const seen = new Set(live.map(p => p.t));
+        for (const p of capped) if (!seen.has(p.t)) live.push(p);
+        live.sort((a, b) => a.t - b.t);
+        while (live.length > MAX_POINTS) live.shift();
+      } else {
+        this.tapes.set(mint, capped);
+      }
+      restored++;
+    }
+    return restored;
+  }
+
+  /**
    * Price of the tape point closest to targetMs, or null when no point falls
    * within toleranceMs. Used by the counterfactual tracker to recover honest
    * decision-time and horizon prices from real observations — never invented.
